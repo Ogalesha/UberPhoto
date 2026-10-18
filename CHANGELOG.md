@@ -7,6 +7,14 @@ e il progetto aderisce a [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-18
+
+### Fixed
+
+- Su Windows le operazioni su cartelle dell'indice (`load_dir`, `move_dir`, `remove_dir`) non trovavano le righe quando i percorsi mescolavano separatori `/` e `\`: il pattern LIKE ora è un prefisso indipendente dal separatore, con filtro esatto in Rust.
+- La CI non pubblicava i log dei test falliti (ora il log finisce in un check run dedicato visibile senza autenticazione).
+- Lo smoke test GUI Linux si interrompeva sotto Xvfb per il mancato caricamento di `libxkbcommon-x11` (pacchetto ora installato) e per lo schermo Xvfb a 8 bit (ora 24 bit).
+
 ## [0.2.0] - 2026-10-18
 
 ### Added
@@ -47,5 +55,6 @@ e il progetto aderisce a [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - CI GitHub Actions su Ubuntu, macOS e Windows (formato, clippy, test) e workflow di release con binari scaricabili per i tag `v*`.
 - Smoke test GUI headless (Xvfb) nella CI Linux.
 
-[Unreleased]: https://github.com/Ogalesha/UberPhoto/compare/v0.2.0...main
+[Unreleased]: https://github.com/Ogalesha/UberPhoto/compare/v0.2.1...main
+[0.2.1]: https://github.com/Ogalesha/UberPhoto/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Ogalesha/UberPhoto/compare/v0.1.0...v0.2.0

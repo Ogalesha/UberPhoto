@@ -352,13 +352,11 @@ fn mtime_secs(modified: Option<SystemTime>) -> Option<i64> {
         .map(|duration| duration.as_secs() as i64)
 }
 
-/// Pattern LIKE per i discendenti di `dir`, con i metacaratteri neutralizzati.
+/// Pattern LIKE di prefisso per i discendenti di `dir`, con i metacaratteri
+/// neutralizzati. Il filtro esatto avviene in Rust (`parent()`/`starts_with()`),
+/// così il pattern resta indipendente dal separatore di percorso.
 fn like_dir_pattern(dir: &Path) -> String {
-    let mut text = path_text(dir);
-    if !text.ends_with(['/', '\\']) {
-        text.push(std::path::MAIN_SEPARATOR);
-    }
-    let escaped = text
+    let escaped = path_text(dir)
         .replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_");
@@ -464,8 +462,12 @@ mod tests {
             .move_dir(Path::new("/base"), Path::new("/nuova"))
             .unwrap();
         assert_eq!(moved, 2);
-        assert!(index.get(Path::new("/nuova/a.jpg")).unwrap().is_some());
-        assert!(index.get(Path::new("/nuova/sub/c.jpg")).unwrap().is_some());
+        let nuova = Path::new("/nuova");
+        assert!(index.get(&nuova.join("a.jpg")).unwrap().is_some());
+        assert!(index
+            .get(&nuova.join("sub").join("c.jpg"))
+            .unwrap()
+            .is_some());
         assert!(index.get(Path::new("/base/a.jpg")).unwrap().is_none());
     }
 

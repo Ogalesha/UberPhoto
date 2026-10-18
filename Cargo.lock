@@ -3749,7 +3749,7 @@ checksum = "bc7d623258602320d5c55d1bc22793b57daff0ec7efc270ea7d55ce1d5f5471c"
 
 [[package]]
 name = "uberphoto-app"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "eframe",
  "tracing",
@@ -3759,11 +3759,11 @@ dependencies = [
 
 [[package]]
 name = "uberphoto-core"
-version = "0.2.0"
+version = "0.2.1"
 
 [[package]]
 name = "uberphoto-db"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3774,7 +3774,7 @@ dependencies = [
 
 [[package]]
 name = "uberphoto-files"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "notify",
  "tempfile",
@@ -3784,14 +3784,14 @@ dependencies = [
 
 [[package]]
 name = "uberphoto-geo"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "uberphoto-core",
 ]
 
 [[package]]
 name = "uberphoto-image"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "image",
  "kamadak-exif",
@@ -3803,7 +3803,7 @@ dependencies = [
 
 [[package]]
 name = "uberphoto-metadata"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "image",
  "serde_json",
@@ -3814,7 +3814,7 @@ dependencies = [
 
 [[package]]
 name = "uberphoto-tests"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "image",
  "tempfile",
@@ -3827,7 +3827,7 @@ dependencies = [
 
 [[package]]
 name = "uberphoto-ui"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chrono",
  "eframe",
