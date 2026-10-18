@@ -1,0 +1,56 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/uberphoto-app",
+    "crates/uberphoto-ui",
+    "crates/uberphoto-core",
+    "crates/uberphoto-files",
+    "crates/uberphoto-image",
+    "crates/uberphoto-metadata",
+    "crates/uberphoto-geo",
+    "crates/uberphoto-db",
+    "crates/uberphoto-tests",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+
+[workspace.dependencies]
+uberphoto-core = { path = "crates/uberphoto-core" }
+uberphoto-files = { path = "crates/uberphoto-files" }
+uberphoto-image = { path = "crates/uberphoto-image" }
+uberphoto-metadata = { path = "crates/uberphoto-metadata" }
+uberphoto-geo = { path = "crates/uberphoto-geo" }
+uberphoto-db = { path = "crates/uberphoto-db" }
+uberphoto-ui = { path = "crates/uberphoto-ui" }
+
+eframe = { version = "0.37", features = ["persistence"] }
+image = { version = "0.25", default-features = false, features = [
+    "jpeg",
+    "png",
+    "tiff",
+    "webp",
+    "gif",
+    "bmp",
+] }
+kamadak-exif = "0.6"
+rayon = "1"
+rfd = "0.17"
+serde = { version = "1", features = ["derive"] }
+chrono = "0.4"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tempfile = "3"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"

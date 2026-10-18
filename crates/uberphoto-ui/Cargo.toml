@@ -1,0 +1,16 @@
+[package]
+name = "uberphoto-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+uberphoto-core.workspace = true
+uberphoto-files.workspace = true
+uberphoto-image.workspace = true
+eframe.workspace = true
+rfd.workspace = true
+serde.workspace = true
+chrono.workspace = true
+tracing.workspace = true

@@ -1,0 +1,10 @@
+# File compilati da Cargo
+/target
+
+# Backup e artefatti
+**/*.rs.bk
+*.pdb
+
+# Sistema operativo
+.DS_Store
+Thumbs.db

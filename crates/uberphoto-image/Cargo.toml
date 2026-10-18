@@ -1,0 +1,16 @@
+[package]
+name = "uberphoto-image"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+uberphoto-core.workspace = true
+image.workspace = true
+kamadak-exif.workspace = true
+rayon.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

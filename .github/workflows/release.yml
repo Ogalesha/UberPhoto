@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  rilascio:
+    name: Binari (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            archivio: uberphoto-linux-x86_64.tar.gz
+          - os: macos-latest
+            archivio: uberphoto-macos-aarch64.tar.gz
+          - os: windows-latest
+            archivio: uberphoto-windows-x86_64.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout del sorgente
+        uses: actions/checkout@v4
+
+      - name: Toolchain Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: cargo build --release --locked -p uberphoto-app
+
+      - name: Impacchetta (Linux e macOS)
+        if: runner.os != 'Windows'
+        run: tar -czf "${{ matrix.archivio }}" -C target/release uberphoto-app
+
+      - name: Impacchetta (Windows)
+        if: runner.os == 'Windows'
+        run: Compress-Archive -Path target/release/uberphoto-app.exe -DestinationPath "${{ matrix.archivio }}"
+
+      - name: Carica artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archivio }}
+          path: ${{ matrix.archivio }}
+
+      - name: Allega il binario alla Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.archivio }}
+          generate_release_notes: true

@@ -1,0 +1,12 @@
+[package]
+name = "uberphoto-files"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+uberphoto-core.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
