@@ -48,7 +48,18 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --workspace
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --workspace --no-fail-fast 2>&1 | tee test-output.txt
+
+      - name: Log dei test (diagnostica)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log-${{ matrix.os }}
+          path: test-output.txt
+          if-no-files-found: ignore
 
       - name: Build release
         run: cargo build --release --locked -p uberphoto-app
@@ -60,7 +71,17 @@ jobs:
             sudo apt-get update
             sudo apt-get install -y xvfb
           }
-          UBERPHOTO_SMOKE_EXIT_SECS=6 xvfb-run -a ./target/release/uberphoto-app
+          set -o pipefail
+          LIBGL_ALWAYS_SOFTWARE=1 UBERPHOTO_SMOKE_EXIT_SECS=6 \
+            xvfb-run -a -s "-screen 0 1280x800x24" ./target/release/uberphoto-app 2>&1 | tee smoke-output.txt
+
+      - name: Log dello smoke test (diagnostica)
+        if: failure() && runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-log-linux
+          path: smoke-output.txt
+          if-no-files-found: ignore
 
       - name: Smoke test GUI (macOS, sperimentale)
         if: runner.os == 'macOS'
