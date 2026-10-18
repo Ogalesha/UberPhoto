@@ -2,6 +2,8 @@
 //!
 //! Con `ScrollArea::show_rows` vengono disegnate solo le righe visibili,
 //! quindi la navigazione resta fluida anche con migliaia di fotografie.
+//! Le celle sono trascinabili (payload `DragPhotos` verso l'esploratore) e
+//! hanno un menu contestuale con le operazioni di file più comuni.
 
 use std::path::Path;
 
@@ -9,7 +11,9 @@ use eframe::egui;
 use uberphoto_files::SortKey;
 use uberphoto_image::ImageService;
 
-use crate::state::{AppState, UiActions, MAX_THUMB_SIZE, MIN_THUMB_SIZE};
+use crate::state::{
+    AppState, DragPhotos, FormatFilter, TransferRequest, UiActions, MAX_THUMB_SIZE, MIN_THUMB_SIZE,
+};
 use crate::thumbnails::{ThumbCache, ThumbState};
 use crate::util::{elide, format_bytes};
 
@@ -125,16 +129,6 @@ fn toolbar(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
                 .show_value(false),
         );
 
-        ui.separator();
-        ui.add(
-            egui::TextEdit::singleline(&mut state.filter_text)
-                .hint_text("Filtra per nome…")
-                .desired_width(160.0),
-        );
-        if !state.filter_text.is_empty() && ui.small_button("✕").clicked() {
-            state.filter_text.clear();
-        }
-
         if !state.selection.is_empty() {
             ui.separator();
             ui.weak(format!("{} sel.", state.selection.len()));
@@ -142,6 +136,52 @@ fn toolbar(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
                 state.selection.clear();
                 state.selection_anchor = None;
             }
+        }
+    });
+
+    ui.horizontal(|ui| {
+        ui.label("Filtri:");
+        ui.add(
+            egui::TextEdit::singleline(&mut state.filter_text)
+                .hint_text("Filtra per nome…")
+                .desired_width(130.0),
+        );
+        if !state.filter_text.is_empty() && ui.small_button("✕").clicked() {
+            state.filter_text.clear();
+        }
+
+        egui::ComboBox::from_id_salt("filter_format")
+            .selected_text(state.filter_format.label())
+            .show_ui(ui, |ui| {
+                for option in FormatFilter::OPTIONS {
+                    ui.selectable_value(&mut state.filter_format, option, option.label());
+                }
+            });
+
+        let rating_label = match state.filter_rating {
+            None => "Valutazione".to_owned(),
+            Some(minimum) => format!("≥ {minimum} ★"),
+        };
+        egui::ComboBox::from_id_salt("filter_rating")
+            .selected_text(rating_label)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut state.filter_rating, None, "Tutte le valutazioni");
+                for stars in 1..=5u8 {
+                    let label = "★".repeat(stars as usize);
+                    ui.selectable_value(&mut state.filter_rating, Some(stars), label);
+                }
+            });
+
+        ui.toggle_value(&mut state.filter_gps, "GPS")
+            .on_hover_text("Mostra solo le foto con coordinate GPS");
+
+        ui.add(
+            egui::TextEdit::singleline(&mut state.filter_keywords)
+                .hint_text("Keyword…")
+                .desired_width(110.0),
+        );
+        if !state.filter_keywords.is_empty() && ui.small_button("✕").clicked() {
+            state.filter_keywords.clear();
         }
     });
 }
@@ -171,17 +211,17 @@ fn schermata_iniziale(ui: &mut egui::Ui, state: &AppState, actions: &mut UiActio
     });
 }
 
-/// Indici di `state.entries` visibili con il filtro corrente.
+/// Indici di `state.entries` visibili con i filtri correnti.
 fn visible_indices(state: &AppState) -> Vec<usize> {
     let filter = state.filter_text.trim().to_lowercase();
-    if filter.is_empty() {
-        return (0..state.entries.len()).collect();
-    }
     state
         .entries
         .iter()
         .enumerate()
-        .filter(|(_, entry)| entry.file_name().to_lowercase().contains(&filter))
+        .filter(|(_, entry)| {
+            filter.is_empty() || entry.file_name().to_lowercase().contains(&filter)
+        })
+        .filter(|(_, entry)| state.asset_visible(entry))
         .map(|(index, _)| index)
         .collect()
 }
@@ -208,7 +248,8 @@ fn cell(
     let size_label = format_bytes(entry.byte_size);
 
     let selected = state.selection.contains(&path);
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(cell_w, cell_h), egui::Sense::click());
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(cell_w, cell_h), egui::Sense::click_and_drag());
 
     if selected {
         ui.painter().rect_filled(
@@ -279,6 +320,22 @@ fn cell(
         }
     }
 
+    let row = state.index_rows.get(&path);
+    if let Some(row) = row {
+        if row.has_gps {
+            paint_gps_badge(&painter, image_rect.left_top() + egui::vec2(4.0, 4.0));
+        }
+        if let Some(rating) = row.rating.filter(|rating| *rating > 0) {
+            paint_chip(
+                &painter,
+                image_rect.right_top() + egui::vec2(-4.0, 4.0),
+                egui::Align2::RIGHT_TOP,
+                &"★".repeat(rating.min(5) as usize),
+                11.0,
+            );
+        }
+    }
+
     let text_x = rect.center().x;
     let name_y = image_rect.bottom() + 3.0;
     painter.text(
@@ -322,7 +379,116 @@ fn cell(
         actions.open_preview = Some(path.clone());
     }
 
+    if response.drag_started() {
+        if !state.selection.contains(&path) {
+            set_single_selection(state, &path);
+        }
+        let paths = state.selection_paths(&path);
+        response.dnd_set_drag_payload(DragPhotos { paths });
+    }
+    if response.dragged() {
+        ghost_badge(ui, response.id, state.selection_paths(&path).len());
+    }
+
+    response.context_menu(|ui| {
+        let paths = state.selection_paths(&path);
+        if ui.button("🔍 Apri anteprima").clicked() {
+            actions.open_preview = Some(path.clone());
+            ui.close();
+        }
+        if ui.button("✏ Rinomina…").clicked() {
+            actions.rename_photo = Some(path.clone());
+            ui.close();
+        }
+        ui.menu_button("Valutazione", |ui| {
+            for stars in 0..=5u8 {
+                let label = if stars == 0 {
+                    "Nessuna".to_owned()
+                } else {
+                    "★".repeat(stars as usize)
+                };
+                if ui.button(label).clicked() {
+                    actions.metadata_rate = Some((paths.clone(), stars));
+                    ui.close();
+                }
+            }
+        });
+        ui.separator();
+        if ui.button("📄 Copia in…").clicked() {
+            actions.transfer = Some(TransferRequest {
+                paths: paths.clone(),
+                copy: true,
+            });
+            ui.close();
+        }
+        if ui.button("📦 Sposta in…").clicked() {
+            actions.transfer = Some(TransferRequest { paths, copy: false });
+            ui.close();
+        }
+    });
+
     response.on_hover_text(hover_detail);
+}
+
+/// Pastiglia al cursore durante il trascinamento delle foto: conta gli
+/// elementi trascinati senza replicare le miniature.
+fn ghost_badge(ui: &egui::Ui, id: egui::Id, count: usize) {
+    let Some(pointer) = ui.ctx().pointer_interact_pos() else {
+        return;
+    };
+    let layer = egui::LayerId::new(egui::Order::Tooltip, id);
+    let painter = ui.ctx().layer_painter(layer);
+    let center = pointer + egui::vec2(18.0, 18.0);
+    painter.circle_filled(center, 14.0, ui.visuals().selection.bg_fill);
+    painter.circle_stroke(center, 14.0, ui.visuals().selection.stroke);
+    painter.text(
+        center,
+        egui::Align2::CENTER_CENTER,
+        count.to_string(),
+        egui::FontId::proportional(12.0),
+        egui::Color32::WHITE,
+    );
+}
+
+/// Etichetta su pastiglia scura, ancorata a un angolo della miniatura.
+fn paint_chip(
+    painter: &egui::Painter,
+    anchor: egui::Pos2,
+    align: egui::Align2,
+    text: &str,
+    size: f32,
+) {
+    let galley = painter.layout_no_wrap(
+        text.to_owned(),
+        egui::FontId::proportional(size),
+        egui::Color32::from_rgb(255, 205, 90),
+    );
+    let rect = align
+        .anchor_size(anchor, galley.size())
+        .expand2(egui::vec2(4.0, 1.0));
+    painter.rect_filled(
+        rect,
+        egui::CornerRadius::same(3),
+        egui::Color32::from_black_alpha(160),
+    );
+    painter.galley(
+        rect.min + egui::vec2(4.0, 1.0),
+        galley,
+        egui::Color32::WHITE,
+    );
+}
+
+/// Badge GPS: pastiglia scura con un piccolo mirino, senza emoji.
+fn paint_gps_badge(painter: &egui::Painter, top_left: egui::Pos2) {
+    let rect = egui::Rect::from_min_size(top_left, egui::vec2(18.0, 18.0));
+    painter.rect_filled(
+        rect,
+        egui::CornerRadius::same(3),
+        egui::Color32::from_black_alpha(160),
+    );
+    let center = rect.center();
+    painter.circle_stroke(center, 5.0, egui::Stroke::new(1.4, egui::Color32::WHITE));
+    painter.circle_filled(center, 2.0, egui::Color32::from_rgb(120, 200, 255));
 }
 
 fn set_single_selection(state: &mut AppState, path: &Path) {
@@ -369,7 +535,7 @@ mod tests {
     use uberphoto_core::{FormatKind, PhotoAsset};
 
     use super::visible_indices;
-    use crate::state::AppState;
+    use crate::state::{AppState, FormatFilter};
 
     fn asset(name: &str) -> PhotoAsset {
         PhotoAsset {
@@ -377,6 +543,13 @@ mod tests {
             format: FormatKind::Jpeg,
             byte_size: 1,
             modified: Some(SystemTime::UNIX_EPOCH),
+        }
+    }
+
+    fn png_asset(name: &str) -> PhotoAsset {
+        PhotoAsset {
+            format: FormatKind::Png,
+            ..asset(name)
         }
     }
 
@@ -404,5 +577,28 @@ mod tests {
             "MARE",
         );
         assert_eq!(visible_indices(&state), vec![0, 2]);
+    }
+
+    #[test]
+    fn il_filtro_formato_limita_le_voci() {
+        let mut state = state_with(vec![asset("a.jpg"), png_asset("b.png")], "");
+        state.filter_format = FormatFilter::Kind(FormatKind::Png);
+        assert_eq!(visible_indices(&state), vec![1]);
+
+        state.filter_format = FormatFilter::Kind(FormatKind::Jpeg);
+        assert_eq!(visible_indices(&state), vec![0]);
+
+        state.filter_format = FormatFilter::All;
+        assert_eq!(visible_indices(&state), vec![0, 1]);
+    }
+
+    #[test]
+    fn il_filtro_raw_raggruppa_i_formati_raw() {
+        let mut raw = asset("scatto.nef");
+        raw.format = FormatKind::Nef;
+        let state_entries = vec![asset("a.jpg"), raw];
+        let mut state = state_with(state_entries, "");
+        state.filter_format = FormatFilter::Raw;
+        assert_eq!(visible_indices(&state), vec![1]);
     }
 }

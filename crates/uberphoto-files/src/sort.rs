@@ -2,25 +2,34 @@ use uberphoto_core::PhotoAsset;
 
 use crate::naming::natural_cmp;
 
-/// Chiavi di ordinamento disponibili in Fase 1.
-///
-/// "Data di acquisizione" arriverà con il motore metadati (Fase 3): richiede
-/// EXIF `DateTimeOriginal`, non la data di modifica del filesystem.
+/// Chiavi di ordinamento disponibili.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortKey {
     Name,
     Modified,
     Size,
+    /// EXIF `DateTimeOriginal`: richiede l'indice metadati (Fase 3).
+    AcquisitionDate,
+    /// Valutazione a stelle: richiede l'indice metadati (Fase 3).
+    Rating,
 }
 
 impl SortKey {
-    pub const ALL: [SortKey; 3] = [SortKey::Name, SortKey::Modified, SortKey::Size];
+    pub const ALL: [SortKey; 5] = [
+        SortKey::Name,
+        SortKey::Modified,
+        SortKey::Size,
+        SortKey::AcquisitionDate,
+        SortKey::Rating,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             SortKey::Name => "Nome",
             SortKey::Modified => "Data modifica",
             SortKey::Size => "Dimensione",
+            SortKey::AcquisitionDate => "Data di acquisizione",
+            SortKey::Rating => "Valutazione",
         }
     }
 }
@@ -33,6 +42,8 @@ pub fn sort_assets(assets: &mut [PhotoAsset], key: SortKey, ascending: bool) {
         SortKey::Name => assets.sort_by(|a, b| natural_cmp(&a.file_name(), &b.file_name())),
         SortKey::Modified => assets.sort_by_key(|asset| asset.modified),
         SortKey::Size => assets.sort_by_key(|asset| asset.byte_size),
+        // Dati non presenti in `PhotoAsset`: ordinati dalla UI tramite l'indice.
+        SortKey::AcquisitionDate | SortKey::Rating => return,
     }
     if !ascending {
         assets.reverse();

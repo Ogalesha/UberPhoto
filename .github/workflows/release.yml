@@ -55,3 +55,37 @@ jobs:
         with:
           files: ${{ matrix.archivio }}
           generate_release_notes: true
+
+  rilascio-macos-x86_64:
+    name: Binari (macOS x86_64, sperimentale)
+    continue-on-error: true
+    runs-on: macos-latest
+    steps:
+      - name: Checkout del sorgente
+        uses: actions/checkout@v4
+
+      - name: Toolchain Rust con target Intel
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release (cross-compilazione Intel)
+        run: cargo build --release --locked -p uberphoto-app --target x86_64-apple-darwin
+
+      - name: Impacchetta
+        run: tar -czf uberphoto-macos-x86_64.tar.gz -C target/x86_64-apple-darwin/release uberphoto-app
+
+      - name: Carica artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: uberphoto-macos-x86_64.tar.gz
+          path: uberphoto-macos-x86_64.tar.gz
+
+      - name: Allega il binario alla Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: uberphoto-macos-x86_64.tar.gz

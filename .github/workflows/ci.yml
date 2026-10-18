@@ -28,6 +28,19 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: ExifTool (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libimage-exiftool-perl
+
+      - name: ExifTool (macOS)
+        if: runner.os == 'macOS'
+        run: command -v exiftool || brew install exiftool
+
+      - name: ExifTool (Windows)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        run: choco install exiftool -y --no-progress
+
       - name: Formato (rustfmt)
         run: cargo fmt --all --check
 
@@ -40,7 +53,7 @@ jobs:
       - name: Build release
         run: cargo build --release --locked -p uberphoto-app
 
-      - name: Smoke test GUI headless (solo Linux)
+      - name: Smoke test GUI headless (Linux, Xvfb)
         if: runner.os == 'Linux'
         run: |
           command -v xvfb-run >/dev/null 2>&1 || {
@@ -48,3 +61,17 @@ jobs:
             sudo apt-get install -y xvfb
           }
           UBERPHOTO_SMOKE_EXIT_SECS=6 xvfb-run -a ./target/release/uberphoto-app
+
+      - name: Smoke test GUI (macOS, sperimentale)
+        if: runner.os == 'macOS'
+        continue-on-error: true
+        run: UBERPHOTO_SMOKE_EXIT_SECS=6 ./target/release/uberphoto-app
+
+      - name: Smoke test GUI (Windows, sperimentale)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $env:UBERPHOTO_SMOKE_EXIT_SECS = "6"
+          & .\target\release\uberphoto-app.exe
+          if ($LASTEXITCODE -ne 0) { throw "uscita con codice $LASTEXITCODE" }

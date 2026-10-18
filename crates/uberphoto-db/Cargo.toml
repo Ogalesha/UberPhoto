@@ -7,3 +7,9 @@ license.workspace = true
 
 [dependencies]
 uberphoto-core.workspace = true
+rusqlite.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -9,7 +9,9 @@ license.workspace = true
 
 [dev-dependencies]
 uberphoto-core.workspace = true
+uberphoto-db.workspace = true
 uberphoto-files.workspace = true
 uberphoto-image.workspace = true
+uberphoto-metadata.workspace = true
 image.workspace = true
 tempfile.workspace = true

@@ -4,12 +4,12 @@ UberPhoto is a **local-first desktop photo manager** written in Rust. It browses
 
 **Your photographs never leave your disk.** There is no server and no upload: the network is only ever needed for map tiles (Phase 4).
 
-> **Development status — Phase 1 of 7.**
-> UberPhoto is built in incremental phases; each phase is compilable and usable on its own. Phase 1 (foundations: folder navigation, thumbnails, preview, inspector scaffold) is implemented and verified on Ubuntu. Metadata editing, GPS, image editing and export are **not implemented yet** — no feature is claimed until it has been verified.
+> **Development status — Phase 3 of 7.**
+> UberPhoto is built in incremental phases; each phase is compilable and usable on its own. Phase 1 (foundations: folder navigation, thumbnails, preview), Phase 2 (filesystem operations, drag & drop, SQLite index, external-change detection) and Phase 3 (EXIF/IPTC/XMP metadata engine via ExifTool) are implemented and verified on Ubuntu. GPS, image editing and export are **not implemented yet** — no feature is claimed until it has been verified.
 
 ---
 
-## What works today (Phase 1)
+## What works today (Phases 1–3)
 
 ### Left panel — Folder explorer
 - Open any real filesystem folder as a root, through the native OS folder dialog.
@@ -29,9 +29,29 @@ UberPhoto is a **local-first desktop photo manager** written in Rust. It browses
 - Decoded by a single dedicated background worker with a latest-wins policy; the oversize buffer is capped at 2560 px on the long edge.
 - Purely visual: no pixels are modified.
 
-### Right panel — Inspector (scaffold)
+### Right panel — Inspector
 - Five tabs (`Colori`, `Informazioni`, `Metadati`, `Posizione GPS`, `Esportazione`) wired for the upcoming phases.
-- Today the `Informazioni` tab shows real data about the selection; the other tabs explicitly state which phase implements them.
+- `Informazioni` shows real data about the selection; `Metadati` is the working metadata editor (see below); the remaining tabs state which phase implements them.
+
+### Filesystem operations (Phase 2)
+- Move or copy photos with drag & drop onto a folder in the explorer, or through the native destination dialog; rename photos and folders; undo the last move.
+- Conflict handling with three policies: automatic rename (`photo (1).jpg`), replace, skip.
+- XMP sidecars travel with their photo; cross-device moves fall back to copy + delete.
+- Create and delete empty subfolders, rename folders from the explorer or context menu.
+- Local SQLite index (`index.db` in the data directory) mirrors file info, image dimensions, ratings, keywords and camera data; WAL mode, incremental updates and upserts.
+- External changes are detected with `notify` (debounced); read-only access events are ignored, so browsing never triggers spurious rescans.
+
+### Metadata editor (Phase 3)
+- ExifTool runs as an external process on a dedicated thread; it is resolved from `PATH` or from the `UBERPHOTO_EXIFTOOL` environment variable.
+- Descriptive fields: title, headline, description, caption, alt text, keywords, category, event, people, rating, label, notes, identifier.
+- Author and rights fields: creator, copyright notice, credit line, source, publisher, license, usage terms, license URL, portfolio URL, e-mail, instructions.
+- Temporal fields: capture date, time zone offset and EXIF orientation.
+- Multi-selection editing: common values are shown, fields with different values are marked as mixed and are left untouched unless edited; clearing a field removes the tag.
+- Embedded metadata for JPEG, PNG, TIFF and WebP; native IPTC only where the format supports it (JPEG/TIFF), with matching XMP tags everywhere else.
+- RAW, HEIC and AVIF files are never rewritten: their XMP fields go to a `<file>.xmp` sidecar, created from the image's existing XMP or updated in place.
+- Post-write verification rereads every file and reports values that could not be confirmed; tags not managed by the editor are preserved.
+- Advanced read-only view of all ExifTool tags with group, name, value, writability and a live filter.
+- Grid overlays for GPS presence and star rating; toolbars filters by minimum rating, GPS and keyword; quick rating (0–5 stars) from the photo context menu.
 
 ### Application
 - Dark "photographic" theme: neutral chrome so photographs dominate the scene and colours are not biased by the surroundings.
@@ -40,12 +60,13 @@ UberPhoto is a **local-first desktop photo manager** written in Rust. It browses
 
 ### Recognized formats
 
-| Format | Browse/decode today | Notes |
-|---|---|---|
-| JPEG, PNG, TIFF, WebP | ✅ | Full pipeline; metadata write planned for Phase 3 |
-| GIF, BMP | ✅ | Browsing only |
-| HEIC, AVIF | ⛔ | Recognized and listed; decoding enabled in a later phase after per-platform verification |
-| DNG, CR2, CR3, NEF, ARW, RAF (RAW) | ⛔ | Recognized and listed; originals are never rewritten — sidecar XMP will be used |
+| Format | Browse/decode | Metadata write | Notes |
+|---|---|---|---|
+| JPEG, TIFF | ✅ | Embedded EXIF/XMP + native IPTC | Full metadata pipeline |
+| PNG, WebP | ✅ | Embedded XMP | IPTC has no native block; XMP tags are used |
+| GIF, BMP | ✅ | ⛔ | Browsing only in this phase |
+| HEIC, AVIF | ⛔ | Sidecar XMP | Recognized and listed; decoding enabled in a later phase after per-platform verification |
+| DNG, CR2, CR3, NEF, ARW, RAF (RAW) | ⛔ | Sidecar XMP | Recognized and listed; originals are never rewritten — metadata goes to `<file>.xmp` |
 
 Capabilities per format are declared explicitly in code (`FormatKind::capabilities`) and updated phase by phase.
 
@@ -57,7 +78,11 @@ Capabilities per format are declared explicitly in code (`FormatKind::capabiliti
 - **Ubuntu / Linux**: any X11 or Wayland session (eframe uses winit + wgpu).
 - **macOS**: recent macOS versions on Intel or Apple Silicon.
 - **Windows**: Windows 10 or newer (release builds do not open a console window).
-- **ExifTool**: not needed for Phase 1. From Phase 3 it will be required for metadata read/write and resolved from `PATH`.
+- **ExifTool** 12+ (Phase 3): required for metadata read/write, resolved from `PATH` or from `UBERPHOTO_EXIFTOOL`.
+  - Ubuntu/Debian: `sudo apt install libimage-exiftool-perl`
+  - macOS: `brew install exiftool`
+  - Windows: install from https://exiftool.org or `choco install exiftool`
+  - Metadata tests skip automatically when ExifTool is absent; CI installs it on Linux and macOS.
 
 ## Getting started
 
@@ -101,9 +126,9 @@ uberphoto/
 │   ├── uberphoto-core/         # domain types: formats, capabilities, photo assets
 │   ├── uberphoto-files/        # scanning, natural sort, folder tree
 │   ├── uberphoto-image/        # decode, EXIF orientation, background services
-│   ├── uberphoto-metadata/     # (Phase 3) ExifTool engine
+│   ├── uberphoto-metadata/     # Phase 3: ExifTool engine, canonical model, sidecars
 │   ├── uberphoto-geo/          # (Phase 4) OpenStreetMap integration
-│   ├── uberphoto-db/           # (Phase 2) SQLite index mirroring the filesystem
+│   ├── uberphoto-db/           # Phase 2: SQLite index mirroring the filesystem
 │   └── uberphoto-tests/        # cross-crate integration tests
 ├── .github/workflows/          # CI and release pipelines
 ├── CHANGELOG.md                # Keep a Changelog 1.1.0
@@ -112,7 +137,7 @@ uberphoto/
 
 ## Architecture & design decisions
 
-- **The filesystem is the source of truth.** The future SQLite index will mirror it for speed (search, ratings, keywords) but never replace it.
+- **The filesystem is the source of truth.** The SQLite index mirrors it for speed (sorting by capture date or rating, keyword/GPS filters) but never replaces it: deleting `index.db` simply rebuilds it on the next scan.
 - **Immediate-mode UI, background pipelines.** egui renders on the main thread; directory scans, thumbnail decoding (rayon pool sized to the machine) and preview decoding (one dedicated worker) run off-thread and deliver results through channels with **latest-wins** semantics, so stale work is discarded instead of blocking.
 - **Only visible work is done.** Thumbnails are requested for cells currently on screen; the LRU cache (2,000 textures, quantized size buckets) keeps memory bounded.
 - **EXIF orientation now, ExifTool later.** Phase 1 reads only the orientation tag with `kamadak-exif` (a pure-Rust, cross-platform crate) and documents it as the single internal EXIF reader. The complete metadata engine — including writing — goes through ExifTool as an external process from Phase 3, because metadata reliability is the priority.
@@ -147,8 +172,8 @@ uberphoto/
 | Phase | Scope |
 |---|---|
 | 1 ✅ | Foundations, folder explorer, virtualized browser, preview, inspector scaffold |
-| 2 | Filesystem operations and drag & drop (move/copy/rename with conflict handling, sidecar moves, SQLite index, external-change detection) |
-| 3 | Metadata engine via ExifTool: read/write EXIF, IPTC, XMP; descriptive, author, time and technical fields; GPS values; sidecars |
+| 2 ✅ | Filesystem operations and drag & drop (move/copy/rename with conflict handling, sidecar moves, SQLite index, external-change detection) |
+| 3 ✅ | Metadata engine via ExifTool: read/write EXIF, IPTC, XMP; descriptive, author, time and technical fields; GPS values; sidecars |
 | 4 | OpenStreetMap GPS picker (`walkers`) with marker placement |
 | 5 | Non-destructive color editing (exposure, contrast, saturation, …), crop/rotate, presets, undo/redo, before/after |
 | 6 | Export for web: profiles, metadata embedding, validation, reports |

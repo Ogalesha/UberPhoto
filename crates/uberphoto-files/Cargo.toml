@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 uberphoto-core.workspace = true
+notify.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
