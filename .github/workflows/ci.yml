@@ -69,7 +69,7 @@ jobs:
             await github.rest.checks.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              name: `Log test - ${context.job}`,
+              name: `Log test - ${context.job} (${process.env.RUNNER_OS})`,
               head_sha: context.sha,
               status: 'completed',
               conclusion: 'neutral',
@@ -82,9 +82,9 @@ jobs:
       - name: Smoke test GUI headless (Linux, Xvfb)
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get install -y xvfb libxkbcommon-x11-0
+          sudo apt-get install -y xvfb libxkbcommon-x11-0 mesa-vulkan-drivers libvulkan1
           set -o pipefail
-          LIBGL_ALWAYS_SOFTWARE=1 UBERPHOTO_SMOKE_EXIT_SECS=6 \
+          LIBGL_ALWAYS_SOFTWARE=1 RUST_LOG=info,wgpu_core=info,wgpu_hal=info UBERPHOTO_SMOKE_EXIT_SECS=6 \
             xvfb-run -a -s "-screen 0 1280x800x24" ./target/release/uberphoto-app 2>&1 | tee smoke-output.txt
 
       - name: Pubblica il log dello smoke test (diagnostica)
@@ -99,7 +99,7 @@ jobs:
             await github.rest.checks.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              name: `Log smoke - ${context.job}`,
+              name: `Log smoke - ${context.job} (${process.env.RUNNER_OS})`,
               head_sha: context.sha,
               status: 'completed',
               conclusion: 'neutral',

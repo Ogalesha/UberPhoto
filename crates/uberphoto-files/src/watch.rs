@@ -144,6 +144,10 @@ mod tests {
         std::fs::write(temp.path().join("foto.jpg"), b"contenuto").unwrap();
         let mut watcher = test_watcher();
         watcher.watch(temp.path());
+        // Drena gli eventuali eventi di assestamento dell'avvio della sorveglianza
+        // (su macOS FSEvents può recapitare in ritardo gli eventi della creazione).
+        std::thread::sleep(QUIET_PERIOD + Duration::from_millis(300));
+        let _ = watcher.take_settled_change();
         let _ = std::fs::read(temp.path().join("foto.jpg")).unwrap();
         let _ = std::fs::metadata(temp.path().join("foto.jpg")).unwrap();
         std::thread::sleep(QUIET_PERIOD + Duration::from_millis(150));

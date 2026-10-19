@@ -464,10 +464,7 @@ mod tests {
         assert_eq!(moved, 2);
         let nuova = Path::new("/nuova");
         assert!(index.get(&nuova.join("a.jpg")).unwrap().is_some());
-        assert!(index
-            .get(&nuova.join("sub").join("c.jpg"))
-            .unwrap()
-            .is_some());
+        assert!(index.get(&nuova.join("sub/c.jpg")).unwrap().is_some());
         assert!(index.get(Path::new("/base/a.jpg")).unwrap().is_none());
     }
 
