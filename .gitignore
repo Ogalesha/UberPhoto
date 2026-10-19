@@ -40,3 +40,6 @@ index.db-*
 # Cartelle di lavoro locali
 /testdata/
 /screenshot/
+
+# Specifica privata del prodotto, non pubblicata
+/PRODUCT.md

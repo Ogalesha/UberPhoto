@@ -27,7 +27,7 @@ e il progetto aderisce a [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 ### Fixed
 
 - La scheda Colori applica i preset alla selezione multipla invece di limitarsi a dichiararla non supportata.
-- `.gitignore` esclude segreti (`.env`, chiavi), fotografie, database locali e log; nel repository restano solo sorgenti, specifiche e l'icona necessaria alla compilazione.
+- `.gitignore` esclude segreti (`.env`, chiavi), fotografie, database locali, log e la specifica privata del prodotto; nel repository restano solo sorgenti, documentazione pubblica e l'icona necessaria alla compilazione.
 
 ## [0.2.1] - 2026-10-18
 

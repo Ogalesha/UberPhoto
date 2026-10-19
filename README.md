@@ -170,8 +170,7 @@ uberphoto/
 │   └── uberphoto-tests/        # cross-crate integration tests
 ├── packaging/                  # Linux .deb, macOS .app, Windows installer + portable ZIP
 ├── .github/workflows/          # CI and release pipelines
-├── CHANGELOG.md                # Keep a Changelog 1.1.0
-└── PRODUCT.md                  # full product specification (Italian)
+└── CHANGELOG.md                # Keep a Changelog 1.1.0
 ```
 
 ## Architecture & design decisions
@@ -226,8 +225,6 @@ uberphoto/
 | 5 ✅ | Non-destructive color editing, crop/rotate, presets, undo/redo, before/after |
 | 6 ✅ | Export for web: profiles, ICC conversion, metadata embedding, verification reports |
 | 7 ✅ | Quality and distribution: regression/smoke tests, benchmarks, documentation, self-contained packages |
-
-`PRODUCT.md` (Italian) holds the complete specification, acceptance criteria and development rules.
 
 ## License
 
