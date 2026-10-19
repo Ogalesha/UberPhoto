@@ -1,0 +1,17 @@
+Package: uberphoto
+Version: @VERSION@
+Section: graphics
+Priority: optional
+Architecture: @ARCH@
+Maintainer: Mirgen <mirgen@users.noreply.github.com>
+Installed-Size: @SIZE@
+Depends: libc6, libgcc-s1, perl
+Recommends: libxkbcommon0, libx11-6, libwayland-client0, libvulkan1
+Homepage: https://github.com/Ogalesha/UberPhoto
+Description: Local-first photo manager with non-destructive editing
+ UberPhoto browses real folders, edits EXIF/IPTC/XMP metadata through the
+ bundled ExifTool, places GPS coordinates on OpenStreetMap, applies
+ non-destructive color recipes and exports web-ready images with verified
+ metadata.
+ .
+ Photographs never leave the local disk: no server, no upload.

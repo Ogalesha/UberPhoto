@@ -7,3 +7,10 @@ license.workspace = true
 
 [dependencies]
 uberphoto-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

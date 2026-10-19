@@ -8,8 +8,10 @@ license.workspace = true
 [dependencies]
 
 [dev-dependencies]
+serde_json.workspace = true
 uberphoto-core.workspace = true
 uberphoto-db.workspace = true
+uberphoto-export.workspace = true
 uberphoto-files.workspace = true
 uberphoto-image.workspace = true
 uberphoto-metadata.workspace = true

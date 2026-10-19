@@ -30,34 +30,12 @@ pub fn ui(ui: &mut egui::Ui, state: &mut AppState, thumbs: &ThumbCache, actions:
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| match state.inspector_tab {
-            InspectorTab::Colori => placeholder(
-                ui,
-                "Regolazioni colore",
-                "Slider di esposizione, contrasto, saturazione e gli altri controlli, \
-                 anteprima non distruttiva, preset e undo/redo arriveranno con la Fase 5.",
-            ),
+            InspectorTab::Colori => crate::editor::ui(ui, state, actions),
             InspectorTab::Informazioni => informazioni(ui, state, thumbs),
             InspectorTab::Metadati => metadati(ui, state, actions),
-            InspectorTab::Gps => placeholder(
-                ui,
-                "Posizione GPS",
-                "La mappa OpenStreetMap con marker trascinabile e salvataggio delle \
-                 coordinate arriverà con la Fase 4.",
-            ),
-            InspectorTab::Esportazione => placeholder(
-                ui,
-                "Export for Web",
-                "Ridimensionamento, qualità JPEG, conversione in sRGB, embedding dei \
-                 metadati e report di verifica arriveranno con la Fase 6.",
-            ),
+            InspectorTab::Gps => crate::gps::ui(ui, state, actions),
+            InspectorTab::Esportazione => crate::export::ui(ui, state, actions),
         });
-}
-
-fn placeholder(ui: &mut egui::Ui, title: &str, body: &str) {
-    ui.add_space(12.0);
-    ui.strong(title);
-    ui.add_space(6.0);
-    ui.weak(body);
 }
 
 fn informazioni(ui: &mut egui::Ui, state: &AppState, thumbs: &ThumbCache) {

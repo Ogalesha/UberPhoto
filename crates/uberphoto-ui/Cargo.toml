@@ -10,9 +10,15 @@ uberphoto-core.workspace = true
 uberphoto-files.workspace = true
 uberphoto-image.workspace = true
 uberphoto-metadata.workspace = true
+uberphoto-geo.workspace = true
 uberphoto-db.workspace = true
+uberphoto-export.workspace = true
 eframe.workspace = true
 rfd.workspace = true
 serde.workspace = true
 chrono.workspace = true
 tracing.workspace = true
+walkers.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

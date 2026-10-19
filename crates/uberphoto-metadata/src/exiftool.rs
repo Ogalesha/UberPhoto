@@ -49,15 +49,57 @@ impl ExifTool {
     /// Variabile d'ambiente per indicare un percorso esplicito di ExifTool.
     pub const ENV_VAR: &str = "UBERPHOTO_EXIFTOOL";
 
-    /// Individua ExifTool: variabile `UBERPHOTO_EXIFTOOL` oppure `exiftool`
-    /// nel PATH. Ritorna `None` se non è eseguibile.
+    /// Individua ExifTool: variabile `UBERPHOTO_EXIFTOOL`, copia inclusa nel
+    /// pacchetto accanto all'eseguibile, oppure `exiftool` nel PATH.
+    /// Ritorna `None` se nessun candidato è eseguibile.
     pub fn detect() -> Option<Self> {
-        let program = std::env::var_os(Self::ENV_VAR)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("exiftool"));
-        let tool = Self { program };
-        tool.version().ok()?;
-        Some(tool)
+        if let Some(explicit) = std::env::var_os(Self::ENV_VAR) {
+            let tool = Self {
+                program: PathBuf::from(explicit),
+            };
+            return tool.version().ok().map(|version| {
+                tracing::debug!(program = %tool.program.display(), %version, "ExifTool individuato");
+                tool
+            });
+        }
+        for program in Self::candidati() {
+            let tool = Self { program };
+            if let Ok(version) = tool.version() {
+                tracing::debug!(program = %tool.program.display(), %version, "ExifTool individuato");
+                return Some(tool);
+            }
+        }
+        None
+    }
+
+    /// Percorsi cercati, in ordine di priorità: prima la copia inclusa nel
+    /// pacchetto (accanto all'eseguibile o nelle risorse), poi il PATH.
+    fn candidati() -> Vec<PathBuf> {
+        let mut percorsi = Vec::new();
+        if let Ok(eseguibile) = std::env::current_exe() {
+            if let Some(dir) = eseguibile.parent() {
+                let nome = if cfg!(windows) {
+                    "exiftool.exe"
+                } else {
+                    "exiftool"
+                };
+                percorsi.push(dir.join(nome));
+                percorsi.push(dir.join("exiftool").join(nome));
+                #[cfg(target_os = "macos")]
+                percorsi.push(dir.join("../Resources/exiftool/exiftool"));
+                #[cfg(target_os = "linux")]
+                {
+                    percorsi.push(dir.join("../lib/uberphoto/exiftool/exiftool"));
+                    percorsi.push(dir.join("../share/uberphoto/exiftool/exiftool"));
+                }
+            }
+        }
+        percorsi.push(PathBuf::from(if cfg!(windows) {
+            "exiftool.exe"
+        } else {
+            "exiftool"
+        }));
+        percorsi
     }
 
     pub fn program(&self) -> &Path {
@@ -131,6 +173,39 @@ impl ExifTool {
         self.run(&args).map(|_| ())
     }
 
+    /// Legge un tag binario (es. `icc_profile`) e ne restituisce il contenuto.
+    ///
+    /// Usa `-b`: nessuna codifica, nessun JSON; `None` se il tag è assente.
+    pub fn read_blob(&self, path: &Path, tag: &str) -> Result<Option<Vec<u8>>, MetadataError> {
+        let args: Vec<OsString> = vec![
+            "-b".into(),
+            format!("-{tag}").into(),
+            "--".into(),
+            path.as_os_str().to_owned(),
+        ];
+        let output = self.run(&args)?;
+        Ok((!output.is_empty()).then_some(output))
+    }
+
+    /// Scrive tag nel file usando argomenti ExifTool completi, dopo le opzioni
+    /// di base. Il chiamante include `-tagsfromfile`, selettori, esclusioni e
+    /// assegnazioni; il percorso di destinazione è aggiunto in coda.
+    ///
+    /// Ritorna le righe `Warning:` emesse da ExifTool (senza il prefisso),
+    /// utili per il report di esportazione.
+    pub fn write_from(
+        &self,
+        target: &Path,
+        args: &[OsString],
+    ) -> Result<Vec<String>, MetadataError> {
+        let mut comando = Self::write_base();
+        comando.extend_from_slice(args);
+        comando.push("--".into());
+        comando.push(target.as_os_str().to_owned());
+        let (_, avvisi) = self.run_dettagliato(&comando)?;
+        Ok(avvisi)
+    }
+
     /// Crea il sidecar XMP di un'immagine (RAW), copiando gli XMP già
     /// presenti nel file e applicando le modifiche richieste.
     pub fn create_sidecar(
@@ -177,6 +252,11 @@ impl ExifTool {
     }
 
     fn run(&self, args: &[OsString]) -> Result<Vec<u8>, MetadataError> {
+        self.run_dettagliato(args).map(|(stdout, _)| stdout)
+    }
+
+    /// Esegue ExifTool e restituisce stdout e righe di avviso.
+    fn run_dettagliato(&self, args: &[OsString]) -> Result<(Vec<u8>, Vec<String>), MetadataError> {
         let output = Command::new(&self.program)
             .args(args)
             .output()
@@ -188,7 +268,14 @@ impl ExifTool {
                 stderr: stderr.trim().to_owned(),
             });
         }
-        Ok(output.stdout)
+        let avvisi = stderr
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("Warning:"))
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect();
+        Ok((output.stdout, avvisi))
     }
 }
 
@@ -205,6 +292,22 @@ mod tests {
         ));
         assert!(esecuzione_fallita("", Some(2)));
         assert!(!esecuzione_fallita("", Some(0)));
+    }
+
+    #[test]
+    fn i_candidati_includono_la_copia_inclusa_e_il_path() {
+        let candidati = ExifTool::candidati();
+        assert!(!candidati.is_empty());
+        assert_eq!(
+            candidati.last().map(PathBuf::as_path),
+            Some(Path::new(if cfg!(windows) {
+                "exiftool.exe"
+            } else {
+                "exiftool"
+            }))
+        );
+        #[cfg(not(windows))]
+        assert!(candidati.iter().any(|p| p.ends_with("exiftool/exiftool")));
     }
 
     #[test]

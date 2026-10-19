@@ -8,3 +8,35 @@
 # Sistema operativo
 .DS_Store
 Thumbs.db
+
+# Segreti e configurazione locale
+.env
+.env.*
+*.pem
+*.key
+
+# Fotografie e dati di prova: mai nel repository
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+*.webp
+*.heic
+*.avif
+*.gif
+*.bmp
+*.dng
+*.cr2
+*.cr3
+*.nef
+*.arw
+*.raf
+*.xmp
+*.log
+index.db
+index.db-*
+!assets/UberPhoto.png
+
+# Cartelle di lavoro locali
+/testdata/
+/screenshot/

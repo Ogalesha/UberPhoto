@@ -1,0 +1,20 @@
+[package]
+name = "uberphoto-export"
+description = "Export for Web: ridimensionamento, profilo ICC, metadati e report di verifica"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+uberphoto-core.workspace = true
+uberphoto-image.workspace = true
+uberphoto-metadata.workspace = true
+image.workspace = true
+lcms2 = { version = "6", features = ["static"] }
+serde = { workspace = true }
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

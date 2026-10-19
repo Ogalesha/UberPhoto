@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=UberPhoto
+GenericName=Photo Manager
+Comment=Local-first photo manager with non-destructive editing and ExifTool metadata
+Exec=uberphoto %F
+Icon=uberphoto
+Terminal=false
+Categories=Graphics;Photography;
+Keywords=photo;image;metadata;exif;editor;
+MimeType=image/jpeg;image/png;image/tiff;image/webp;image/gif;image/bmp;
+StartupNotify=true

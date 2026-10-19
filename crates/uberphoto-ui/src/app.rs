@@ -11,14 +11,18 @@ use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use eframe::egui;
+use uberphoto_core::GpsLocation;
 use uberphoto_db::{Index, MetadataIndex};
+use uberphoto_export::{ExportItem, ExportJob, ExportService};
 use uberphoto_files::{
     create_dir, delete_empty_dir, dir_item_count, rename_dir, ConflictPolicy, DirNode, DirWatcher,
     DirectoryScanner, FileOpRequest, FileOpsService,
 };
-use uberphoto_image::{ImageKind, ImageService};
+use uberphoto_geo::{GeoOutcome, GeoRequest, GeoService, NominatimClient};
+use uberphoto_image::{EditRecipe, EditService, EditSource, ImageKind, ImageService};
 use uberphoto_metadata::{
-    exiftool_versione, MetadataField, MetadataOutcome, MetadataRequest, MetadataService, WriteItem,
+    exiftool_versione, LocationRole, MetadataEdit, MetadataField, MetadataOutcome, MetadataRequest,
+    MetadataService, WriteItem,
 };
 
 use crate::browser;
@@ -27,7 +31,7 @@ use crate::inspector;
 use crate::preview::PreviewState;
 use crate::state::{
     AppState, ConflictPrompt, DeleteDirPrompt, NewFolderPrompt, OpStatus, PersistedState,
-    RenamePrompt, RenameTarget, UiActions,
+    RenamePrompt, RenameTarget, SuggestionTarget, UiActions,
 };
 use crate::thumbnails::ThumbCache;
 use crate::util::elide;
@@ -45,6 +49,12 @@ pub struct UberPhotoApp {
     ops: FileOpsService,
     /// Lettura e scrittura dei metadati su thread dedicato.
     meta: MetadataService,
+    /// Ricerche geografiche (Nominatim) su thread dedicato.
+    geo: GeoService,
+    /// Elaborazione delle anteprime modificate (ricette di editing).
+    edit: EditService,
+    /// Esportazione for web su thread dedicato.
+    export: ExportService,
     /// Osservatore della cartella corrente per le modifiche esterne.
     watcher: Option<DirWatcher>,
     /// Chiusura automatica dopo N secondi, usata dagli smoke test di CI
@@ -80,6 +90,9 @@ impl UberPhotoApp {
             preview: PreviewState::new(),
             ops: FileOpsService::new(repaint.clone()),
             meta: MetadataService::new(repaint.clone()),
+            geo: GeoService::new(geo_client(), repaint.clone()),
+            edit: EditService::new(repaint.clone()),
+            export: ExportService::new(repaint.clone()),
             watcher: DirWatcher::new(repaint),
             smoke_exit,
         };
@@ -87,6 +100,21 @@ impl UberPhotoApp {
         app.state.exiftool = exiftool_versione();
         if app.state.exiftool.is_none() {
             tracing::warn!("ExifTool non trovato: l'editor metadati resterà disabilitato");
+        }
+        if let Some(index) = &app.index {
+            match index.load_presets() {
+                Ok(righe) => {
+                    app.state.edit.presets = righe
+                        .into_iter()
+                        .filter_map(|(nome, json)| {
+                            EditRecipe::from_json(&json)
+                                .ok()
+                                .map(|recipe| (nome, recipe.sanitized()))
+                        })
+                        .collect();
+                }
+                Err(err) => tracing::warn!("lettura dei preset non riuscita: {err:#}"),
+            }
         }
 
         if let Some(dir) = last_dir {
@@ -297,6 +325,11 @@ impl UberPhotoApp {
                     {
                         self.state.rebuild_meta_form();
                     }
+                    if self.state.gps.form_paths == self.state.selected_paths()
+                        && !self.state.gps.draft_dirty
+                    {
+                        self.state.rebuild_gps_form();
+                    }
                 }
                 MetadataOutcome::Written { report } => {
                     self.state.op_status = Some(OpStatus {
@@ -305,6 +338,10 @@ impl UberPhotoApp {
                         undo: None,
                     });
                     self.state.meta.form_dirty.clear();
+                    if report.failed.is_empty() {
+                        self.state.gps.location_dirty.clear();
+                        self.state.gps.draft_dirty = false;
+                    }
                     if report.updated.is_empty() {
                         continue;
                     }
@@ -337,6 +374,57 @@ impl UberPhotoApp {
         }
     }
 
+    /// Raccoglie gli esiti delle ricerche geografiche e aggiorna la scheda GPS.
+    fn pump_geo_results(&mut self) {
+        while let Some(outcome) = self.geo.try_recv() {
+            match outcome {
+                GeoOutcome::Search { query, result } => {
+                    self.state.gps.searching = false;
+                    match result {
+                        Ok(results) => {
+                            self.state.gps.geo_error = None;
+                            self.state.gps.search_results = results;
+                            tracing::info!(
+                                query = %query,
+                                risultati = self.state.gps.search_results.len(),
+                                "ricerca geografica completata"
+                            );
+                        }
+                        Err(error) => {
+                            self.state.gps.search_results.clear();
+                            self.state.gps.geo_error = Some(error);
+                        }
+                    }
+                }
+                GeoOutcome::Reverse { location, result } => {
+                    self.state.gps.reverse_pending = false;
+                    match result {
+                        Ok(Some(suggestion)) => {
+                            self.state.gps.geo_error = None;
+                            if self.state.gps.marker.is_some() {
+                                self.state.gps.fill_location(
+                                    LocationRole::Created,
+                                    &suggestion.location_suggestion(),
+                                );
+                                self.state.gps.reverse_note = Some(format!(
+                                    "Località di scatto compilata da: {}",
+                                    suggestion.display_name
+                                ));
+                            }
+                        }
+                        Ok(None) => {
+                            self.state.gps.geo_error = Some(format!(
+                                "Nessuna località trovata per {:.6}, {:.6}",
+                                location.latitude, location.longitude
+                            ));
+                        }
+                        Err(error) => self.state.gps.geo_error = Some(error),
+                    }
+                }
+            }
+        }
+    }
+
     /// Allinea il form metadati alla selezione corrente e legge i documenti
     /// mancanti delle foto appena selezionate.
     fn sync_metadata(&mut self) {
@@ -361,6 +449,11 @@ impl UberPhotoApp {
         } else if !da_ricaricare.is_empty() && self.state.meta.form_dirty.is_empty() {
             self.state.rebuild_meta_form();
         }
+        if self.state.gps.form_paths != selected
+            || (!da_ricaricare.is_empty() && !self.state.gps.draft_dirty)
+        {
+            self.state.rebuild_gps_form();
+        }
         if self.state.exiftool.is_none() {
             return;
         }
@@ -382,12 +475,249 @@ impl UberPhotoApp {
         }
     }
 
+    /// Allinea la scheda Colori alla selezione: carica la ricetta dal
+    /// catalogo, richiede la sorgente decodificata e innesca l'elaborazione
+    /// quando la ricetta attiva cambia.
+    fn sync_edit(&mut self, ctx: &egui::Context) {
+        let selected = self.state.selected_paths();
+        let singola = match selected.as_slice() {
+            [path] => Some(path.clone()),
+            _ => None,
+        };
+
+        let mut nuova_foto = false;
+        match &singola {
+            Some(path) => {
+                let mtime = self.state.entry_mtime(path);
+                let corrente = self.state.edit.path.as_deref() == Some(path.as_path());
+                if !corrente || self.state.edit.mtime != mtime {
+                    let recipe = self
+                        .index
+                        .as_ref()
+                        .and_then(|index| index.load_recipe(path).ok().flatten())
+                        .and_then(|json| EditRecipe::from_json(&json).ok())
+                        .map(|recipe| recipe.sanitized())
+                        .unwrap_or_default();
+                    self.state.edit.carica(path, mtime, recipe);
+                    self.preview.clear_edited();
+                    nuova_foto = true;
+                }
+            }
+            None => {
+                if self.state.edit.path.is_some() {
+                    self.state.edit.scarica();
+                    self.preview.clear_edited();
+                }
+            }
+        }
+
+        // La sorgente serve quando la scheda Colori è visibile o quando la
+        // finestra di anteprima mostra proprio questa foto.
+        let serve_sorgente = self.state.inspector_tab == crate::state::InspectorTab::Colori
+            || singola.as_deref().is_some_and(|path| {
+                let mtime = self.state.entry_mtime(path);
+                self.preview.accepts(path, mtime)
+            });
+        if nuova_foto || serve_sorgente {
+            if let Some(path) = &singola {
+                if self.state.edit.source.is_none() && !self.state.edit.source_requested {
+                    self.state.edit.source_requested = true;
+                    let mtime = self.state.entry_mtime(path);
+                    self.images.request_preview(path.clone(), mtime);
+                }
+            }
+        }
+
+        // Texture dell'originale, caricata dalla sorgente decodificata.
+        if self.state.edit.original.is_none() {
+            if let Some(source) = &self.state.edit.source {
+                let image = &source.image;
+                let color = egui::ColorImage::from_rgba_unmultiplied(
+                    [image.width as usize, image.height as usize],
+                    &image.rgba,
+                );
+                self.state.edit.original = Some(ctx.load_texture(
+                    "uberphoto-edit-source",
+                    color,
+                    egui::TextureOptions::LINEAR,
+                ));
+                self.state.edit.original_size = egui::vec2(image.width as f32, image.height as f32);
+            }
+        }
+
+        // Elaborazione: richiesta quando cambia la ricetta desiderata.
+        let edit = &mut self.state.edit;
+        let desiderata = (!edit.recipe.is_identity()).then_some(edit.recipe);
+        if desiderata != edit.requested {
+            match desiderata {
+                Some(recipe) => {
+                    if let Some(source) = &edit.source {
+                        edit.generation += 1;
+                        let generation = edit.generation;
+                        let source = source.clone();
+                        edit.requested = Some(recipe);
+                        self.edit.request(generation, source, recipe);
+                    }
+                }
+                None => {
+                    edit.edited = None;
+                    edit.edited_size = egui::Vec2::ZERO;
+                    edit.requested = None;
+                    self.preview.clear_edited();
+                }
+            }
+        }
+    }
+
+    /// Raccoglie le anteprime modificate pronte e le pubblica alla scheda
+    /// Colori e alla finestra di anteprima.
+    fn pump_edit_results(&mut self, ctx: &egui::Context) {
+        for result in self.edit.drain() {
+            {
+                let edit = &mut self.state.edit;
+                if edit.requested.is_none() || result.generation != edit.generation {
+                    continue; // richiesta superata
+                }
+                if edit.path.as_deref() != Some(result.path.as_path()) || edit.mtime != result.mtime
+                {
+                    continue; // il risultato è per un'altra foto
+                }
+                let pixels = &result.pixels;
+                let color = egui::ColorImage::from_rgba_unmultiplied(
+                    [pixels.width as usize, pixels.height as usize],
+                    &pixels.rgba,
+                );
+                let texture = ctx.load_texture(
+                    "uberphoto-edit-preview",
+                    color,
+                    egui::TextureOptions::LINEAR,
+                );
+                edit.edited_size = egui::vec2(pixels.width as f32, pixels.height as f32);
+                edit.applied_generation = result.generation;
+                edit.edited = Some(texture);
+            }
+            if self.preview.accepts(&result.path, result.mtime) {
+                if let Some(texture) = &self.state.edit.edited {
+                    self.preview
+                        .set_edited(texture.clone(), self.state.edit.edited_size);
+                }
+            }
+        }
+        self.state.edit.busy = self.edit.busy();
+    }
+
+    /// Scrive nel catalogo la ricetta modificata (autosalvataggio distinto
+    /// dal salvataggio dei metadati e dai pixel dell'originale).
+    fn autosave_recipe(&mut self) {
+        if !self.state.edit.pending_save {
+            return;
+        }
+        let Some(path) = self.state.edit.path.clone() else {
+            self.state.edit.pending_save = false;
+            return;
+        };
+        let recipe = self.state.edit.recipe;
+        let Some(index) = &self.index else {
+            self.state.edit.pending_save = false;
+            return;
+        };
+        let esito = if recipe.is_identity() {
+            index.remove_recipe(&path)
+        } else {
+            index.save_recipe(&path, &recipe.to_json())
+        };
+        match esito {
+            Ok(()) => {
+                self.state.edit.saved = recipe;
+                self.state.edit.pending_save = false;
+                self.state.edit.save_error = None;
+            }
+            Err(err) => {
+                self.state.edit.save_error = Some(format!("Ricetta non salvata: {err:#}"));
+            }
+        }
+    }
+
+    /// Raccoglie gli eventi del servizio di esportazione.
+    fn pump_export_results(&mut self) {
+        for evento in self.export.drain() {
+            match evento {
+                uberphoto_export::ExportEvent::Item(report) => {
+                    self.state.export.registra_report(report);
+                }
+                uberphoto_export::ExportEvent::Failed { source, error } => {
+                    self.state.export.registra_errore(source, error);
+                }
+                uberphoto_export::ExportEvent::Finished {
+                    exported,
+                    failed,
+                    total,
+                    cancelled,
+                } => {
+                    self.state.export.busy = false;
+                    self.state.export.cancelled = cancelled;
+                    let stato = if cancelled {
+                        "interrotta"
+                    } else {
+                        "completata"
+                    };
+                    self.state.export.summary = Some(format!(
+                        "Esportazione {stato}: {exported} riuscite, {failed} fallite su {total}."
+                    ));
+                }
+            }
+        }
+        if !self.export.busy() {
+            self.state.export.busy = false;
+        }
+    }
+
+    /// Avvia l'esportazione della selezione con i parametri della scheda.
+    fn start_export(&mut self) {
+        let selezionati: Vec<(PathBuf, uberphoto_core::FormatKind)> = self
+            .state
+            .selected_assets()
+            .into_iter()
+            .map(|asset| (asset.path.clone(), asset.format))
+            .collect();
+        if selezionati.is_empty() {
+            self.state.export.error = Some("Seleziona almeno una foto da esportare.".to_owned());
+            return;
+        }
+        let items: Vec<ExportItem> = selezionati
+            .into_iter()
+            .map(|(path, kind)| {
+                let recipe = if self.state.edit.path.as_deref() == Some(path.as_path()) {
+                    self.state.edit.recipe
+                } else {
+                    self.index
+                        .as_ref()
+                        .and_then(|index| index.load_recipe(&path).ok().flatten())
+                        .and_then(|json| EditRecipe::from_json(&json).ok())
+                        .map(|recipe| recipe.sanitized())
+                        .unwrap_or_default()
+                };
+                ExportItem { path, kind, recipe }
+            })
+            .collect();
+        let totale = items.len();
+        let job = ExportJob {
+            settings: self.state.export.settings.clone(),
+            items,
+        };
+        self.state.export.prepara(totale);
+        if !self.export.start(job) {
+            self.state.export.busy = false;
+            self.state.export.error = Some("Un'esportazione è già in corso.".to_owned());
+        }
+    }
+
     /// Scrive sulla selezione i soli campi modificati nel form.
     fn save_metadata(&mut self) {
         if self.state.meta.form_dirty.is_empty() {
             return;
         }
-        let edits: Vec<(MetadataField, Option<String>)> = self
+        let edits: Vec<MetadataEdit> = self
             .state
             .meta
             .form_dirty
@@ -401,7 +731,7 @@ impl UberPhotoApp {
                     .cloned()
                     .unwrap_or_default();
                 let value = value.trim();
-                (*field, (!value.is_empty()).then(|| value.to_owned()))
+                MetadataEdit::Field(*field, (!value.is_empty()).then(|| value.to_owned()))
             })
             .collect();
         if edits.is_empty() {
@@ -422,6 +752,79 @@ impl UberPhotoApp {
         }
     }
 
+    /// Scrive le coordinate del marker sulla selezione.
+    fn apply_gps_draft(&mut self) {
+        let Some(location) = self.state.gps.marker else {
+            self.state.error =
+                Some("Posiziona il marker o inserisci le coordinate prima di applicare".to_owned());
+            return;
+        };
+        self.write_gps_edit(Some(location));
+    }
+
+    /// Rimuove le coordinate GPS dalla selezione.
+    fn remove_gps_selection(&mut self) {
+        self.write_gps_edit(None);
+    }
+
+    fn write_gps_edit(&mut self, location: Option<GpsLocation>) {
+        let items: Vec<WriteItem> = self
+            .state
+            .selected_assets()
+            .into_iter()
+            .map(|asset| WriteItem {
+                path: asset.path.clone(),
+                format: asset.format,
+                edits: vec![MetadataEdit::Gps(location)],
+            })
+            .collect();
+        if items.is_empty() {
+            return;
+        }
+        self.meta.request(MetadataRequest::Write { items });
+    }
+
+    /// Scrive i soli campi di località modificati nella bozza.
+    fn save_location_edits(&mut self) {
+        if self.state.gps.location_dirty.is_empty() {
+            return;
+        }
+        let edits: Vec<MetadataEdit> = self
+            .state
+            .gps
+            .location_dirty
+            .iter()
+            .map(|(role, field)| {
+                let value = self
+                    .state
+                    .gps
+                    .location_values
+                    .get(&(*role, *field))
+                    .map(|text| text.trim().to_owned())
+                    .filter(|text| !text.is_empty());
+                MetadataEdit::Location {
+                    role: *role,
+                    field: *field,
+                    value,
+                }
+            })
+            .collect();
+        let items: Vec<WriteItem> = self
+            .state
+            .selected_assets()
+            .into_iter()
+            .map(|asset| WriteItem {
+                path: asset.path.clone(),
+                format: asset.format,
+                edits: edits.clone(),
+            })
+            .collect();
+        if items.is_empty() {
+            return;
+        }
+        self.meta.request(MetadataRequest::Write { items });
+    }
+
     /// Scrittura rapida della valutazione dal menu contestuale della griglia.
     fn rate_metadata(&mut self, paths: Vec<PathBuf>, stars: u8) {
         let items: Vec<WriteItem> = self
@@ -432,7 +835,10 @@ impl UberPhotoApp {
             .map(|entry| WriteItem {
                 path: entry.path.clone(),
                 format: entry.format,
-                edits: vec![(MetadataField::Rating, Some(stars.to_string()))],
+                edits: vec![MetadataEdit::Field(
+                    MetadataField::Rating,
+                    Some(stars.to_string()),
+                )],
             })
             .collect();
         if !items.is_empty() {
@@ -456,11 +862,33 @@ impl UberPhotoApp {
                     }
                 }
                 ImageKind::Preview => {
-                    if self.preview.accepts(&result.path, result.mtime) {
-                        match result.outcome {
+                    let path = result.path;
+                    let mtime = result.mtime;
+                    if self.preview.accepts(&path, mtime) {
+                        match &result.outcome {
                             Ok(image) => self.preview.set_image(ctx, image),
-                            Err(error) => self.preview.set_error(error),
+                            Err(error) => self.preview.set_error(error.clone()),
                         }
+                    }
+                    if self.state.edit.path.as_deref() == Some(path.as_path())
+                        && self.state.edit.mtime == mtime
+                    {
+                        match result.outcome {
+                            Ok(image) => {
+                                self.state.edit.source =
+                                    Some(Arc::new(EditSource { path, mtime, image }));
+                                self.state.edit.source_requested = false;
+                                self.state.edit.source_error = None;
+                            }
+                            Err(error) => {
+                                self.state.edit.source_requested = false;
+                                self.state.edit.source_error = Some(error);
+                            }
+                        }
+                    } else if self.state.edit.source_requested {
+                        // Il worker "latest wins" ha servito una richiesta più
+                        // recente: la sorgente va chiesta di nuovo.
+                        self.state.edit.source_requested = false;
                     }
                 }
             }
@@ -639,6 +1067,179 @@ impl UberPhotoApp {
         }
         if let Some((paths, stars)) = actions.metadata_rate {
             self.rate_metadata(paths, stars);
+        }
+
+        if actions.gps_apply {
+            self.apply_gps_draft();
+        }
+        if actions.gps_remove {
+            self.remove_gps_selection();
+        }
+        if actions.gps_save_location {
+            self.save_location_edits();
+        }
+        if actions.gps_reset {
+            self.state.rebuild_gps_form();
+        }
+        if let Some((result, target)) = actions.gps_use_suggestion {
+            match target {
+                SuggestionTarget::Marker => {
+                    let altitude = self.state.gps.marker.and_then(|marker| marker.altitude);
+                    self.state.gps.set_marker(Some(GpsLocation {
+                        latitude: result.latitude,
+                        longitude: result.longitude,
+                        altitude,
+                    }));
+                    let marker = self.state.gps.marker;
+                    self.state.center_gps_map(marker);
+                    self.state.gps.centered_for = marker;
+                }
+                SuggestionTarget::Created => {
+                    let suggestion = result.location_suggestion();
+                    self.state
+                        .gps
+                        .fill_location(LocationRole::Created, &suggestion);
+                }
+                SuggestionTarget::Shown => {
+                    let suggestion = result.location_suggestion();
+                    self.state
+                        .gps
+                        .fill_location(LocationRole::Shown, &suggestion);
+                }
+            }
+        }
+        if let Some(query) = actions.geocode_search {
+            self.geo.request(GeoRequest::Search { query });
+        }
+        if let Some(location) = actions.geocode_reverse {
+            self.geo.request(GeoRequest::Reverse { location });
+        }
+
+        if actions.edit_save_preset {
+            self.save_edit_preset();
+        }
+        if let Some(nome) = actions.edit_delete_preset {
+            self.delete_edit_preset(&nome);
+        }
+        if let Some(ricetta) = actions.edit_apply_preset {
+            self.apply_edit_preset_to_selection(ricetta);
+        }
+
+        if actions.export_pick_destination {
+            if let Some(cartella) = rfd::FileDialog::new()
+                .set_title("Cartella di destinazione dell'esportazione")
+                .pick_folder()
+            {
+                self.state.export.settings.destination = cartella;
+            }
+        }
+        if actions.export_clear {
+            self.state.export.reports.clear();
+            self.state.export.failures.clear();
+            self.state.export.summary = None;
+            self.state.export.error = None;
+            self.state.export.cancelled = false;
+            self.state.export.done = 0;
+            self.state.export.total = 0;
+        }
+        if actions.export_cancel {
+            self.export.cancel();
+        }
+        if actions.export_start {
+            self.start_export();
+        }
+    }
+
+    /// Salva la ricetta corrente come preset nel catalogo locale.
+    fn save_edit_preset(&mut self) {
+        let nome = self.state.edit.preset_name.trim().to_owned();
+        if nome.is_empty() {
+            return;
+        }
+        let recipe = self.state.edit.recipe;
+        let Some(index) = &self.index else {
+            self.state.edit.save_error =
+                Some("Preset non salvato: catalogo locale non disponibile".to_owned());
+            return;
+        };
+        match index.save_preset(&nome, &recipe.to_json()) {
+            Ok(()) => {
+                match self
+                    .state
+                    .edit
+                    .presets
+                    .iter_mut()
+                    .find(|(esistente, _)| *esistente == nome)
+                {
+                    Some(esistente) => esistente.1 = recipe,
+                    None => {
+                        self.state.edit.presets.push((nome, recipe));
+                        self.state
+                            .edit
+                            .presets
+                            .sort_by_cached_key(|(esistente, _)| esistente.to_lowercase());
+                    }
+                }
+                self.state.edit.preset_name.clear();
+                self.state.edit.save_error = None;
+            }
+            Err(err) => {
+                self.state.edit.save_error = Some(format!("Preset non salvato: {err:#}"));
+            }
+        }
+    }
+
+    /// Applica una ricetta (o la neutra) a tutte le foto selezionate.
+    fn apply_edit_preset_to_selection(&mut self, recipe: EditRecipe) {
+        let recipe = recipe.sanitized();
+        let selezionati = self.state.selected_paths();
+        let Some(index) = &self.index else {
+            self.state.edit.save_error =
+                Some("Preset non applicato: catalogo locale non disponibile".to_owned());
+            return;
+        };
+        let mut errori = 0usize;
+        for path in &selezionati {
+            let esito = if recipe.is_identity() {
+                index.remove_recipe(path)
+            } else {
+                index.save_recipe(path, &recipe.to_json())
+            };
+            if esito.is_err() {
+                errori += 1;
+            }
+        }
+        if errori > 0 {
+            self.state.edit.save_error = Some(format!(
+                "Preset applicato con {errori} errori di salvataggio nel catalogo"
+            ));
+        } else {
+            self.state.edit.save_error = None;
+        }
+        if let Some(path) = self.state.edit.path.clone() {
+            if selezionati.iter().any(|selezionata| selezionata == &path) {
+                let mtime = self.state.edit.mtime;
+                self.state.edit.carica(&path, mtime, recipe);
+            }
+        }
+    }
+
+    /// Elimina un preset dal catalogo locale.
+    fn delete_edit_preset(&mut self, nome: &str) {
+        let Some(index) = &self.index else {
+            return;
+        };
+        match index.delete_preset(nome) {
+            Ok(()) => {
+                self.state
+                    .edit
+                    .presets
+                    .retain(|(esistente, _)| esistente != nome);
+                self.state.edit.save_error = None;
+            }
+            Err(err) => {
+                self.state.edit.save_error = Some(format!("Preset non eliminato: {err:#}"));
+            }
         }
     }
 
@@ -1005,6 +1606,14 @@ fn open_index() -> Option<Index> {
     }
 }
 
+/// Client Nominatim con cache su disco accanto all'indice.
+fn geo_client() -> NominatimClient {
+    match eframe::storage_dir("UberPhoto") {
+        Some(dir) => NominatimClient::new(Some(dir.join("geo-cache.json"))),
+        None => NominatimClient::new(None),
+    }
+}
+
 /// Aggiorna i percorsi dei nodi sotto `from` dopo una rinomina di cartella,
 /// ricaricando i figli dei rami espansi coinvolti.
 fn tree_repath(node: &mut DirNode, from: &Path, to: &Path) {
@@ -1132,7 +1741,11 @@ impl eframe::App for UberPhotoApp {
         self.pump_image_results(&ctx);
         self.pump_ops_results();
         self.pump_metadata_results();
+        self.pump_geo_results();
+        self.pump_edit_results(&ctx);
+        self.pump_export_results();
         self.sync_metadata();
+        self.sync_edit(&ctx);
 
         // Modifiche esterne alla cartella corrente: riscansione calmierata.
         let settled = self
@@ -1173,6 +1786,8 @@ impl eframe::App for UberPhotoApp {
 
         self.prompts(&ctx, &mut actions);
         self.handle_actions(actions);
+        self.autosave_recipe();
+        self.preview.set_prefer_edited(!self.state.edit.compare);
         self.preview.ui(&ctx);
 
         // Mantiene animati spinner e avanzamento durante le operazioni lunghe.
@@ -1180,6 +1795,8 @@ impl eframe::App for UberPhotoApp {
         if self.state.loading_dir.is_some()
             || self.thumbs.has_inflight()
             || self.preview.is_loading()
+            || self.state.edit.busy
+            || self.state.export.busy
             || watcher_pending
         {
             ctx.request_repaint_after(Duration::from_millis(100));

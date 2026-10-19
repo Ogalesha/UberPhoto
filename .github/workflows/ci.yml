@@ -79,6 +79,32 @@ jobs:
       - name: Build release
         run: cargo build --release --locked -p uberphoto-app
 
+      - name: Verifica pacchetto Linux (.deb con ExifTool incluso)
+        if: runner.os == 'Linux'
+        run: |
+          bash packaging/linux/build-deb.sh
+          VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
+          STAGE="target/deb/uberphoto_${VERSION}_amd64"
+          dpkg-deb --info "target/uberphoto_${VERSION}_amd64.deb"
+          "$STAGE/usr/lib/uberphoto/exiftool/exiftool" -ver
+
+      - name: Verifica bundle macOS (.app con ExifTool incluso)
+        if: runner.os == 'macOS'
+        run: |
+          MACOS_ARCH=aarch64 bash packaging/macos/bundle.sh
+          ./target/UberPhoto.app/Contents/Resources/exiftool/exiftool -ver
+
+      - name: Verifica pacchetto Windows (ZIP e installer con ExifTool incluso)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./packaging/windows/package.ps1
+          & .\target\windows-package\exiftool.exe -ver
+          choco install innosetup -y --no-progress
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"$').Matches[0].Groups[1].Value
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$version" packaging\windows\installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "iscc uscito con codice $LASTEXITCODE" }
+
       - name: Smoke test GUI headless (Linux, Xvfb)
         if: runner.os == 'Linux'
         run: |

@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use uberphoto_core::FormatKind;
 use uberphoto_db::{Index, MetadataIndex};
 use uberphoto_metadata::{
-    document_from_tags, exiftool_disponibile, ExifTool, MetadataField, MetadataOutcome,
-    MetadataRequest, MetadataService, WriteItem,
+    document_from_tags, exiftool_disponibile, ExifTool, MetadataEdit, MetadataField,
+    MetadataOutcome, MetadataRequest, MetadataService, WriteItem,
 };
 
 fn crea_immagine(path: &Path, format: image::ImageFormat) {
@@ -61,9 +61,9 @@ fn scrittura_riassunto_e_indice_in_sincronia() {
             path: path.clone(),
             format: FormatKind::Jpeg,
             edits: vec![
-                (MetadataField::Title, Some("Titolo test".to_owned())),
-                (MetadataField::Keywords, Some("mare, blu".to_owned())),
-                (MetadataField::Rating, Some("4".to_owned())),
+                MetadataEdit::Field(MetadataField::Title, Some("Titolo test".to_owned())),
+                MetadataEdit::Field(MetadataField::Keywords, Some("mare, blu".to_owned())),
+                MetadataEdit::Field(MetadataField::Rating, Some("4".to_owned())),
             ],
         }],
     });
@@ -148,8 +148,8 @@ fn i_formati_senza_metadati_embedded_usano_il_sidecar() {
             path: path.clone(),
             format: FormatKind::Dng,
             edits: vec![
-                (MetadataField::Title, Some("Titolo RAW".to_owned())),
-                (MetadataField::Orientation, Some("6".to_owned())),
+                MetadataEdit::Field(MetadataField::Title, Some("Titolo RAW".to_owned())),
+                MetadataEdit::Field(MetadataField::Orientation, Some("6".to_owned())),
             ],
         }],
     });

@@ -3,6 +3,10 @@
 //! L'immagine viene decodificata in background (worker dedicato del
 //! [`ImageService`], con politica "latest wins") e caricata come texture.
 //! La navigazione è puramente visuale: nessuna modifica ai pixel.
+//!
+//! Quando la scheda Colori produce un'anteprima modificata per la stessa
+//! foto, la finestra mostra quella (marcata "DOPO"); col pulsante "Prima"
+//! della scheda Colori si torna temporaneamente all'originale.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -16,6 +20,12 @@ pub struct PreviewState {
     mtime: Option<SystemTime>,
     texture: Option<egui::TextureHandle>,
     size_px: egui::Vec2,
+    /// Anteprima con la ricetta di editing applicata, condivisa con la
+    /// scheda Colori (è la stessa texture, il costo è quello di un handle).
+    edited: Option<egui::TextureHandle>,
+    edited_size: egui::Vec2,
+    /// Mostra l'anteprima modificata quando disponibile.
+    prefer_edited: bool,
     loading: bool,
     error: Option<String>,
     zoom: f32,
@@ -31,6 +41,9 @@ impl PreviewState {
             mtime: None,
             texture: None,
             size_px: egui::Vec2::ZERO,
+            edited: None,
+            edited_size: egui::Vec2::ZERO,
+            prefer_edited: true,
             loading: false,
             error: None,
             zoom: 1.0,
@@ -52,6 +65,8 @@ impl PreviewState {
         self.path = Some(path.to_path_buf());
         self.mtime = mtime;
         self.texture = None;
+        self.edited = None;
+        self.edited_size = egui::Vec2::ZERO;
         self.size_px = egui::Vec2::ZERO;
         self.loading = true;
         self.error = None;
@@ -67,7 +82,7 @@ impl PreviewState {
         self.open && self.path.as_deref() == Some(path) && self.mtime == mtime
     }
 
-    pub fn set_image(&mut self, ctx: &egui::Context, image: LoadedImage) {
+    pub fn set_image(&mut self, ctx: &egui::Context, image: &LoadedImage) {
         let color = egui::ColorImage::from_rgba_unmultiplied(
             [image.width as usize, image.height as usize],
             &image.rgba,
@@ -76,6 +91,25 @@ impl PreviewState {
         self.size_px = egui::vec2(image.width as f32, image.height as f32);
         self.loading = false;
         self.needs_fit = true;
+    }
+
+    /// Anteprima modificata prodotta dalla scheda Colori per la foto
+    /// corrente (la texture è condivisa, non duplicata).
+    pub fn set_edited(&mut self, texture: egui::TextureHandle, size: egui::Vec2) {
+        self.edited = Some(texture);
+        self.edited_size = size;
+        self.needs_fit = true;
+    }
+
+    /// Nessuna anteprima modificata: si torna all'originale.
+    pub fn clear_edited(&mut self) {
+        self.edited = None;
+        self.edited_size = egui::Vec2::ZERO;
+    }
+
+    /// Scelta tra originale e modificata (il pulsante "Prima" dell'editor).
+    pub fn set_prefer_edited(&mut self, prefer: bool) {
+        self.prefer_edited = prefer;
     }
 
     pub fn set_error(&mut self, error: String) {
@@ -114,6 +148,8 @@ impl PreviewState {
         // a costo di una nuova decodifica.
         if !self.open {
             self.texture = None;
+            self.edited = None;
+            self.edited_size = egui::Vec2::ZERO;
             self.path = None;
             self.mtime = None;
             self.error = None;
@@ -191,7 +227,16 @@ impl PreviewState {
             return;
         }
 
-        let Some(texture) = &self.texture else {
+        let attiva = if self.prefer_edited && self.edited.is_some() {
+            self.edited
+                .as_ref()
+                .map(|texture| (texture, self.edited_size))
+        } else {
+            None
+        }
+        .or_else(|| self.texture.as_ref().map(|texture| (texture, self.size_px)));
+
+        let Some((texture, size_px)) = attiva else {
             painter.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
@@ -203,7 +248,7 @@ impl PreviewState {
         };
 
         let ppp = ui.ctx().pixels_per_point();
-        let size_pts = self.size_px / ppp;
+        let size_pts = size_px / ppp;
         if self.needs_fit && size_pts.x > 0.0 && size_pts.y > 0.0 {
             self.zoom = (rect.width() / size_pts.x)
                 .min(rect.height() / size_pts.y)
@@ -220,5 +265,16 @@ impl PreviewState {
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
             egui::Color32::WHITE,
         );
+
+        if self.edited.is_some() {
+            let etichetta = if self.prefer_edited { "DOPO" } else { "PRIMA" };
+            painter.text(
+                rect.left_top() + egui::vec2(10.0, 10.0),
+                egui::Align2::LEFT_TOP,
+                etichetta,
+                egui::FontId::proportional(11.0),
+                egui::Color32::from_gray(200),
+            );
+        }
     }
 }

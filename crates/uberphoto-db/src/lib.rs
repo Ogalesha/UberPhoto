@@ -1,14 +1,15 @@
-//! Indice locale SQLite (Fasi 2-3).
+//! Indice locale SQLite (Fasi 2-5).
 //!
 //! Principio architetturale: **SQLite riflette lo stato del filesystem, non
 //! lo sostituisce**. Ogni riga è una cache verificabile rispetto ai file
 //! reali: il file resta la fonte di verità e il database può essere
 //! ricostruito in ogni momento con una riscansione.
 //!
-//! Contenuto attuale (Fase 2): tabella `photo_index` con i dati di filesystem
-//! delle foto scansionate (percorso, mtime, dimensione, formato, dimensioni)
-//! e le colonne dei metadati, che saranno popolate dal motore ExifTool
-//! (Fase 3).
+//! Contenuto attuale:
+//! - tabella `photo_index` con i dati di filesystem delle foto scansionate
+//!   (Fase 2) e i metadati letti da ExifTool (Fase 3);
+//! - tabelle `edit_recipes` e `edit_presets` con le ricette di editing
+//!   non distruttivo (Fase 5), salvate separatamente dagli originali.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,7 +20,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use uberphoto_core::PhotoAsset;
 
 /// Versione dello schema salvata in `PRAGMA user_version`.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 const COLUMNS: &str = "path, mtime, byte_size, format, width, height, has_gps, \
      rating, date_original, keywords, camera_make, camera_model, lens, iso, \
@@ -145,7 +146,18 @@ impl Index {
                 gps_lat REAL,
                 gps_lon REAL
             );
-            CREATE INDEX IF NOT EXISTS idx_photo_index_format ON photo_index(format);",
+            CREATE INDEX IF NOT EXISTS idx_photo_index_format ON photo_index(format);
+
+            CREATE TABLE IF NOT EXISTS edit_recipes (
+                path TEXT PRIMARY KEY,
+                recipe TEXT NOT NULL,
+                updated INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS edit_presets (
+                name TEXT PRIMARY KEY,
+                recipe TEXT NOT NULL
+            );",
         )
         .context("creazione schema indice")?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
@@ -270,7 +282,7 @@ impl Index {
     }
 
     /// Aggiorna il percorso di una singola riga (rinomina o spostamento),
-    /// mantenendo i dati già indicizzati.
+    /// mantenendo i dati già indicizzati (metadati e ricetta di editing).
     pub fn move_path(&self, from: &Path, to: &Path) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
@@ -281,14 +293,26 @@ impl Index {
             "UPDATE photo_index SET path = ?1 WHERE path = ?2",
             params![path_text(to), path_text(from)],
         )?;
+        tx.execute(
+            "DELETE FROM edit_recipes WHERE path = ?1",
+            params![path_text(to)],
+        )?;
+        tx.execute(
+            "UPDATE edit_recipes SET path = ?1 WHERE path = ?2",
+            params![path_text(to), path_text(from)],
+        )?;
         tx.commit()?;
         Ok(())
     }
 
-    /// Elimina la riga relativa a `path`.
+    /// Elimina la riga relativa a `path` (metadati e ricetta di editing).
     pub fn remove(&self, path: &Path) -> Result<()> {
         self.conn.execute(
             "DELETE FROM photo_index WHERE path = ?1",
+            params![path_text(path)],
+        )?;
+        self.conn.execute(
+            "DELETE FROM edit_recipes WHERE path = ?1",
             params![path_text(path)],
         )?;
         Ok(())
@@ -297,10 +321,17 @@ impl Index {
     /// Elimina `dir` e tutte le sue sottocartelle; restituisce le righe rimosse.
     pub fn remove_dir(&self, dir: &Path) -> Result<usize> {
         let paths = self.paths_under(dir)?;
+        let recipes = self.recipe_paths_under(dir)?;
         let tx = self.conn.unchecked_transaction()?;
         {
             let mut stmt = tx.prepare("DELETE FROM photo_index WHERE path = ?1")?;
             for path in &paths {
+                stmt.execute(params![path_text(path)])?;
+            }
+        }
+        {
+            let mut stmt = tx.prepare("DELETE FROM edit_recipes WHERE path = ?1")?;
+            for path in &recipes {
                 stmt.execute(params![path_text(path)])?;
             }
         }
@@ -311,6 +342,7 @@ impl Index {
     /// Aggiorna i percorsi dopo la rinomina/spostamento di una cartella.
     pub fn move_dir(&self, from: &Path, to: &Path) -> Result<usize> {
         let paths = self.paths_under(from)?;
+        let recipes = self.recipe_paths_under(from)?;
         let tx = self.conn.unchecked_transaction()?;
         {
             let mut stmt = tx.prepare("UPDATE photo_index SET path = ?1 WHERE path = ?2")?;
@@ -320,14 +352,114 @@ impl Index {
                 }
             }
         }
+        {
+            let mut stmt = tx.prepare("UPDATE edit_recipes SET path = ?1 WHERE path = ?2")?;
+            for path in &recipes {
+                if let Ok(relative) = path.strip_prefix(from) {
+                    stmt.execute(params![path_text(&to.join(relative)), path_text(path)])?;
+                }
+            }
+        }
         tx.commit()?;
         Ok(paths.len())
+    }
+
+    /// Salva (o sostituisce) la ricetta di editing di una foto, in JSON.
+    pub fn save_recipe(&self, path: &Path, recipe_json: &str) -> Result<()> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0);
+        self.conn.execute(
+            "INSERT INTO edit_recipes (path, recipe, updated) VALUES (?1, ?2, ?3)
+             ON CONFLICT(path) DO UPDATE SET
+                recipe = excluded.recipe,
+                updated = excluded.updated",
+            params![path_text(path), recipe_json, now],
+        )?;
+        Ok(())
+    }
+
+    /// Ricetta di editing di una foto (JSON), se presente.
+    pub fn load_recipe(&self, path: &Path) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT recipe FROM edit_recipes WHERE path = ?1",
+                params![path_text(path)],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Elimina la ricetta di editing di una foto.
+    pub fn remove_recipe(&self, path: &Path) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM edit_recipes WHERE path = ?1",
+            params![path_text(path)],
+        )?;
+        Ok(())
+    }
+
+    /// Numero di ricette salvate (per test e diagnostica).
+    pub fn count_recipes(&self) -> Result<u64> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM edit_recipes", [], |row| row.get(0))?;
+        Ok(count.max(0) as u64)
+    }
+
+    /// Salva (o sostituisce) un preset di editing, in JSON.
+    pub fn save_preset(&self, name: &str, recipe_json: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO edit_presets (name, recipe) VALUES (?1, ?2)
+             ON CONFLICT(name) DO UPDATE SET recipe = excluded.recipe",
+            params![name, recipe_json],
+        )?;
+        Ok(())
+    }
+
+    /// Elimina un preset di editing.
+    pub fn delete_preset(&self, name: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM edit_presets WHERE name = ?1", params![name])?;
+        Ok(())
+    }
+
+    /// Preset salvati, in ordine alfabetico: `(nome, ricetta JSON)`.
+    pub fn load_presets(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name, recipe FROM edit_presets ORDER BY name COLLATE NOCASE")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     fn paths_under(&self, dir: &Path) -> Result<Vec<PathBuf>> {
         let mut stmt = self
             .conn
             .prepare("SELECT path FROM photo_index WHERE path LIKE ?1 ESCAPE '\\'")?;
+        let rows = stmt.query_map(params![like_dir_pattern(dir)], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let path = PathBuf::from(row?);
+            if path.starts_with(dir) {
+                out.push(path);
+            }
+        }
+        Ok(out)
+    }
+
+    fn recipe_paths_under(&self, dir: &Path) -> Result<Vec<PathBuf>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path FROM edit_recipes WHERE path LIKE ?1 ESCAPE '\\'")?;
         let rows = stmt.query_map(params![like_dir_pattern(dir)], |row| {
             row.get::<_, String>(0)
         })?;
@@ -505,5 +637,120 @@ mod tests {
         let index = Index::open(&db_path).unwrap();
         let row = index.get(Path::new("/foto/a.jpg")).unwrap().unwrap();
         assert_eq!(row.byte_size, Some(42));
+    }
+
+    #[test]
+    fn la_ricetta_si_salva_e_si_rilegge() {
+        let index = Index::open_in_memory().unwrap();
+        index
+            .save_recipe(Path::new("/foto/a.jpg"), r#"{"exposure":1.0}"#)
+            .unwrap();
+        assert_eq!(
+            index
+                .load_recipe(Path::new("/foto/a.jpg"))
+                .unwrap()
+                .as_deref(),
+            Some(r#"{"exposure":1.0}"#)
+        );
+        assert_eq!(index.load_recipe(Path::new("/foto/b.jpg")).unwrap(), None);
+        assert_eq!(index.count_recipes().unwrap(), 1);
+
+        index
+            .save_recipe(Path::new("/foto/a.jpg"), r#"{"exposure":-2.0}"#)
+            .unwrap();
+        assert_eq!(
+            index
+                .load_recipe(Path::new("/foto/a.jpg"))
+                .unwrap()
+                .as_deref(),
+            Some(r#"{"exposure":-2.0}"#),
+            "il salvataggio sostituisce la ricetta precedente"
+        );
+
+        index.remove_recipe(Path::new("/foto/a.jpg")).unwrap();
+        assert_eq!(index.load_recipe(Path::new("/foto/a.jpg")).unwrap(), None);
+    }
+
+    #[test]
+    fn i_preset_si_salvano_e_si_elencano_in_ordine() {
+        let index = Index::open_in_memory().unwrap();
+        index.save_preset("Vintage", r#"{"gamma":1.4}"#).unwrap();
+        index
+            .save_preset("Bianco e nero", r#"{"saturation":-100}"#)
+            .unwrap();
+        index.save_preset("Vintage", r#"{"gamma":1.6}"#).unwrap();
+
+        let presets = index.load_presets().unwrap();
+        assert_eq!(presets.len(), 2);
+        assert_eq!(presets[0].0, "Bianco e nero");
+        assert_eq!(
+            presets[1],
+            ("Vintage".to_owned(), r#"{"gamma":1.6}"#.to_owned())
+        );
+
+        index.delete_preset("Vintage").unwrap();
+        let rimasti = index.load_presets().unwrap();
+        assert_eq!(rimasti.len(), 1);
+        assert_eq!(rimasti[0].0, "Bianco e nero");
+    }
+
+    #[test]
+    fn lo_spostamento_porta_con_se_la_ricetta() {
+        let index = Index::open_in_memory().unwrap();
+        index.upsert_file_info(&asset("/base/a.jpg", 1)).unwrap();
+        index
+            .save_recipe(Path::new("/base/a.jpg"), r#"{"contrast":20}"#)
+            .unwrap();
+        index
+            .move_path(Path::new("/base/a.jpg"), Path::new("/base/b.jpg"))
+            .unwrap();
+        assert_eq!(
+            index
+                .load_recipe(Path::new("/base/b.jpg"))
+                .unwrap()
+                .as_deref(),
+            Some(r#"{"contrast":20}"#)
+        );
+        assert_eq!(index.load_recipe(Path::new("/base/a.jpg")).unwrap(), None);
+    }
+
+    #[test]
+    fn la_rinomina_di_cartella_aggiorna_le_ricette() {
+        let index = Index::open_in_memory().unwrap();
+        for path in ["/base/a.jpg", "/base/sub/c.jpg"] {
+            index.upsert_file_info(&asset(path, 1)).unwrap();
+            index
+                .save_recipe(Path::new(path), r#"{"exposure":1}"#)
+                .unwrap();
+        }
+        index
+            .move_dir(Path::new("/base"), Path::new("/nuova"))
+            .unwrap();
+        assert_eq!(index.count_recipes().unwrap(), 2);
+        assert!(index
+            .load_recipe(Path::new("/nuova/a.jpg"))
+            .unwrap()
+            .is_some());
+        assert!(index
+            .load_recipe(Path::new("/nuova/sub/c.jpg"))
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn l_eliminazione_di_cartella_rimuove_le_ricette() {
+        let index = Index::open_in_memory().unwrap();
+        for path in ["/base/a.jpg", "/base/sub/c.jpg", "/altrove/d.jpg"] {
+            index.upsert_file_info(&asset(path, 1)).unwrap();
+            index
+                .save_recipe(Path::new(path), r#"{"exposure":1}"#)
+                .unwrap();
+        }
+        index.remove_dir(Path::new("/base")).unwrap();
+        assert_eq!(index.count_recipes().unwrap(), 1);
+        assert!(index
+            .load_recipe(Path::new("/altrove/d.jpg"))
+            .unwrap()
+            .is_some());
     }
 }

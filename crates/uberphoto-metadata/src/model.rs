@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 
 use serde_json::Value;
-use uberphoto_core::FormatKind;
+use uberphoto_core::{FormatKind, GpsLocation};
 
 use crate::exiftool::TagMap;
 
@@ -167,11 +167,136 @@ impl MetadataField {
 }
 
 /// Posizione GPS in gradi decimali (latitudine a sud e longitudine a ovest
-/// sono negative).
+/// sono negative); l'altitudine è in metri sul livello del mare.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GpsPosition {
     pub latitude: f64,
     pub longitude: f64,
+    pub altitude: Option<f64>,
+}
+
+/// Ruolo di una località secondo l'IPTC Extension: dove è stata scattata la
+/// foto (`Created`) oppure cosa raffigura l'immagine (`Shown`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LocationRole {
+    Created,
+    Shown,
+}
+
+impl LocationRole {
+    pub const ALL: [Self; 2] = [Self::Created, Self::Shown];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Created => "Località di scatto",
+            Self::Shown => "Località raffigurata",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::Created => "dove è stata scattata la fotografia",
+            Self::Shown => "cosa raffigura l'immagine",
+        }
+    }
+}
+
+/// Campi descrittivi di una località (IPTC Extension).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LocationField {
+    Place,
+    Sublocation,
+    City,
+    State,
+    Country,
+    CountryCode,
+}
+
+impl LocationField {
+    pub const ALL: [Self; 6] = [
+        Self::Place,
+        Self::Sublocation,
+        Self::City,
+        Self::State,
+        Self::Country,
+        Self::CountryCode,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Place => "Nome luogo",
+            Self::Sublocation => "Sublocation",
+            Self::City => "Città",
+            Self::State => "Regione / provincia",
+            Self::Country => "Paese",
+            Self::CountryCode => "Codice ISO",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::CountryCode => "due lettere, es. IT",
+            Self::Place => "nome del luogo",
+            _ => "",
+        }
+    }
+}
+
+/// Valori delle località lette dai metadati.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct LocationInfo {
+    values: BTreeMap<LocationField, String>,
+}
+
+impl LocationInfo {
+    pub fn value(&self, field: LocationField) -> Option<&str> {
+        self.values.get(&field).map(String::as_str)
+    }
+
+    pub fn display(&self, field: LocationField) -> String {
+        self.value(field).unwrap_or_default().to_owned()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    fn set(&mut self, field: LocationField, value: Option<String>) {
+        match value {
+            Some(value) if !value.is_empty() => {
+                self.values.insert(field, value);
+            }
+            _ => {
+                self.values.remove(&field);
+            }
+        }
+    }
+}
+
+/// Modifica inviata al motore metadati: campo canonico, coordinate GPS o
+/// campo di località. `None`/stringa vuota cancellano il valore.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MetadataEdit {
+    Field(MetadataField, Option<String>),
+    Gps(Option<GpsLocation>),
+    Location {
+        role: LocationRole,
+        field: LocationField,
+        value: Option<String>,
+    },
+}
+
+impl MetadataEdit {
+    /// Etichetta per i report di scrittura e verifica.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Field(field, _) => field.label().to_owned(),
+            Self::Gps(_) => "Coordinate GPS".to_owned(),
+            Self::Location { role, field, .. } => {
+                format!("{} — {}", role.label(), field.label())
+            }
+        }
+    }
 }
 
 /// Informazioni tecniche prodotte dalla fotocamera: sola lettura, per non
@@ -190,13 +315,15 @@ pub struct TechnicalInfo {
     pub date_modified: Option<String>,
 }
 
-/// Documento canonico: valori scalari, liste e dati tecnici.
+/// Documento canonico: valori scalari, liste, dati tecnici e località.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct MetadataDocument {
     values: BTreeMap<MetadataField, String>,
     lists: BTreeMap<MetadataField, Vec<String>>,
     pub technical: TechnicalInfo,
     pub gps: Option<GpsPosition>,
+    pub location_created: LocationInfo,
+    pub location_shown: LocationInfo,
 }
 
 impl MetadataDocument {
@@ -222,6 +349,14 @@ impl MetadataDocument {
             .and_then(|v| v.parse::<i64>().ok())
             .and_then(|v| u8::try_from(v).ok())
             .filter(|v| *v <= 5)
+    }
+
+    /// Località per ruolo (di scatto oppure raffigurata).
+    pub fn location(&self, role: LocationRole) -> &LocationInfo {
+        match role {
+            LocationRole::Created => &self.location_created,
+            LocationRole::Shown => &self.location_shown,
+        }
     }
 
     fn set_value(&mut self, field: MetadataField, value: Option<String>) {
@@ -341,6 +476,91 @@ fn seconds(value: f64) -> String {
     } else {
         format!("{value:.1} s")
     }
+}
+
+/// Tag di lettura per ciascun campo di località, in ordine di priorità:
+/// prima l'IPTC Extension (struttura moderna), poi i campi IPTC Core / IIM
+/// legacy solo per la località di scatto.
+fn location_read_tags(role: LocationRole, field: LocationField) -> &'static [&'static str] {
+    match role {
+        LocationRole::Created => match field {
+            LocationField::Place => &["XMP-iptcExt:LocationCreatedLocationName"],
+            LocationField::Sublocation => &[
+                "XMP-iptcExt:LocationCreatedSublocation",
+                "XMP-iptcCore:Location",
+                "IPTC:Sub-location",
+            ],
+            LocationField::City => &[
+                "XMP-iptcExt:LocationCreatedCity",
+                "XMP-photoshop:City",
+                "IPTC:City",
+            ],
+            LocationField::State => &[
+                "XMP-iptcExt:LocationCreatedProvinceState",
+                "XMP-photoshop:State",
+                "IPTC:Province-State",
+            ],
+            LocationField::Country => &[
+                "XMP-iptcExt:LocationCreatedCountryName",
+                "XMP-photoshop:Country",
+                "IPTC:Country-PrimaryLocationName",
+            ],
+            LocationField::CountryCode => &[
+                "XMP-iptcExt:LocationCreatedCountryCode",
+                "XMP-iptcCore:CountryCode",
+                "IPTC:Country-PrimaryLocationCode",
+            ],
+        },
+        LocationRole::Shown => match field {
+            LocationField::Place => &["XMP-iptcExt:LocationShownLocationName"],
+            LocationField::Sublocation => &["XMP-iptcExt:LocationShownSublocation"],
+            LocationField::City => &["XMP-iptcExt:LocationShownCity"],
+            LocationField::State => &["XMP-iptcExt:LocationShownProvinceState"],
+            LocationField::Country => &["XMP-iptcExt:LocationShownCountryName"],
+            LocationField::CountryCode => &["XMP-iptcExt:LocationShownCountryCode"],
+        },
+    }
+}
+
+/// Nome del campo dentro la struttura IPTC Extension (`LocationCreated` /
+/// `LocationShown`); ExifTool con `-struct` non appiattisce questi campi.
+fn location_struct_key(field: LocationField) -> &'static str {
+    match field {
+        LocationField::Place => "LocationName",
+        LocationField::Sublocation => "Sublocation",
+        LocationField::City => "City",
+        LocationField::State => "ProvinceState",
+        LocationField::Country => "CountryName",
+        LocationField::CountryCode => "CountryCode",
+    }
+}
+
+/// Legge un campo dalla struttura IPTC Extension: una lista di oggetti
+/// (lang-alt), di norma con una sola voce.
+fn location_struct_value(tags: &TagMap, group: &str, field: LocationField) -> Option<String> {
+    let key = location_struct_key(field);
+    let valore = |oggetto: &Value| oggetto.get(key).and_then(string_value);
+    match tags.get(group)? {
+        Value::Array(items) => items.iter().rev().find_map(valore),
+        Value::Object(map) => map.get(key).and_then(string_value),
+        _ => None,
+    }
+}
+
+fn location_from_tags(tags: &TagMap, role: LocationRole) -> LocationInfo {
+    let group = match role {
+        LocationRole::Created => "XMP-iptcExt:LocationCreated",
+        LocationRole::Shown => "XMP-iptcExt:LocationShown",
+    };
+    let mut info = LocationInfo::default();
+    for field in LocationField::ALL {
+        info.set(
+            field,
+            location_struct_value(tags, group, field)
+                .or_else(|| text(tags, location_read_tags(role, field))),
+        );
+    }
+    info
 }
 
 /// Costruisce il documento canonico da una mappa di tag ExifTool.
@@ -547,13 +767,30 @@ pub fn document_from_tags(tags: &TagMap) -> MetadataDocument {
             &["GPS:GPSLongitudeRef", "EXIF:GPSLongitudeRef"],
         )
     });
+    let altitude = number(tags, &["Composite:GPSAltitude"]).or_else(|| {
+        let value = number(tags, &["GPS:GPSAltitude", "EXIF:GPSAltitude"])?;
+        let below = number(
+            tags,
+            &[
+                "GPS:GPSAltitudeRef",
+                "EXIF:GPSAltitudeRef",
+                "XMP-exif:GPSAltitudeRef",
+            ],
+        )
+        .is_some_and(|reference| reference >= 1.0);
+        Some(if below { -value } else { value })
+    });
     document.gps = match (latitude, longitude) {
         (Some(latitude), Some(longitude)) => Some(GpsPosition {
             latitude,
             longitude,
+            altitude,
         }),
         _ => None,
     };
+
+    document.location_created = location_from_tags(tags, LocationRole::Created);
+    document.location_shown = location_from_tags(tags, LocationRole::Shown);
 
     document
 }
@@ -820,6 +1057,184 @@ pub fn changes_for(
         }
     }
     Ok(assegnazioni)
+}
+
+// ---------------------------------------------------------------------------
+// Scrittura GPS e località
+// ---------------------------------------------------------------------------
+
+fn numero(value: f64) -> String {
+    value.to_string()
+}
+
+/// Assegnazioni per scrivere (o cancellare, con `None`) le coordinate GPS.
+///
+/// Nei file embedded si scrivono sia il gruppo EXIF GPS sia i tag XMP
+/// equivalenti; nei sidecar XMP soltanto i tag XMP. I riferimenti N/S ed E/O
+/// e il segno dell'altitudine vengono sempre esplicitati.
+pub fn gps_changes(
+    location: Option<&GpsLocation>,
+    _format: FormatKind,
+    sidecar: bool,
+) -> Vec<String> {
+    const EXIF_TAGS: [&str; 6] = [
+        "EXIF:GPSLatitude",
+        "EXIF:GPSLatitudeRef",
+        "EXIF:GPSLongitude",
+        "EXIF:GPSLongitudeRef",
+        "EXIF:GPSAltitude",
+        "EXIF:GPSAltitudeRef",
+    ];
+    const XMP_TAGS: [&str; 4] = [
+        "XMP-exif:GPSLatitude",
+        "XMP-exif:GPSLongitude",
+        "XMP-exif:GPSAltitude",
+        "XMP-exif:GPSAltitudeRef",
+    ];
+
+    let mut out = Vec::new();
+    if !sidecar {
+        for tag in EXIF_TAGS {
+            out.push(format!("{tag}="));
+        }
+    }
+    for tag in XMP_TAGS {
+        out.push(format!("{tag}="));
+    }
+
+    if let Some(location) = location {
+        if !sidecar {
+            out.push(format!("EXIF:GPSLatitude={}", numero(location.latitude)));
+            out.push(format!(
+                "EXIF:GPSLatitudeRef={}",
+                if location.latitude < 0.0 { "S" } else { "N" }
+            ));
+            out.push(format!("EXIF:GPSLongitude={}", numero(location.longitude)));
+            out.push(format!(
+                "EXIF:GPSLongitudeRef={}",
+                if location.longitude < 0.0 { "W" } else { "E" }
+            ));
+            if let Some(altitude) = location.altitude {
+                out.push(format!("EXIF:GPSAltitude={}", numero(altitude.abs())));
+                out.push(format!(
+                    "EXIF:GPSAltitudeRef={}",
+                    if altitude < 0.0 { 1 } else { 0 }
+                ));
+            }
+        }
+        out.push(format!(
+            "XMP-exif:GPSLatitude={}",
+            numero(location.latitude)
+        ));
+        out.push(format!(
+            "XMP-exif:GPSLongitude={}",
+            numero(location.longitude)
+        ));
+        if let Some(altitude) = location.altitude {
+            out.push(format!("XMP-exif:GPSAltitude={}", numero(altitude.abs())));
+            out.push(format!(
+                "XMP-exif:GPSAltitudeRef={}",
+                if altitude < 0.0 { 1 } else { 0 }
+            ));
+        }
+    }
+    out
+}
+
+/// Tag di scrittura per ciascun campo di località; l'IPTC nativo viene
+/// aggiunto solo per i formati che lo supportano e mai nei sidecar.
+fn location_write_tags(role: LocationRole, field: LocationField) -> &'static [&'static str] {
+    match role {
+        LocationRole::Created => match field {
+            LocationField::Place => &["XMP-iptcExt:LocationCreatedLocationName"],
+            LocationField::Sublocation => &[
+                "XMP-iptcExt:LocationCreatedSublocation",
+                "XMP-iptcCore:Location",
+                "IPTC:Sub-location",
+            ],
+            LocationField::City => &[
+                "XMP-iptcExt:LocationCreatedCity",
+                "XMP-photoshop:City",
+                "IPTC:City",
+            ],
+            LocationField::State => &[
+                "XMP-iptcExt:LocationCreatedProvinceState",
+                "XMP-photoshop:State",
+                "IPTC:Province-State",
+            ],
+            LocationField::Country => &[
+                "XMP-iptcExt:LocationCreatedCountryName",
+                "XMP-photoshop:Country",
+                "IPTC:Country-PrimaryLocationName",
+            ],
+            LocationField::CountryCode => &[
+                "XMP-iptcExt:LocationCreatedCountryCode",
+                "XMP-iptcCore:CountryCode",
+                "IPTC:Country-PrimaryLocationCode",
+            ],
+        },
+        LocationRole::Shown => match field {
+            LocationField::Place => &["XMP-iptcExt:LocationShownLocationName"],
+            LocationField::Sublocation => &["XMP-iptcExt:LocationShownSublocation"],
+            LocationField::City => &["XMP-iptcExt:LocationShownCity"],
+            LocationField::State => &["XMP-iptcExt:LocationShownProvinceState"],
+            LocationField::Country => &["XMP-iptcExt:LocationShownCountryName"],
+            LocationField::CountryCode => &["XMP-iptcExt:LocationShownCountryCode"],
+        },
+    }
+}
+
+fn normalizza_codice_paese(valore: &str) -> Result<String, String> {
+    let codice = valore.trim().to_ascii_uppercase();
+    if codice.len() == 2 && codice.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+        Ok(codice)
+    } else {
+        Err("usa il codice ISO a due lettere (es. IT)".to_owned())
+    }
+}
+
+/// Assegnazioni per un campo di località; `None` o stringa vuota cancellano
+/// il campo da tutti i contenitori supportati.
+pub fn location_changes(
+    role: LocationRole,
+    field: LocationField,
+    value: Option<&str>,
+    format: FormatKind,
+    sidecar: bool,
+) -> Result<Vec<String>, String> {
+    let normalizzato = match value.map(str::trim).filter(|text| !text.is_empty()) {
+        None => None,
+        Some(text) => match field {
+            LocationField::CountryCode => Some(normalizza_codice_paese(text)?),
+            _ => Some(text.to_owned()),
+        },
+    };
+
+    let scrivibile_iptc = !sidecar && iptc_supportato(format);
+    let mut out = Vec::new();
+    for tag in location_write_tags(role, field) {
+        if tag.starts_with("IPTC:") && !scrivibile_iptc {
+            continue;
+        }
+        out.push(format!("{tag}={}", normalizzato.as_deref().unwrap_or("")));
+    }
+    Ok(out)
+}
+
+/// Trasforma una [`MetadataEdit`] nelle assegnazioni ExifTool
+/// (`Gruppo:Tag=valore`) per il formato e la destinazione indicati.
+pub fn assignments_for(
+    edit: &MetadataEdit,
+    format: FormatKind,
+    sidecar: bool,
+) -> Result<Vec<String>, String> {
+    match edit {
+        MetadataEdit::Field(field, value) => changes_for(*field, value.as_deref(), format, sidecar),
+        MetadataEdit::Gps(location) => Ok(gps_changes(location.as_ref(), format, sidecar)),
+        MetadataEdit::Location { role, field, value } => {
+            location_changes(*role, *field, value.as_deref(), format, sidecar)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1101,7 +1516,8 @@ mod tests {
             doc.gps,
             Some(GpsPosition {
                 latitude: -44.4949,
-                longitude: 11.3426
+                longitude: 11.3426,
+                altitude: None,
             })
         );
         assert_eq!(
@@ -1165,5 +1581,172 @@ mod tests {
         assert!(!raw[0].writable, "ExifTool è un gruppo di sola lettura");
         assert!(!raw[1].writable);
         assert!(raw[2].writable, "IFD0 è scrivibile");
+    }
+
+    #[test]
+    fn l_altitudine_viene_letta_col_segno_dal_riferimento() {
+        let tags = mappa(&[
+            ("Composite:GPSLatitude", json!(44.4949)),
+            ("Composite:GPSLongitude", json!(11.3426)),
+            ("Composite:GPSAltitude", json!(-120.5)),
+        ]);
+        let doc = document_from_tags(&tags);
+        assert_eq!(doc.gps.unwrap().altitude, Some(-120.5));
+
+        let tags = mappa(&[
+            ("GPS:GPSLatitude", json!(33.8688)),
+            ("GPS:GPSLatitudeRef", json!("S")),
+            ("GPS:GPSLongitude", json!(70.6693)),
+            ("GPS:GPSLongitudeRef", json!("W")),
+            ("GPS:GPSAltitude", json!(120.5)),
+            ("GPS:GPSAltitudeRef", json!(1)),
+        ]);
+        let doc = document_from_tags(&tags);
+        let gps = doc.gps.unwrap();
+        assert_eq!(gps.latitude, -33.8688);
+        assert_eq!(gps.longitude, -70.6693);
+        assert_eq!(gps.altitude, Some(-120.5));
+    }
+
+    #[test]
+    fn le_coordinate_vengono_scritte_e_cancellate_su_tutti_i_contenitori() {
+        let location = GpsLocation::new(-33.8688, -70.6693, Some(-120.5)).unwrap();
+
+        let embedded = gps_changes(Some(&location), FormatKind::Jpeg, false);
+        assert!(embedded.contains(&"EXIF:GPSLatitude=-33.8688".to_owned()));
+        assert!(embedded.contains(&"EXIF:GPSLatitudeRef=S".to_owned()));
+        assert!(embedded.contains(&"EXIF:GPSLongitude=-70.6693".to_owned()));
+        assert!(embedded.contains(&"EXIF:GPSLongitudeRef=W".to_owned()));
+        assert!(embedded.contains(&"EXIF:GPSAltitude=120.5".to_owned()));
+        assert!(embedded.contains(&"EXIF:GPSAltitudeRef=1".to_owned()));
+        assert!(embedded.contains(&"XMP-exif:GPSLatitude=-33.8688".to_owned()));
+
+        let sidecar = gps_changes(Some(&location), FormatKind::Dng, true);
+        assert!(sidecar.iter().all(|change| change.starts_with("XMP-exif:")));
+
+        let removed = gps_changes(None, FormatKind::Jpeg, false);
+        assert!(removed.contains(&"EXIF:GPSLatitude=".to_owned()));
+        assert!(removed.contains(&"XMP-exif:GPSLatitude=".to_owned()));
+        assert!(removed.iter().all(|change| change.ends_with('=')));
+    }
+
+    #[test]
+    fn le_localita_created_e_shown_usano_gli_standard_iptc() {
+        let created = location_changes(
+            LocationRole::Created,
+            LocationField::City,
+            Some("Sesto"),
+            FormatKind::Jpeg,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            created,
+            vec![
+                "XMP-iptcExt:LocationCreatedCity=Sesto",
+                "XMP-photoshop:City=Sesto",
+                "IPTC:City=Sesto",
+            ]
+        );
+
+        let shown = location_changes(
+            LocationRole::Shown,
+            LocationField::City,
+            Some("Milano"),
+            FormatKind::Jpeg,
+            false,
+        )
+        .unwrap();
+        assert_eq!(shown, vec!["XMP-iptcExt:LocationShownCity=Milano"]);
+
+        let png = location_changes(
+            LocationRole::Created,
+            LocationField::City,
+            Some("Sesto"),
+            FormatKind::Png,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            png,
+            vec![
+                "XMP-iptcExt:LocationCreatedCity=Sesto",
+                "XMP-photoshop:City=Sesto",
+            ]
+        );
+    }
+
+    #[test]
+    fn il_codice_paese_viene_normalizzato_e_validato() {
+        let it = location_changes(
+            LocationRole::Created,
+            LocationField::CountryCode,
+            Some(" it "),
+            FormatKind::Png,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            it,
+            vec![
+                "XMP-iptcExt:LocationCreatedCountryCode=IT",
+                "XMP-iptcCore:CountryCode=IT"
+            ]
+        );
+
+        assert!(location_changes(
+            LocationRole::Created,
+            LocationField::CountryCode,
+            Some("Italia"),
+            FormatKind::Png,
+            false
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn le_localita_vengono_lette_con_le_priorita_giuste() {
+        let tags = mappa(&[
+            ("XMP-iptcExt:LocationCreatedCity", json!("Sesto")),
+            ("XMP-photoshop:City", json!("Legacy")),
+            ("IPTC:Country-PrimaryLocationCode", json!("IT ")),
+            ("XMP-iptcExt:LocationShownLocationName", json!("Duomo")),
+        ]);
+        let doc = document_from_tags(&tags);
+        assert_eq!(
+            doc.location_created.value(LocationField::City),
+            Some("Sesto")
+        );
+        assert_eq!(
+            doc.location_created.value(LocationField::CountryCode),
+            Some("IT"),
+            "il padding IPTC viene rimosso"
+        );
+        assert_eq!(
+            doc.location_shown.value(LocationField::Place),
+            Some("Duomo")
+        );
+        assert!(doc.location_shown.value(LocationField::City).is_none());
+    }
+
+    #[test]
+    fn una_modifica_unificata_produce_le_assegnazioni_giuste() {
+        let edit = MetadataEdit::Location {
+            role: LocationRole::Created,
+            field: LocationField::Country,
+            value: Some("Italia".to_owned()),
+        };
+        assert_eq!(
+            assignments_for(&edit, FormatKind::Jpeg, false).unwrap(),
+            vec![
+                "XMP-iptcExt:LocationCreatedCountryName=Italia",
+                "XMP-photoshop:Country=Italia",
+                "IPTC:Country-PrimaryLocationName=Italia",
+            ]
+        );
+        assert_eq!(edit.label(), "Località di scatto — Paese");
+
+        let gps = MetadataEdit::Gps(GpsLocation::new(1.0, 2.0, None).ok());
+        assert!(assignments_for(&gps, FormatKind::Jpeg, false).is_ok());
     }
 }

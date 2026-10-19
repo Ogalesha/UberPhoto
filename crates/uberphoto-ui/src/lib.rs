@@ -10,7 +10,10 @@
 
 mod app;
 mod browser;
+mod editor;
 mod explorer;
+mod export;
+mod gps;
 mod inspector;
 mod preview;
 mod state;

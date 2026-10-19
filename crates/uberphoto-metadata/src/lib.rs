@@ -16,8 +16,9 @@ mod service;
 pub use error::MetadataError;
 pub use exiftool::{sidecar_path, ExifTool, TagMap};
 pub use model::{
-    changes_for, document_from_tags, raw_tags_from, summary_from_tags, GpsPosition,
-    MetadataDocument, MetadataField, MetadataSummary, RawTag, Section, TechnicalInfo,
+    assignments_for, changes_for, document_from_tags, gps_changes, location_changes, raw_tags_from,
+    summary_from_tags, GpsPosition, LocationField, LocationInfo, LocationRole, MetadataDocument,
+    MetadataEdit, MetadataField, MetadataSummary, RawTag, Section, TechnicalInfo,
 };
 pub use service::{
     exiftool_disponibile, exiftool_versione, FullDocument, MetadataOutcome, MetadataRequest,

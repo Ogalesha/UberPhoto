@@ -7,6 +7,28 @@ e il progetto aderisce a [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-19
+
+### Added
+
+- Fase 4 — selettore GPS su mappa OpenStreetMap con marker trascinabile, clic per posizionare, coordinate manuali e centratura; ricerca facoltativa dei luoghi su Nominatim solo su azione esplicita, con User-Agent e attribuzione.
+- Fase 5 — editing non distruttivo: ricetta colore salvata nel catalogo (esposizione, luminosità, contrasto, alte luci, ombre, bianchi, neri, saturazione, vibrance, temperatura, tinta, gamma, nitidezza), ritaglio e rotazione a passi di 90°.
+- Fase 5 — anteprima in tempo reale su copia ridotta con worker "latest wins", confronto "Prima", annulla/ripeti e ripristino per singolo campo.
+- Fase 5 — preset colore salvati nel catalogo, applicabili alla foto corrente o all'intera selezione multipla.
+- Fase 6 — nuovo crate `uberphoto-export`: profili Full metadata, Web optimized e Privacy, formati JPEG/PNG/WebP/TIFF, conversione ICC a sRGB con profilo incorporato, ridimensionamento Lanczos3 senza ingrandimento, denominazione con prefisso/suffisso/slug e conflitti senza sovrascrittura.
+- Fase 6 — verifica dell'esportazione: i tag di sorgente e uscita vengono riletti insieme e classificati come preservati, adeguati, non supportati o persi, con avvisi espliciti (per esempio IPTC non memorizzabile in WebP).
+- Fase 6 — scheda Esportazione con profilo, formato, qualità, ridimensionamento, destinazione, avanzamento, annullamento e report per foto; i file parziali vengono rimossi in caso di errore.
+- Fase 7 — pacchetti installabili e autosufficienti: `.deb` Debian/Ubuntu con desktop entry, bundle `.app` macOS, installer Windows (Inno Setup) e ZIP portabile, tutti con ExifTool incluso; archivio portabile Linux con ExifTool.
+- Fase 7 — smoke test di integrazione GPS (Fase 4): scrittura e rilettura del marker con altitudine, rimozione senza toccare i tag estranei, rifiuto delle coordinate fuori intervallo.
+- Fase 7 — ExifTool viene cercato prima accanto all'eseguibile (copia inclusa nel pacchetto), poi in `UBERPHOTO_EXIFTOOL` e infine nel `PATH`.
+- Fase 7 — benchmark manuali per la pipeline colore su 24 MP e per la scansione di 2.000 file; verifica dei pacchetti nella CI.
+- Fase 7 — README aggiornato alle Fasi 1–7 con funzionalità, limiti noti e istruzioni di packaging.
+
+### Fixed
+
+- La scheda Colori applica i preset alla selezione multipla invece di limitarsi a dichiararla non supportata.
+- `.gitignore` esclude segreti (`.env`, chiavi), fotografie, database locali e log; nel repository restano solo sorgenti, specifiche e l'icona necessaria alla compilazione.
+
 ## [0.2.1] - 2026-10-18
 
 ### Fixed
@@ -55,6 +77,7 @@ e il progetto aderisce a [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - CI GitHub Actions su Ubuntu, macOS e Windows (formato, clippy, test) e workflow di release con binari scaricabili per i tag `v*`.
 - Smoke test GUI headless (Xvfb) nella CI Linux.
 
-[Unreleased]: https://github.com/Ogalesha/UberPhoto/compare/v0.2.1...main
+[Unreleased]: https://github.com/Ogalesha/UberPhoto/compare/v0.3.0...main
+[0.3.0]: https://github.com/Ogalesha/UberPhoto/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/Ogalesha/UberPhoto/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Ogalesha/UberPhoto/compare/v0.1.0...v0.2.0

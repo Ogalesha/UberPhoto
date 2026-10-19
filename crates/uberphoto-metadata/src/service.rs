@@ -8,13 +8,13 @@ use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, OnceLock};
 
-use uberphoto_core::FormatKind;
+use uberphoto_core::{FormatKind, GpsLocation};
 
 use crate::error::MetadataError;
 use crate::exiftool::{sidecar_path, ExifTool};
 use crate::model::{
-    changes_for, document_from_tags, raw_tags_from, summary_from_tags, MetadataDocument,
-    MetadataField, MetadataSummary, RawTag,
+    assignments_for, document_from_tags, raw_tags_from, summary_from_tags, LocationField,
+    LocationRole, MetadataDocument, MetadataEdit, MetadataField, MetadataSummary, RawTag,
 };
 
 /// File per invocazione nelle letture riassuntive (indice).
@@ -73,7 +73,7 @@ pub enum MetadataRequest {
 pub struct WriteItem {
     pub path: PathBuf,
     pub format: FormatKind,
-    pub edits: Vec<(MetadataField, Option<String>)>,
+    pub edits: Vec<MetadataEdit>,
 }
 
 /// Documento completo con la vista avanzata dei tag.
@@ -274,6 +274,90 @@ fn normalizza_confronto(field: MetadataField, value: &str) -> String {
     }
 }
 
+/// Confronto tra valori attesi e riletti; tolleranze per i valori numerici
+/// che ExifTool converte in frazioni razionali (DMS, altitudine).
+fn gps_conferma(
+    atteso: Option<GpsLocation>,
+    effettivo: Option<crate::model::GpsPosition>,
+) -> Result<(), String> {
+    match (atteso, effettivo) {
+        (None, None) => Ok(()),
+        (None, Some(effettivo)) => Err(format!(
+            "atteso «(nessuna coordinata)», letto «{:.6}, {:.6}»",
+            effettivo.latitude, effettivo.longitude
+        )),
+        (Some(atteso), None) => Err(format!(
+            "atteso «{:.6}, {:.6}», letto «(nessuna coordinata)»",
+            atteso.latitude, atteso.longitude
+        )),
+        (Some(atteso), Some(effettivo)) => {
+            let lat_ok = (atteso.latitude - effettivo.latitude).abs() <= 5e-6;
+            let lon_ok = (atteso.longitude - effettivo.longitude).abs() <= 5e-6;
+            if !lat_ok || !lon_ok {
+                return Err(format!(
+                    "atteso «{:.6}, {:.6}», letto «{:.6}, {:.6}»",
+                    atteso.latitude, atteso.longitude, effettivo.latitude, effettivo.longitude
+                ));
+            }
+            let alt_ok = match (atteso.altitude, effettivo.altitude) {
+                (None, None) => true,
+                (Some(atteso), Some(effettivo)) => (atteso - effettivo).abs() <= 0.05,
+                _ => false,
+            };
+            if alt_ok {
+                Ok(())
+            } else {
+                let testo = |altitude: Option<f64>| match altitude {
+                    Some(value) => format!("{value:.1} m"),
+                    None => "(nessuna)".to_owned(),
+                };
+                Err(format!(
+                    "altitudine: atteso «{}», letto «{}»",
+                    testo(atteso.altitude),
+                    testo(effettivo.altitude)
+                ))
+            }
+        }
+    }
+}
+
+fn location_conferma(
+    document: &MetadataDocument,
+    role: LocationRole,
+    field: LocationField,
+    atteso: Option<&str>,
+) -> Result<(), String> {
+    // Il codice paese viene normalizzato in maiuscolo prima della scrittura.
+    let atteso = atteso.map(str::trim).unwrap_or_default();
+    let atteso = if field == LocationField::CountryCode {
+        atteso.to_ascii_uppercase()
+    } else {
+        atteso.to_owned()
+    };
+    let info = match role {
+        LocationRole::Created => &document.location_created,
+        LocationRole::Shown => &document.location_shown,
+    };
+    let effettivo = info.display(field);
+    if atteso == effettivo {
+        Ok(())
+    } else {
+        Err(format!(
+            "atteso «{}», letto «{}»",
+            if atteso.is_empty() {
+                "(vuoto)".to_owned()
+            } else {
+                atteso
+            },
+            if effettivo.is_empty() {
+                "(vuoto)".to_owned()
+            } else {
+                effettivo
+            }
+        ))
+    }
+}
+
 fn write_items(items: &[WriteItem]) -> MetadataWriteReport {
     let mut report = MetadataWriteReport::default();
     let tool = match tool() {
@@ -301,23 +385,21 @@ fn write_items(items: &[WriteItem]) -> MetadataWriteReport {
             continue;
         }
         let mut assignments = Vec::new();
-        let mut saltate: Vec<&str> = Vec::new();
-        let mut scritte: Vec<(MetadataField, Option<String>)> = Vec::new();
+        let mut saltate: Vec<String> = Vec::new();
+        let mut scritte: Vec<MetadataEdit> = Vec::new();
         let mut errore_validazione = None;
 
-        for (field, value) in &item.edits {
-            match changes_for(*field, value.as_deref(), item.format, sidecar) {
+        for edit in &item.edits {
+            match assignments_for(edit, item.format, sidecar) {
                 Ok(changes) if changes.is_empty() => {
-                    if value.is_some() {
-                        saltate.push(field.label());
-                    }
+                    saltate.push(edit.label());
                 }
                 Ok(changes) => {
                     assignments.extend(changes);
-                    scritte.push((*field, value.clone()));
+                    scritte.push(edit.clone());
                 }
                 Err(message) => {
-                    errore_validazione = Some(format!("{}: {message}", field.label()));
+                    errore_validazione = Some(format!("{}: {message}", edit.label()));
                     break;
                 }
             }
@@ -369,27 +451,41 @@ fn write_items(items: &[WriteItem]) -> MetadataWriteReport {
             Ok(maps) => match maps.first() {
                 Some(map) if ha_errore(map).is_none() => {
                     let document = document_from_tags(map);
-                    for (field, value) in &scritte {
-                        let atteso = normalizza_confronto(*field, value.as_deref().unwrap_or(""));
-                        let effettivo = normalizza_confronto(*field, &document.display(*field));
-                        if atteso != effettivo {
-                            let atteso_testo = if atteso.is_empty() {
-                                "(vuoto)"
-                            } else {
-                                &atteso
-                            };
-                            let effettivo_testo = if effettivo.is_empty() {
-                                "(vuoto)".to_owned()
-                            } else {
-                                effettivo
-                            };
-                            report.unverified.push((
-                                item.path.clone(),
-                                format!(
-                                    "{}: atteso «{atteso_testo}», letto «{effettivo_testo}»",
-                                    field.label()
-                                ),
-                            ));
+                    for edit in &scritte {
+                        let esito = match edit {
+                            MetadataEdit::Field(field, value) => {
+                                let atteso =
+                                    normalizza_confronto(*field, value.as_deref().unwrap_or(""));
+                                let effettivo =
+                                    normalizza_confronto(*field, &document.display(*field));
+                                (atteso != effettivo).then(|| {
+                                    let atteso_testo = if atteso.is_empty() {
+                                        "(vuoto)".to_owned()
+                                    } else {
+                                        atteso
+                                    };
+                                    let effettivo_testo = if effettivo.is_empty() {
+                                        "(vuoto)".to_owned()
+                                    } else {
+                                        effettivo
+                                    };
+                                    format!(
+                                        "{}: atteso «{atteso_testo}», letto «{effettivo_testo}»",
+                                        field.label()
+                                    )
+                                })
+                            }
+                            MetadataEdit::Gps(location) => gps_conferma(*location, document.gps)
+                                .err()
+                                .map(|message| format!("{}: {message}", edit.label())),
+                            MetadataEdit::Location { role, field, value } => {
+                                location_conferma(&document, *role, *field, value.as_deref())
+                                    .err()
+                                    .map(|message| format!("{}: {message}", edit.label()))
+                            }
+                        };
+                        if let Some(message) = esito {
+                            report.unverified.push((item.path.clone(), message));
                         }
                     }
                     report.updated.push(item.path.clone());
@@ -487,9 +583,9 @@ mod tests {
                 path: foto.clone(),
                 format: FormatKind::Jpeg,
                 edits: vec![
-                    (MetadataField::Title, Some("Titolo servizio".to_owned())),
-                    (MetadataField::Rating, Some("5".to_owned())),
-                    (MetadataField::Keywords, Some("mare, tramonto".to_owned())),
+                    MetadataEdit::Field(MetadataField::Title, Some("Titolo servizio".to_owned())),
+                    MetadataEdit::Field(MetadataField::Rating, Some("5".to_owned())),
+                    MetadataEdit::Field(MetadataField::Keywords, Some("mare, tramonto".to_owned())),
                 ],
             }],
         });
@@ -536,7 +632,10 @@ mod tests {
             items: vec![WriteItem {
                 path: PathBuf::from("/tmp/uberphoto-non-esiste-mai/foto.jpg"),
                 format: FormatKind::Jpeg,
-                edits: vec![(MetadataField::Title, Some("x".to_owned()))],
+                edits: vec![MetadataEdit::Field(
+                    MetadataField::Title,
+                    Some("x".to_owned()),
+                )],
             }],
         });
         match attendi(&service) {
@@ -565,8 +664,8 @@ mod tests {
                 path: raw.clone(),
                 format: FormatKind::Dng,
                 edits: vec![
-                    (MetadataField::Title, Some("Scatto RAW".to_owned())),
-                    (MetadataField::Orientation, Some("6".to_owned())),
+                    MetadataEdit::Field(MetadataField::Title, Some("Scatto RAW".to_owned())),
+                    MetadataEdit::Field(MetadataField::Orientation, Some("6".to_owned())),
                 ],
             }],
         });
@@ -581,5 +680,138 @@ mod tests {
         }
         let sidecar = sidecar_path(&raw);
         assert!(sidecar.is_file(), "il sidecar XMP deve esistere");
+    }
+
+    #[test]
+    fn le_coordinate_gps_vengono_scritte_e_verificate() {
+        let Some(_tool) = exiftool() else {
+            eprintln!("ExifTool assente: test saltato");
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let foto = temp.path().join("gps.jpg");
+        crea_immagine(&foto);
+
+        let posizione = GpsLocation::new(-33.8688, -70.6693, Some(-120.5)).unwrap();
+        let service = MetadataService::new(Arc::new(|| {}));
+        service.request(MetadataRequest::Write {
+            items: vec![WriteItem {
+                path: foto.clone(),
+                format: FormatKind::Jpeg,
+                edits: vec![MetadataEdit::Gps(Some(posizione))],
+            }],
+        });
+        match attendi(&service) {
+            MetadataOutcome::Written { report } => {
+                assert_eq!(report.updated, vec![foto.clone()]);
+                assert!(report.failed.is_empty(), "{:?}", report.failed);
+                assert!(report.unverified.is_empty(), "{:?}", report.unverified);
+            }
+            _ => panic!("esito inatteso"),
+        }
+
+        service.request(MetadataRequest::ReadFull {
+            paths: vec![foto.clone()],
+        });
+        match attendi(&service) {
+            MetadataOutcome::Full { items } => {
+                let document = items[0].1.as_ref().unwrap();
+                let gps = document.document.gps.unwrap();
+                assert!((gps.latitude + 33.8688).abs() < 5e-6);
+                assert!((gps.longitude + 70.6693).abs() < 5e-6);
+                assert!((gps.altitude.unwrap() + 120.5).abs() < 0.05);
+            }
+            _ => panic!("esito inatteso"),
+        }
+
+        service.request(MetadataRequest::Write {
+            items: vec![WriteItem {
+                path: foto.clone(),
+                format: FormatKind::Jpeg,
+                edits: vec![MetadataEdit::Gps(None)],
+            }],
+        });
+        match attendi(&service) {
+            MetadataOutcome::Written { report } => {
+                assert_eq!(report.updated, vec![foto.clone()]);
+                assert!(report.unverified.is_empty(), "{:?}", report.unverified);
+            }
+            _ => panic!("esito inatteso"),
+        }
+        service.request(MetadataRequest::ReadFull {
+            paths: vec![foto.clone()],
+        });
+        match attendi(&service) {
+            MetadataOutcome::Full { items } => {
+                assert!(items[0].1.as_ref().unwrap().document.gps.is_none());
+            }
+            _ => panic!("esito inatteso"),
+        }
+    }
+
+    #[test]
+    fn le_localita_vengono_scritte_e_verificate() {
+        let Some(_tool) = exiftool() else {
+            eprintln!("ExifTool assente: test saltato");
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let foto = temp.path().join("luogo.jpg");
+        crea_immagine(&foto);
+
+        let service = MetadataService::new(Arc::new(|| {}));
+        service.request(MetadataRequest::Write {
+            items: vec![WriteItem {
+                path: foto.clone(),
+                format: FormatKind::Jpeg,
+                edits: vec![
+                    MetadataEdit::Location {
+                        role: LocationRole::Created,
+                        field: LocationField::City,
+                        value: Some("Sesto".to_owned()),
+                    },
+                    MetadataEdit::Location {
+                        role: LocationRole::Created,
+                        field: LocationField::CountryCode,
+                        value: Some("it".to_owned()),
+                    },
+                    MetadataEdit::Location {
+                        role: LocationRole::Shown,
+                        field: LocationField::Place,
+                        value: Some("Duomo".to_owned()),
+                    },
+                ],
+            }],
+        });
+        match attendi(&service) {
+            MetadataOutcome::Written { report } => {
+                assert_eq!(report.updated, vec![foto.clone()]);
+                assert!(report.failed.is_empty(), "{:?}", report.failed);
+                assert!(report.unverified.is_empty(), "{:?}", report.unverified);
+            }
+            _ => panic!("esito inatteso"),
+        }
+
+        service.request(MetadataRequest::ReadFull {
+            paths: vec![foto.clone()],
+        });
+        match attendi(&service) {
+            MetadataOutcome::Full { items } => {
+                let document = &items[0].1.as_ref().unwrap().document;
+                assert_eq!(
+                    document.location_created.value(LocationField::City),
+                    Some("Sesto")
+                );
+                assert_eq!(
+                    document.location_created.value(LocationField::CountryCode),
+                    Some("IT")
+                );
+                assert_eq!(
+                    document.location_shown.value(LocationField::Place),
+                    Some("Duomo")
+                );
+            }
+            _ => panic!("esito inatteso"),
+        }
     }
 }

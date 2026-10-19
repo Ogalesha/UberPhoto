@@ -9,11 +9,12 @@ members = [
     "crates/uberphoto-metadata",
     "crates/uberphoto-geo",
     "crates/uberphoto-db",
+    "crates/uberphoto-export",
     "crates/uberphoto-tests",
 ]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
@@ -25,6 +26,7 @@ uberphoto-image = { path = "crates/uberphoto-image" }
 uberphoto-metadata = { path = "crates/uberphoto-metadata" }
 uberphoto-geo = { path = "crates/uberphoto-geo" }
 uberphoto-db = { path = "crates/uberphoto-db" }
+uberphoto-export = { path = "crates/uberphoto-export" }
 uberphoto-ui = { path = "crates/uberphoto-ui" }
 
 eframe = { version = "0.37", features = ["persistence"] }
@@ -48,6 +50,11 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3"
+ureq = { version = "3", default-features = false, features = [
+    "rustls",
+    "gzip",
+] }
+walkers = "0.63"
 
 [profile.dev]
 opt-level = 1
