@@ -6,6 +6,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 $Bin = Join-Path $Root "target\release\uberphoto-app.exe"
 if (-not (Test-Path $Bin)) {
@@ -22,18 +23,21 @@ $Extract = Join-Path $Cache "exiftool-$ExifToolVersion`_64"
 if (-not (Test-Path $Zip)) {
     New-Item -ItemType Directory -Force -Path $Cache | Out-Null
     $url = "https://sourceforge.net/projects/exiftool/files/exiftool-$ExifToolVersion`_64.zip/download"
-    for ($tentativo = 1; $tentativo -le 3; $tentativo++) {
-        try {
-            Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $Zip
-            break
-        } catch {
-            if ($tentativo -eq 3) { throw }
-            Start-Sleep -Seconds 5
-        }
+    Write-Host "Scarico ExifTool $ExifToolVersion da $url"
+    & curl.exe -fL --retry 5 --retry-all-errors --connect-timeout 30 -o $Zip $url
+    if ($LASTEXITCODE -ne 0) {
+        throw "download di ExifTool fallito (curl codice $LASTEXITCODE)"
     }
 }
+if (-not (Test-Path $Zip) -or (Get-Item $Zip).Length -lt 1000000) {
+    throw "archivio ExifTool non valido: $Zip"
+}
 if (-not (Test-Path (Join-Path $Extract "exiftool(-k).exe"))) {
+    Write-Host "Estraggo $Zip in $Cache"
     Expand-Archive -Path $Zip -DestinationPath $Cache -Force
+}
+if (-not (Test-Path (Join-Path $Extract "exiftool(-k).exe"))) {
+    throw "contenuto di ExifTool inatteso in $Extract"
 }
 
 $Stage = Join-Path $Root "target\windows-package"

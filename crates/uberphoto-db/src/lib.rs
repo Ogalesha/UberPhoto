@@ -295,11 +295,11 @@ impl Index {
         )?;
         tx.execute(
             "DELETE FROM edit_recipes WHERE path = ?1",
-            params![path_text(to)],
+            params![recipe_path_text(to)],
         )?;
         tx.execute(
             "UPDATE edit_recipes SET path = ?1 WHERE path = ?2",
-            params![path_text(to), path_text(from)],
+            params![recipe_path_text(to), recipe_path_text(from)],
         )?;
         tx.commit()?;
         Ok(())
@@ -313,7 +313,7 @@ impl Index {
         )?;
         self.conn.execute(
             "DELETE FROM edit_recipes WHERE path = ?1",
-            params![path_text(path)],
+            params![recipe_path_text(path)],
         )?;
         Ok(())
     }
@@ -332,7 +332,7 @@ impl Index {
         {
             let mut stmt = tx.prepare("DELETE FROM edit_recipes WHERE path = ?1")?;
             for path in &recipes {
-                stmt.execute(params![path_text(path)])?;
+                stmt.execute(params![recipe_path_text(path)])?;
             }
         }
         tx.commit()?;
@@ -356,7 +356,10 @@ impl Index {
             let mut stmt = tx.prepare("UPDATE edit_recipes SET path = ?1 WHERE path = ?2")?;
             for path in &recipes {
                 if let Ok(relative) = path.strip_prefix(from) {
-                    stmt.execute(params![path_text(&to.join(relative)), path_text(path)])?;
+                    stmt.execute(params![
+                        recipe_path_text(&to.join(relative)),
+                        recipe_path_text(path)
+                    ])?;
                 }
             }
         }
@@ -375,7 +378,7 @@ impl Index {
              ON CONFLICT(path) DO UPDATE SET
                 recipe = excluded.recipe,
                 updated = excluded.updated",
-            params![path_text(path), recipe_json, now],
+            params![recipe_path_text(path), recipe_json, now],
         )?;
         Ok(())
     }
@@ -386,7 +389,7 @@ impl Index {
             .conn
             .query_row(
                 "SELECT recipe FROM edit_recipes WHERE path = ?1",
-                params![path_text(path)],
+                params![recipe_path_text(path)],
                 |row| row.get(0),
             )
             .optional()?)
@@ -396,7 +399,7 @@ impl Index {
     pub fn remove_recipe(&self, path: &Path) -> Result<()> {
         self.conn.execute(
             "DELETE FROM edit_recipes WHERE path = ?1",
-            params![path_text(path)],
+            params![recipe_path_text(path)],
         )?;
         Ok(())
     }
@@ -460,7 +463,7 @@ impl Index {
         let mut stmt = self
             .conn
             .prepare("SELECT path FROM edit_recipes WHERE path LIKE ?1 ESCAPE '\\'")?;
-        let rows = stmt.query_map(params![like_dir_pattern(dir)], |row| {
+        let rows = stmt.query_map(params![like_recipe_dir_pattern(dir)], |row| {
             row.get::<_, String>(0)
         })?;
         let mut out = Vec::new();
@@ -478,6 +481,17 @@ fn path_text(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// Chiave canonica delle ricette: su Windows i separatori sono normalizzati
+/// a `/`, così `C:\\foto\\a.jpg` e `C:/foto/a.jpg` sono lo stesso percorso.
+fn recipe_path_text(path: &Path) -> String {
+    let text = path_text(path);
+    if cfg!(windows) {
+        text.replace('\\', "/")
+    } else {
+        text
+    }
+}
+
 fn mtime_secs(modified: Option<SystemTime>) -> Option<i64> {
     modified
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
@@ -488,7 +502,15 @@ fn mtime_secs(modified: Option<SystemTime>) -> Option<i64> {
 /// neutralizzati. Il filtro esatto avviene in Rust (`parent()`/`starts_with()`),
 /// così il pattern resta indipendente dal separatore di percorso.
 fn like_dir_pattern(dir: &Path) -> String {
-    let escaped = path_text(dir)
+    like_pattern_for(&path_text(dir))
+}
+
+fn like_recipe_dir_pattern(dir: &Path) -> String {
+    like_pattern_for(&recipe_path_text(dir))
+}
+
+fn like_pattern_for(text: &str) -> String {
+    let escaped = text
         .replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_");
@@ -712,6 +734,21 @@ mod tests {
             Some(r#"{"contrast":20}"#)
         );
         assert_eq!(index.load_recipe(Path::new("/base/a.jpg")).unwrap(), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn le_ricette_usano_una_chiave_indipendente_dai_separatori() {
+        let index = Index::open_in_memory().unwrap();
+        index
+            .save_recipe(Path::new(r"C:\foto\a.jpg"), r#"{"exposure":1}"#)
+            .unwrap();
+        assert!(index
+            .load_recipe(Path::new("C:/foto/a.jpg"))
+            .unwrap()
+            .is_some());
+        index.remove_recipe(Path::new("C:/foto/a.jpg")).unwrap();
+        assert_eq!(index.count_recipes().unwrap(), 0);
     }
 
     #[test]

@@ -7,6 +7,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  EXIFTOOL_VERSION: "13.59"
 
 permissions:
   contents: read
@@ -98,12 +99,34 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          ./packaging/windows/package.ps1
+          ./packaging/windows/package.ps1 -ExifToolVersion $env:EXIFTOOL_VERSION 2>&1 | Tee-Object -FilePath target\package-log.txt
           & .\target\windows-package\exiftool.exe -ver
           choco install innosetup -y --no-progress
+          $iscc = (Get-ChildItem "C:\Program Files (x86)\Inno Setup*\ISCC.exe" | Select-Object -First 1).FullName
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"$').Matches[0].Groups[1].Value
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$version" packaging\windows\installer.iss
+          & $iscc "/DMyAppVersion=$version" packaging\windows\installer.iss 2>&1 | Tee-Object -FilePath target\installer-log.txt -Append
           if ($LASTEXITCODE -ne 0) { throw "iscc uscito con codice $LASTEXITCODE" }
+
+      - name: Pubblica il log del packaging Windows (diagnostica)
+        if: failure() && runner.os == 'Windows'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let log = '';
+            for (const file of ['target/package-log.txt', 'target/installer-log.txt']) {
+              try { log += `\n--- ${file} ---\n` + fs.readFileSync(file, 'utf8'); } catch (e) {}
+            }
+            if (!log) log = 'nessun log disponibile';
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: `Log packaging - ${context.job} (${process.env.RUNNER_OS})`,
+              head_sha: context.sha,
+              status: 'completed',
+              conclusion: 'neutral',
+              output: { title: 'Log packaging (coda)', summary: '```\n' + log.slice(-60000) + '\n```' },
+            });
 
       - name: Smoke test GUI headless (Linux, Xvfb)
         if: runner.os == 'Linux'

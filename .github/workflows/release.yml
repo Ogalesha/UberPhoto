@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  checks: write
 
 env:
   EXIFTOOL_VERSION: "13.59"
@@ -146,20 +147,42 @@ jobs:
 
       - name: ZIP portabile con ExifTool incluso
         shell: pwsh
-        run: ./packaging/windows/package.ps1 -ExifToolVersion $env:EXIFTOOL_VERSION
+        run: ./packaging/windows/package.ps1 -ExifToolVersion $env:EXIFTOOL_VERSION 2>&1 | Tee-Object -FilePath target\package-log.txt
 
       - name: Installa Inno Setup
         shell: pwsh
         run: |
           choco install innosetup -y --no-progress
-          "C:\Program Files (x86)\Inno Setup 6" | Out-File -FilePath $env:GITHUB_PATH -Append
+          $iscc = (Get-ChildItem "C:\Program Files (x86)\Inno Setup*\ISCC.exe" | Select-Object -First 1).FullName
+          Split-Path $iscc | Out-File -FilePath $env:GITHUB_PATH -Append
 
       - name: Installer Windows (.exe) con ExifTool incluso
         shell: pwsh
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"$').Matches[0].Groups[1].Value
-          iscc "/DMyAppVersion=$version" packaging\windows\installer.iss
+          iscc "/DMyAppVersion=$version" packaging\windows\installer.iss 2>&1 | Tee-Object -FilePath target\installer-log.txt
           if ($LASTEXITCODE -ne 0) { throw "iscc uscito con codice $LASTEXITCODE" }
+
+      - name: Pubblica il log del packaging (diagnostica)
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let log = '';
+            for (const file of ['target/package-log.txt', 'target/installer-log.txt']) {
+              try { log += `\n--- ${file} ---\n` + fs.readFileSync(file, 'utf8'); } catch (e) {}
+            }
+            if (!log) log = 'nessun log disponibile';
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: `Log packaging Windows (${context.sha.slice(0, 7)})`,
+              head_sha: context.sha,
+              status: 'completed',
+              conclusion: 'neutral',
+              output: { title: 'Log packaging (coda)', summary: '```\n' + log.slice(-60000) + '\n```' },
+            });
 
       - name: Carica artifact
         uses: actions/upload-artifact@v4
