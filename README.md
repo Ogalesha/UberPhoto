@@ -117,6 +117,52 @@ Capabilities per format are declared explicitly in code (`FormatKind::capabiliti
     - Windows: `choco install exiftool` or download from https://exiftool.org
   - Metadata tests skip automatically when ExifTool is absent.
 
+## Installing release packages
+
+Download the files from the [Releases](https://github.com/Ogalesha/UberPhoto/releases) page; no GitHub account is required.
+
+### Linux — Debian/Ubuntu package
+
+```bash
+sudo apt install ./uberphoto_<version>_amd64.deb
+```
+
+`apt` resolves the dependencies and installs the desktop entry and icons. Remove it with `sudo apt remove uberphoto`.
+
+### Linux — portable archive
+
+```bash
+tar -xzf uberphoto-linux-x86_64.tar.gz
+./uberphoto
+```
+
+The archive contains ExifTool next to the executable, so nothing else is needed.
+
+### Windows
+
+Run `uberphoto-windows-x86_64-setup.exe` (per-user install, no administrator rights). If SmartScreen appears, choose **More info → Run anyway**. The portable `uberphoto-windows-x86_64.zip` can be extracted anywhere and started with `uberphoto.exe`; ExifTool is included.
+
+### macOS
+
+Extract `uberphoto-macos-<arch>.app.tar.gz`, then drag `UberPhoto.app` into **Applications**. On first launch, right-click the app and choose **Open → Open** (or use **System Settings → Privacy & Security → Open Anyway**). If macOS still blocks it, remove the quarantine flag:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/UberPhoto.app
+```
+
+### Verify downloads
+
+Every current release attaches a `SHA256SUMS` file:
+
+```bash
+sha256sum -c SHA256SUMS          # Linux
+shasum -a 256 -c SHA256SUMS      # macOS
+```
+
+On Windows compare `Get-FileHash <file> -Algorithm SHA256` with the matching line.
+
+Packages are complete and self-contained, but they are **not code-signed** (the project has no Apple Developer ID or Windows code-signing certificate). The warnings above are the only consequence: downloads and installation work normally.
+
 ## Getting started
 
 ```bash
@@ -202,7 +248,7 @@ uberphoto/
   - `uberphoto-macos-x86_64.app.tar.gz` — Intel build (experimental)
   - `uberphoto-windows-x86_64-setup.exe` — Windows installer (Inno Setup) with Start Menu entry and standalone ExifTool
   - `uberphoto-windows-x86_64.zip` — portable Windows archive with standalone ExifTool
-- Release artifacts are not code-signed: Windows SmartScreen and macOS Gatekeeper may show a warning; packages are otherwise complete and self-contained.
+- Release artifacts are not code-signed: Windows SmartScreen and macOS Gatekeeper may show a warning; see [Installing release packages](#installing-release-packages) for the first-launch steps. Packages are otherwise complete and self-contained.
 - Every workflow run also publishes build artifacts on GitHub, so compiled files are always obtainable without a local toolchain.
 
 ## Configuration and data
