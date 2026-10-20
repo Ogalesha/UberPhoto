@@ -116,7 +116,7 @@ jobs:
           script: |
             const fs = require('fs');
             let log = '';
-            for (const file of ['target/package-log.txt', 'target/installer-log.txt']) {
+            for (const file of ['target/package-log.txt', 'target/installer-log.txt', 'target/install-test-log.txt']) {
               try { log += `\n--- ${file} ---\n` + fs.readFileSync(file, 'utf8'); } catch (e) {}
             }
             if (!log) log = 'nessun log disponibile';
@@ -192,22 +192,38 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $dir = Join-Path $env:RUNNER_TEMP "UberPhotoInstall"
-          if (Test-Path $dir) { Remove-Item -Recurse -Force $dir }
-          $setup = (Resolve-Path "target\uberphoto-windows-x86_64-setup.exe").Path
-          $install = Start-Process -FilePath $setup -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/DIR=$dir" -Wait -PassThru
-          if ($install.ExitCode -ne 0) { throw "installer uscito con codice $($install.ExitCode)" }
-          foreach ($file in @("uberphoto.exe", "exiftool.exe", "exiftool_files\exiftool.pl")) {
-            if (-not (Test-Path (Join-Path $dir $file))) { throw "file mancante dopo l'installazione: $file" }
+          $log = "target\install-test-log.txt"
+          Remove-Item $log -ErrorAction SilentlyContinue
+          function Write-TestLog([string]$message) {
+            $message | Tee-Object -FilePath $log -Append
           }
-          $env:UBERPHOTO_SMOKE_EXIT_SECS = "6"
-          & (Join-Path $dir "uberphoto.exe")
-          if ($LASTEXITCODE -ne 0) { throw "avvio uscito con codice $LASTEXITCODE" }
-          $uninstaller = Get-ChildItem $dir -Filter "unins*.exe" | Select-Object -First 1
-          if (-not $uninstaller) { throw "disinstaller non trovato in $dir" }
-          $uninstall = Start-Process -FilePath $uninstaller.FullName -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" -Wait -PassThru
-          if ($uninstall.ExitCode -ne 0) { throw "disinstaller uscito con codice $($uninstall.ExitCode)" }
-          for ($i = 0; $i -lt 30 -and (Test-Path (Join-Path $dir "uberphoto.exe")); $i++) {
-            Start-Sleep -Seconds 1
+          try {
+            $dir = Join-Path $env:RUNNER_TEMP "UberPhotoInstall"
+            if (Test-Path $dir) { Remove-Item -Recurse -Force $dir }
+            $setup = (Resolve-Path "target\uberphoto-windows-x86_64-setup.exe").Path
+            Write-TestLog "Installazione in $dir"
+            $install = Start-Process -FilePath $setup -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/DIR=$dir" -Wait -PassThru
+            Write-TestLog "Exit code installer: $($install.ExitCode)"
+            if ($install.ExitCode -ne 0) { throw "installer uscito con codice $($install.ExitCode)" }
+            foreach ($file in @("uberphoto.exe", "exiftool.exe", "exiftool_files\exiftool.pl")) {
+              if (-not (Test-Path (Join-Path $dir $file))) { throw "file mancante dopo l'installazione: $file" }
+            }
+            $env:UBERPHOTO_SMOKE_EXIT_SECS = "6"
+            $app = Start-Process -FilePath (Join-Path $dir "uberphoto.exe") -Wait -PassThru
+            Write-TestLog "Exit code applicazione: $($app.ExitCode)"
+            if ($app.ExitCode -ne 0) { throw "avvio uscito con codice $($app.ExitCode)" }
+            $uninstaller = Get-ChildItem $dir -Filter "unins*.exe" | Select-Object -First 1
+            if (-not $uninstaller) { throw "disinstaller non trovato in $dir" }
+            Write-TestLog "Disinstallazione con $($uninstaller.FullName)"
+            $uninstall = Start-Process -FilePath $uninstaller.FullName -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" -Wait -PassThru
+            Write-TestLog "Exit code disinstaller: $($uninstall.ExitCode)"
+            if ($uninstall.ExitCode -ne 0) { throw "disinstaller uscito con codice $($uninstall.ExitCode)" }
+            for ($i = 0; $i -lt 30 -and (Test-Path (Join-Path $dir "uberphoto.exe")); $i++) {
+              Start-Sleep -Seconds 1
+            }
+            if (Test-Path (Join-Path $dir "uberphoto.exe")) { throw "binario ancora presente dopo la disinstallazione" }
+            Write-TestLog "Test di installazione completato"
+          } catch {
+            Write-TestLog "ERRORE: $($_.Exception.Message)"
+            throw
           }
-          if (Test-Path (Join-Path $dir "uberphoto.exe")) { throw "binario ancora presente dopo la disinstallazione" }
