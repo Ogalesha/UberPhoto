@@ -7,6 +7,7 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 VERSION="${1:-${VERSION:-$(sed -n 's/^version = "\(.*\)"$/\1/p' "$ROOT/Cargo.toml" | head -n1)}}"
 BIN="${2:-${BIN:-$ROOT/target/release/uberphoto-app}}"
 EXIFTOOL_VERSION="${EXIFTOOL_VERSION:-13.59}"
+EXIFTOOL_SHA256="${EXIFTOOL_SHA256:-668ea3acececb7235fbd0f4900e72d5f12c9b07e5c778fd36cb1e9b5828fd65a}"
 APP="$ROOT/target/UberPhoto.app"
 
 if [[ ! -x "$BIN" ]]; then
@@ -17,14 +18,31 @@ fi
 # ExifTool incluso nel bundle: nessuna dipendenza esterna da installare.
 CACHE="$ROOT/target/exiftool-cache"
 SRC="$CACHE/Image-ExifTool-$EXIFTOOL_VERSION"
+ARCHIVE="$CACHE/Image-ExifTool-$EXIFTOOL_VERSION.tar.gz"
+
+verifica_sha256() {
+    local file="$1" expected="$2" actual
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual="$(sha256sum "$file" | awk '{print $1}')"
+    else
+        actual="$(shasum -a 256 "$file" | awk '{print $1}')"
+    fi
+    if [[ "$actual" != "$expected" ]]; then
+        echo "checksum ExifTool non valido per $file: $actual" >&2
+        return 1
+    fi
+}
+
 if [[ ! -f "$SRC/exiftool" ]]; then
     mkdir -p "$CACHE"
-    ARCHIVE="$CACHE/Image-ExifTool-$EXIFTOOL_VERSION.tar.gz"
     if [[ ! -f "$ARCHIVE" ]]; then
         curl -fsSL --retry 3 -o "$ARCHIVE" \
             "https://sourceforge.net/projects/exiftool/files/Image-ExifTool-$EXIFTOOL_VERSION.tar.gz/download"
     fi
+    verifica_sha256 "$ARCHIVE" "$EXIFTOOL_SHA256"
     tar -xzf "$ARCHIVE" -C "$CACHE"
+elif [[ -f "$ARCHIVE" ]]; then
+    verifica_sha256 "$ARCHIVE" "$EXIFTOOL_SHA256"
 fi
 
 rm -rf "$APP"

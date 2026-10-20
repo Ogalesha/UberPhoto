@@ -8,6 +8,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   EXIFTOOL_VERSION: "13.59"
+  EXIFTOOL_SHA256: "668ea3acececb7235fbd0f4900e72d5f12c9b07e5c778fd36cb1e9b5828fd65a"
+  EXIFTOOL_WIN_SHA256: "44b512b25af500724ba579d0a53c8fc5851628b692dd5e5d94ae4a15c2cba9ec"
 
 permissions:
   contents: read
@@ -99,7 +101,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          ./packaging/windows/package.ps1 -ExifToolVersion $env:EXIFTOOL_VERSION 2>&1 | Tee-Object -FilePath target\package-log.txt
+          ./packaging/windows/package.ps1 -ExifToolVersion $env:EXIFTOOL_VERSION -ExifToolSha256 $env:EXIFTOOL_WIN_SHA256 2>&1 | Tee-Object -FilePath target\package-log.txt
           & .\target\windows-package\exiftool.exe -ver
           choco install innosetup -y --no-progress
           $iscc = (Get-ChildItem "C:\Program Files (x86)\Inno Setup*\ISCC.exe" | Select-Object -First 1).FullName
@@ -155,10 +157,27 @@ jobs:
               output: { title: 'Log dello smoke test (coda)', summary: '```\n' + tail + '\n```' },
             });
 
+      - name: Test installazione Linux (.deb, avvio, rimozione)
+        if: runner.os == 'Linux'
+        run: |
+          VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
+          sudo dpkg -i "target/uberphoto_${VERSION}_amd64.deb"
+          test -x /usr/bin/uberphoto
+          test -x /usr/lib/uberphoto/exiftool/exiftool
+          set -o pipefail
+          LIBGL_ALWAYS_SOFTWARE=1 UBERPHOTO_SMOKE_EXIT_SECS=6 \
+            xvfb-run -a -s "-screen 0 1280x800x24" /usr/bin/uberphoto 2>&1 | tee -a smoke-output.txt
+          sudo dpkg -P uberphoto
+          test ! -e /usr/bin/uberphoto
+
       - name: Smoke test GUI (macOS, sperimentale)
         if: runner.os == 'macOS'
         continue-on-error: true
         run: UBERPHOTO_SMOKE_EXIT_SECS=6 ./target/release/uberphoto-app
+
+      - name: Avvio del bundle macOS (.app)
+        if: runner.os == 'macOS'
+        run: PATH=/usr/bin:/bin UBERPHOTO_SMOKE_EXIT_SECS=6 ./target/UberPhoto.app/Contents/MacOS/uberphoto
 
       - name: Smoke test GUI (Windows, sperimentale)
         if: runner.os == 'Windows'
@@ -168,3 +187,27 @@ jobs:
           $env:UBERPHOTO_SMOKE_EXIT_SECS = "6"
           & .\target\release\uberphoto-app.exe
           if ($LASTEXITCODE -ne 0) { throw "uscita con codice $LASTEXITCODE" }
+
+      - name: Test installazione Windows (installer, avvio, disinstallazione)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP "UberPhotoInstall"
+          if (Test-Path $dir) { Remove-Item -Recurse -Force $dir }
+          $setup = (Resolve-Path "target\uberphoto-windows-x86_64-setup.exe").Path
+          $install = Start-Process -FilePath $setup -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/DIR=$dir" -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "installer uscito con codice $($install.ExitCode)" }
+          foreach ($file in @("uberphoto.exe", "exiftool.exe", "exiftool_files\exiftool.pl")) {
+            if (-not (Test-Path (Join-Path $dir $file))) { throw "file mancante dopo l'installazione: $file" }
+          }
+          $env:UBERPHOTO_SMOKE_EXIT_SECS = "6"
+          & (Join-Path $dir "uberphoto.exe")
+          if ($LASTEXITCODE -ne 0) { throw "avvio uscito con codice $LASTEXITCODE" }
+          $uninstaller = Get-ChildItem $dir -Filter "unins*.exe" | Select-Object -First 1
+          if (-not $uninstaller) { throw "disinstaller non trovato in $dir" }
+          $uninstall = Start-Process -FilePath $uninstaller.FullName -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) { throw "disinstaller uscito con codice $($uninstall.ExitCode)" }
+          for ($i = 0; $i -lt 30 -and (Test-Path (Join-Path $dir "uberphoto.exe")); $i++) {
+            Start-Sleep -Seconds 1
+          }
+          if (Test-Path (Join-Path $dir "uberphoto.exe")) { throw "binario ancora presente dopo la disinstallazione" }

@@ -2,7 +2,8 @@
 # Uso: pwsh -File packaging/windows/package.ps1 [-Version 0.3.0]
 param(
     [string]$Version = "",
-    [string]$ExifToolVersion = "13.59"
+    [string]$ExifToolVersion = "13.59",
+    [string]$ExifToolSha256 = "44b512b25af500724ba579d0a53c8fc5851628b692dd5e5d94ae4a15c2cba9ec"
 )
 
 $ErrorActionPreference = "Stop"
@@ -31,6 +32,10 @@ if (-not (Test-Path $Zip)) {
 }
 if (-not (Test-Path $Zip) -or (Get-Item $Zip).Length -lt 1000000) {
     throw "archivio ExifTool non valido: $Zip"
+}
+$hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $Zip).Hash.ToLower()
+if ($hash -ne $ExifToolSha256.ToLower()) {
+    throw "checksum ExifTool non valido per $Zip`: $hash"
 }
 if (-not (Test-Path (Join-Path $Extract "exiftool(-k).exe"))) {
     Write-Host "Estraggo $Zip in $Cache"

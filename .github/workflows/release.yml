@@ -11,6 +11,8 @@ permissions:
 
 env:
   EXIFTOOL_VERSION: "13.59"
+  EXIFTOOL_SHA256: "668ea3acececb7235fbd0f4900e72d5f12c9b07e5c778fd36cb1e9b5828fd65a"
+  EXIFTOOL_WIN_SHA256: "44b512b25af500724ba579d0a53c8fc5851628b692dd5e5d94ae4a15c2cba9ec"
 
 jobs:
   linux:
@@ -147,7 +149,7 @@ jobs:
 
       - name: ZIP portabile con ExifTool incluso
         shell: pwsh
-        run: ./packaging/windows/package.ps1 -ExifToolVersion $env:EXIFTOOL_VERSION 2>&1 | Tee-Object -FilePath target\package-log.txt
+        run: ./packaging/windows/package.ps1 -ExifToolVersion $env:EXIFTOOL_VERSION -ExifToolSha256 $env:EXIFTOOL_WIN_SHA256 2>&1 | Tee-Object -FilePath target\package-log.txt
 
       - name: Installa Inno Setup
         shell: pwsh
