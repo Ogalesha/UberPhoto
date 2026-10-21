@@ -1,15 +1,19 @@
 # UberPhoto
 
-UberPhoto is a **local-first desktop photo manager** written in Rust. It browses real filesystem folders, presents photographs in a fast virtualized grid, edits photos **non-destructively**, edits the full EXIF/IPTC/XMP metadata stack through **ExifTool**, places GPS coordinates on an **OpenStreetMap** map, and exports web-ready images with verified metadata.
+UberPhoto is a **local-first desktop photo manager** for real folders, built in Rust. It opens folders directly from disk and lets you cull, rate, edit metadata, geotag, adjust color non-destructively and export web-ready files — without importing anything into a proprietary library.
 
-**Your photographs never leave your disk.** There is no server and no upload: the network is only used for OpenStreetMap tiles and, on explicit request, Nominatim place search.
+**Your photographs never leave your disk.** There is no account, no server and no upload. The network is used only for OpenStreetMap tiles and, on explicit request, Nominatim place search.
 
-> **Development status — Phase 7 of 7.**
-> UberPhoto is built in incremental phases; each phase is compilable and usable on its own. All phases — foundations, filesystem operations and index, metadata engine, GPS picker, non-destructive editing, export, quality and distribution — are implemented and verified on Ubuntu. Release packages bundle ExifTool, so no separate metadata tool has to be installed; macOS and Windows GUI smoke tests are experimental in CI.
+## Why UberPhoto
 
----
+- **Your folders, your files.** No library import and no hidden copy of your originals: the filesystem stays the source of truth and the SQLite index can be rebuilt at any time.
+- **Fast culling.** Cached thumbnails, keyboard and multi-selection, star ratings, filters and a large preview keep big shoots moving.
+- **Complete metadata editing.** EXIF, IPTC and XMP through the bundled ExifTool, with read-back verification and XMP sidecars for formats that must not be rewritten.
+- **Geotagging on a map.** Search a place or click the OpenStreetMap map, then save coordinates and IPTC location fields to one photo or a whole selection.
+- **Non-destructive color work.** Exposure, tone, color, crop and rotation stay in a per-photo draft until you explicitly save a new copy or overwrite the original.
+- **Save and export with guarantees.** Atomic replacement, rollback on failure, per-field verification, ICC-aware rendering and metadata-aware export profiles.
 
-## What works today (Phases 1–7)
+## Features
 
 ### Left panel — Folder explorer
 - Open any real filesystem folder as a root, through the native OS folder dialog.
@@ -30,7 +34,7 @@ UberPhoto is a **local-first desktop photo manager** written in Rust. It browses
 - Opens on double-click; zoom with the mouse wheel or the `−` / `+` buttons (2 %–3200 %), drag to pan, `Adatta` to fit, `1:1` for one image pixel per physical screen pixel, double-click to re-fit, `Esc` to close.
 - Decoded by a single dedicated background worker with a latest-wins policy; the oversize buffer is capped at 2560 px on the long edge.
 
-### Color editor (Phase 5) — non-destructive by default
+### Color editor — non-destructive by default
 - Adjustments are kept as an in-memory **recipe draft**, so changing photo or tab never rewrites the original. A color draft can still be saved explicitly to disk with **Salva**.
 - Exposure (−5…+5 EV), brightness, contrast, highlights, shadows, whites, blacks, saturation, vibrance, temperature, tint, gamma, sharpness.
 - Straighten-free geometry: crop with adjustable region and 90° rotation steps.
@@ -39,7 +43,7 @@ UberPhoto is a **local-first desktop photo manager** written in Rust. It browses
 - Named presets stored in the catalog; a preset can be applied to the current photo or to the whole multi-selection.
 - Full-resolution pixels are produced only by export or by the explicit save flow; the editor is single-photo by design, while presets can be batch-applied.
 
-### Metadata editor (Phase 3)
+### Metadata editor
 - ExifTool runs as an external process on a dedicated thread; packages include their own copy, otherwise it is resolved from `UBERPHOTO_EXIFTOOL` or `PATH`.
 - Descriptive fields: title, headline, description, caption, alt text, keywords, category, event, people, rating, label, notes, identifier.
 - Author and rights fields: creator, copyright notice, credit line, source, publisher, license, usage terms, license URL, portfolio URL, e-mail, instructions.
@@ -50,7 +54,7 @@ UberPhoto is a **local-first desktop photo manager** written in Rust. It browses
 - Edited fields stay in a per-photo draft that survives selection changes until **Salva** is pressed. Post-write verification rereads every file and reports values that could not be confirmed; tags not managed by the editor are preserved.
 - Advanced read-only view of all ExifTool tags with group, name, value, writability and a live filter.
 
-### GPS picker (Phase 4)
+### GPS picker
 - OpenStreetMap map with a draggable marker; click to place, drag to refine.
 - Manual latitude/longitude/altitude entry, decimal or DMS formatting, and "Centra" to recenter the map on the photo's coordinates.
 - Multi-selection aware: mixed coordinates are flagged; the marker and place fields are kept as per-photo drafts and written to every selected photo by **Salva**.
@@ -66,7 +70,7 @@ UberPhoto is a **local-first desktop photo manager** written in Rust. It browses
 - Metadata and GPS fields are verified after writing; the save is reported as successful only when the read-back matches.
 - Closing the app with unsaved drafts asks for confirmation; closing while a save is running is refused with a status message until the batch finishes.
 
-### Export (Phase 6)
+### Export
 - Three profiles: **Full metadata** (default), **Web optimized** (editorial EXIF/IPTC/XMP whitelist), **Privacy** (removes GPS, serial number and author/creator fields).
 - Formats: JPEG (quality 1–100), PNG, WebP (lossless) and TIFF.
 - Non-sRGB images are converted to sRGB with LittleCMS and the generated sRGB profile is embedded in the export.
@@ -77,7 +81,7 @@ UberPhoto is a **local-first desktop photo manager** written in Rust. It browses
 - Per-item progress, cancellation and a per-photo result list; failures never leave a partial file behind.
 - Supported sources are JPEG, PNG, TIFF and WebP; RAW/HEIC/AVIF are listed in the browser but cannot be decoded, edited or exported yet.
 
-### Filesystem operations (Phase 2)
+### Filesystem operations
 - Move or copy photos with drag & drop onto a folder in the explorer, or through the native destination dialog; rename photos and folders; undo the last move.
 - Conflict handling with three policies: automatic rename (`photo (1).jpg`), replace, skip.
 - XMP sidecars travel with their photo; cross-device moves fall back to copy + delete.
@@ -101,7 +105,7 @@ UberPhoto is a **local-first desktop photo manager** written in Rust. It browses
 | HEIC, AVIF | ⛔ | Sidecar XMP | ⛔ | Recognized and listed; decoding not enabled yet |
 | DNG, CR2, CR3, NEF, ARW, RAF (RAW) | ⛔ | Sidecar XMP | ⛔ | Recognized and listed; originals are never rewritten — metadata goes to `<file>.xmp` |
 
-Capabilities per format are declared explicitly in code (`FormatKind::capabilities`) and updated phase by phase.
+Capabilities per format are declared explicitly in code (`FormatKind::capabilities`).
 
 ### Known limitations
 - RAW/HEIC/AVIF decoding is not implemented (browse-only). Their XMP is edited through sidecars, never embedded.
@@ -242,7 +246,7 @@ uberphoto/
 ## Testing and CI
 
 - Unit and integration tests live next to the code plus a cross-crate smoke suite in `uberphoto-tests` (fixtures generated at runtime; no binary test assets in the repository).
-- Integration smoke tests cover Phases 2–6: filesystem operations, metadata round-trip, GPS writing/removal, editing recipes and export with metadata verification. Save tests cover new-copy naming, atomic overwrite, metadata round-trip and rollback on error.
+- Integration smoke tests cover filesystem operations, metadata round-trip, GPS writing/removal, editing recipes and export with metadata verification. Save tests cover new-copy naming, atomic overwrite, metadata round-trip and rollback on error.
 - CI (`.github/workflows/ci.yml`) runs on **Ubuntu, macOS and Windows**: `rustfmt --check`, `clippy -D warnings`, `cargo test --workspace`, a release build, packaging checks that bundle ExifTool, and — on Linux only — a headless GUI smoke test under Xvfb.
 - Benchmark tests are `#[ignore]`d so they never slow the normal suite.
 
@@ -269,17 +273,9 @@ uberphoto/
 - The SQLite catalog (`index.db`, WAL mode) lives in the same data directory and holds the folder index plus edit recipes and presets. It is disposable: photos and their embedded metadata remain authoritative.
 - Log verbosity follows `RUST_LOG` (default `info`).
 
-## Roadmap
+## Availability
 
-| Phase | Scope |
-|---|---|
-| 1 ✅ | Foundations, folder explorer, virtualized browser, preview, inspector scaffold |
-| 2 ✅ | Filesystem operations and drag & drop, sidecar moves, SQLite index, external-change detection |
-| 3 ✅ | Metadata engine via ExifTool: EXIF, IPTC, XMP; descriptive, author, time and technical fields; sidecars |
-| 4 ✅ | OpenStreetMap GPS picker with draggable marker and optional Nominatim search |
-| 5 ✅ | Non-destructive color editing, crop/rotate, presets, undo/redo, before/after, explicit save with new copy or confirmed overwrite |
-| 6 ✅ | Export for web: profiles, ICC conversion, metadata embedding, verification reports |
-| 7 ✅ | Quality and distribution: regression/smoke tests, benchmarks, documentation, self-contained packages |
+UberPhoto runs on Linux, macOS and Windows. Linux is the primary platform and its packages are tested end to end. macOS and Windows packages are published; their GUI smoke tests remain experimental in CI. Every release package bundles ExifTool, so no separate metadata tool is required.
 
 ## License
 
