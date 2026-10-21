@@ -183,7 +183,7 @@ fn mappa(ui: &mut egui::Ui, state: &mut AppState, height: f32) {
         });
     });
     if let Some(nuova) = nuova {
-        state.gps.set_marker(nuova);
+        state.set_gps_marker(nuova);
     }
 
     ui.horizontal(|ui| {
@@ -260,7 +260,7 @@ fn coordinate(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions, 
             ui.end_row();
         });
     if cambiato {
-        state.gps.apply_manual_fields();
+        state.apply_gps_manual_fields();
     }
 
     if let Some(error) = &state.gps.manual_error {
@@ -284,30 +284,22 @@ fn coordinate(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions, 
 
     ui.add_space(4.0);
     ui.horizontal(|ui| {
-        let applica = if count == 1 {
-            "Applica alla foto".to_owned()
+        let rimuovi = if count == 1 {
+            "Rimuovi posizione".to_owned()
         } else {
-            format!("Applica a {count} foto")
+            format!("Rimuovi posizione da {count}")
         };
         if ui
-            .add_enabled(
-                state.gps.marker.is_some(),
-                egui::Button::new(applica).min_size(egui::vec2(140.0, 26.0)),
-            )
+            .add_enabled(state.gps.marker.is_some(), egui::Button::new(rimuovi))
             .clicked()
         {
-            actions.gps_apply = true;
-        }
-        let rimuovi = if count == 1 {
-            "Rimuovi".to_owned()
-        } else {
-            format!("Rimuovi da {count}")
-        };
-        if ui.button(rimuovi).clicked() {
             actions.gps_remove = true;
         }
     });
-    ui.weak("Le coordinate vengono scritte in EXIF GPS e XMP, con l'altitudine se indicata.");
+    ui.weak(
+        "Coordinate e località restano in bozza: verranno scritte in EXIF GPS e XMP \
+         quando premi Salva.",
+    );
 }
 
 /// Campi delle località (IPTC Extension) per ruolo.
@@ -340,9 +332,7 @@ fn localita(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
                                     .desired_width(f32::INFINITY),
                             );
                             if response.changed() {
-                                state.gps.location_values.insert((role, field), testo);
-                                state.gps.location_dirty.insert((role, field));
-                                state.gps.draft_dirty = true;
+                                state.set_gps_location_field(role, field, testo);
                             }
                             ui.end_row();
                         }
@@ -352,19 +342,13 @@ fn localita(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
 
     ui.add_space(6.0);
     ui.horizontal(|ui| {
-        let dirty = state.gps.location_dirty.len();
-        let salva = egui::Button::new(format!("Salva località ({dirty})"))
-            .min_size(egui::vec2(150.0, 28.0));
-        if ui.add_enabled(dirty > 0, salva).clicked() {
-            actions.gps_save_location = true;
-        }
         if ui.button("Annulla modifiche").clicked() {
             actions.gps_reset = true;
         }
     });
     ui.weak(
         "I campi svuotati vengono rimossi dai metadati; il codice paese \
-         richiede due lettere (es. IT).",
+         richiede due lettere (es. IT). Le località si salvano con Salva.",
     );
 }
 

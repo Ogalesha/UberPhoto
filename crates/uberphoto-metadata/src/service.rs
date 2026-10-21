@@ -181,7 +181,7 @@ fn execute(request: MetadataRequest) -> MetadataOutcome {
             items: read_full(&paths),
         },
         MetadataRequest::Write { items } => MetadataOutcome::Written {
-            report: write_items(&items),
+            report: write_edits(&items),
         },
     }
 }
@@ -358,7 +358,11 @@ fn location_conferma(
     }
 }
 
-fn write_items(items: &[WriteItem]) -> MetadataWriteReport {
+/// Scrive e riverifica un lotto di modifiche già validate.
+///
+/// È il punto di ingresso usato anche dal salvataggio manuale dei file, che
+/// deve applicare i campi dopo aver rigenerato i pixel.
+pub fn write_edits(items: &[WriteItem]) -> MetadataWriteReport {
     let mut report = MetadataWriteReport::default();
     let tool = match tool() {
         Ok(tool) => tool,

@@ -235,18 +235,26 @@ fn metadati(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
 
     ui.add_space(8.0);
     ui.horizontal(|ui| {
-        let dirty = state.meta.form_dirty.len();
-        let salva = egui::Button::new(format!("Salva metadati ({dirty})"))
-            .min_size(egui::vec2(150.0, 28.0));
-        if ui.add_enabled(dirty > 0, salva).clicked() {
-            actions.metadata_save = true;
+        let salva = egui::Button::new("Salva…").min_size(egui::vec2(110.0, 28.0));
+        if ui
+            .add_enabled(
+                state.has_pending_changes() && state.gps.manual_error.is_none(),
+                salva,
+            )
+            .on_hover_text("Salva colore, metadati e posizione (Ctrl+S)")
+            .clicked()
+        {
+            actions.save_open = true;
         }
         if ui.button("Annulla modifiche").clicked() {
-            state.rebuild_meta_form();
+            state.discard_meta_drafts();
         }
     });
     ui.add_space(4.0);
-    ui.weak("I campi svuotati vengono rimossi dai metadati del file.");
+    ui.weak(
+        "I campi svuotati vengono rimossi dai metadati; le modifiche a colore, \
+         metadati e posizione si salvano insieme con Salva.",
+    );
     if let Some(asset) = state.selected_assets().first() {
         if !asset.format.capabilities().embedded_metadata {
             ui.weak(format!(
@@ -304,8 +312,7 @@ fn campo(ui: &mut egui::Ui, state: &mut AppState, field: MetadataField) {
                 });
             if scelto != value {
                 let text = scelto.map(|stars| stars.to_string()).unwrap_or_default();
-                state.meta.form_values.insert(field, text);
-                state.meta.form_dirty.insert(field);
+                state.set_meta_field(field, Some(text));
             }
         }
         MetadataField::Orientation => {
@@ -324,8 +331,7 @@ fn campo(ui: &mut egui::Ui, state: &mut AppState, field: MetadataField) {
                 });
             if scelto != value {
                 let text = scelto.map(|code| code.to_string()).unwrap_or_default();
-                state.meta.form_values.insert(field, text);
-                state.meta.form_dirty.insert(field);
+                state.set_meta_field(field, Some(text));
             }
         }
         _ => {
@@ -341,8 +347,7 @@ fn campo(ui: &mut egui::Ui, state: &mut AppState, field: MetadataField) {
                     .desired_width(f32::INFINITY),
             );
             if response.changed() {
-                state.meta.form_values.insert(field, text);
-                state.meta.form_dirty.insert(field);
+                state.set_meta_field(field, Some(text));
             }
         }
     }

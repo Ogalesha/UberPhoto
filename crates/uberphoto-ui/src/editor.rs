@@ -1,18 +1,18 @@
 //! Scheda Colori — editing non distruttivo.
 //!
-//! Ogni regolazione è un valore dentro una [`EditRecipe`] salvata nel
-//! catalogo locale accanto alla foto: i pixel dell'originale non vengono mai
-//! riscritti; la ricetta viene applicata a un'anteprima ridotta in background
-//! (worker con politica "latest wins") e verrà applicata ai pixel completi
-//! solo all'esportazione (Fase 6).
+//! Ogni regolazione è un valore dentro una [`EditRecipe`] tenuta in bozza:
+//! i pixel dell'originale non vengono mai riscritti finché non si preme
+//! Salva; la ricetta viene applicata a un'anteprima ridotta in background
+//! (worker con politica "latest wins") e ai pixel completi solo al salvataggio
+//! o all'esportazione.
 //!
 //! Convenzioni della scheda:
 //! - trascinare uno slider aggiorna l'anteprima in tempo reale; la voce di
 //!   undo viene registrata al rilascio, non a ogni frame;
 //! - "Prima" mostra l'originale finché resta premuto;
 //! - Ctrl+Z annulla, Ctrl+Shift+Z (o Ctrl+Y) ripete;
-//! - la ricetta viene salvata automaticamente a ogni conferma (mai insieme
-//!   ai metadati: sono due flussi distinti).
+//! - le regolazioni restano in bozza (anche cambiando foto) finché non premi
+//!   Salva: lì scegli se creare una nuova copia o sovrascrivere l'originale.
 
 use eframe::egui;
 use uberphoto_image::{CropRect, EditField, EditRecipe};
@@ -352,9 +352,9 @@ fn barra_comandi(
 
     if let Some(error) = &edit.save_error {
         ui.colored_label(ui.visuals().error_fg_color, error);
-        if edit.is_dirty() {
-            ui.weak("La ricetta resta in memoria finché il catalogo non torna disponibile.");
-        }
+    }
+    if edit.is_dirty() {
+        ui.weak("Bozza non salvata: premi Salva (Ctrl+S) per scrivere la foto.");
     }
 }
 
@@ -427,6 +427,7 @@ fn preset_alla_selezione(
     if ui.small_button("Rimuovi le regolazioni da tutte").clicked() {
         actions.edit_apply_preset = Some(EditRecipe::default());
     }
+    ui.weak("Le regolazioni applicate restano in bozza finché non premi Salva.");
 }
 
 /// Esito dell'interazione con una riga di regolazione.
@@ -516,7 +517,6 @@ fn applica_commit(edit: &mut EditState, esito: &EsitoRiga) {
             }
             None => edit.push_undo(),
         }
-        edit.pending_save = true;
     }
 }
 

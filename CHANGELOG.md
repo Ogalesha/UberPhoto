@@ -7,6 +7,34 @@ e il progetto aderisce a [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- Salvataggio manuale unificato con `Salva` nella barra superiore e `Ctrl+S`: dialogo con scelta tra nuova copia (`nome-modificata.ext`, collisioni progressive) e sovrascrittura dell'originale con conferma esplicita.
+- Nuovo servizio di salvataggio in `uberphoto-export`: rendering su file temporaneo nella stessa cartella, applicazione metadati verificata, sostituzione atomica, rollback sui fallimenti e gestione dei lotti con errori parziali.
+- Bozze in memoria per colore, metadati e posizione, conservate per foto anche cambiando selezione; il salvataggio include solo le foto selezionate che hanno bozze.
+- Test del salvataggio: nome automatico, sovrascrittura con pixel e metadati, copia con metadati, rollback su errore e collisioni.
+- Conferma alla chiusura quando restano bozze non salvate e blocco della chiusura durante un salvataggio in corso.
+
+### Changed
+
+- Il colore non viene più salvato automaticamente nel catalogo quando si cambia foto o si applica un preset: resta una bozza finché l'utente non preme `Salva`.
+- I campi metadati e GPS non vengono più scritti immediatamente: restano in bozza e vengono applicati insieme dal salvataggio manuale, con verifica post-scrittura.
+- L'esportazione usa le bozze correnti delle ricette, così colore e file esportato restano coerenti.
+- Gli errori di coordinate manuali bloccano il salvataggio finché non vengono corretti.
+- Le bozze di colore, metadati e posizione seguono rinomina e spostamento di file e cartelle.
+
+### Fixed
+
+- La valutazione rapida non cancella più i campi metadati o GPS in bozza dopo la rilettura.
+- La sostituzione su Windows non rimuove più l'originale prima del rename atomico.
+- I form metadati e GPS si ricostruiscono quando i documenti tornano disponibili, senza restare vuoti dopo un salvataggio o una rilettura.
+- Le bozze metadati e GPS non vengono più perse cambiando selezione: restano associate alla singola foto.
+- Dopo un salvataggio o una rilettura la cache metadati viene invalidata anche per i file con sidecar XMP, così i valori verificati compaiono subito nei form.
+
+### Documentation
+
+- README aggiornato con il flusso di salvataggio manuale, le garanzie di rollback e il nuovo significato delle ricette in bozza.
+
 ## [0.3.0] - 2026-10-19
 
 ### Added

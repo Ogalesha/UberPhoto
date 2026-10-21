@@ -7,11 +7,13 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 use uberphoto_core::{FormatKind, GpsLocation, PhotoAsset};
 use uberphoto_db::IndexRow;
-use uberphoto_export::{ExportReport, ExportSettings};
+use uberphoto_export::{ExportReport, ExportSettings, SaveMode};
 use uberphoto_files::{sort_assets, ConflictPolicy, DirNode, FileOpReport, SortKey};
 use uberphoto_geo::{GeocodeResult, LocationSuggestion};
 use uberphoto_image::{EditRecipe, EditSource};
-use uberphoto_metadata::{LocationField, LocationRole, MetadataDocument, MetadataField, RawTag};
+use uberphoto_metadata::{
+    LocationField, LocationRole, MetadataDocument, MetadataEdit, MetadataField, RawTag,
+};
 
 /// Schede del pannello destro.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,7 +189,9 @@ pub struct MetaState {
     pub form_values: BTreeMap<MetadataField, String>,
     /// Campi con valori diversi nella multi-selezione.
     pub form_mixed: BTreeSet<MetadataField>,
-    /// Campi modificati e non ancora salvati.
+    /// Campi modificati e non ancora salvati per ciascuna foto.
+    pub drafts: HashMap<PathBuf, BTreeMap<MetadataField, Option<String>>>,
+    /// Campi modificati nella selezione corrente (vista derivata).
     pub form_dirty: BTreeSet<MetadataField>,
     pub raw_filter: String,
     /// Riassunti già letti: percorso → mtime Unix in secondi.
@@ -206,6 +210,22 @@ pub enum SuggestionTarget {
     Created,
     /// Compila i campi della località raffigurata.
     Shown,
+}
+
+/// Bozza GPS di una singola foto, indipendente dalla selezione corrente.
+#[derive(Debug, Clone, Default)]
+pub struct GpsDraft {
+    /// `Some(None)` significa coordinate rimosse, `Some(Some(_))` coordinate
+    /// impostate, `None` nessuna modifica.
+    pub coordinates: Option<Option<GpsLocation>>,
+    /// Campi di località modificati (`None` = campo svuotato).
+    pub locations: BTreeMap<(LocationRole, LocationField), Option<String>>,
+}
+
+impl GpsDraft {
+    pub fn is_empty(&self) -> bool {
+        self.coordinates.is_none() && self.locations.is_empty()
+    }
 }
 
 /// Stato della scheda GPS: mappa, bozza delle coordinate e delle località.
@@ -238,6 +258,10 @@ pub struct GpsState {
     pub location_dirty: BTreeSet<(LocationRole, LocationField)>,
     /// Bozza (marker o località) modificata e non ancora salvata.
     pub draft_dirty: bool,
+    /// Le coordinate del marker sono state cambiate rispetto ai documenti.
+    pub coordinates_dirty: bool,
+    /// Bozze GPS per foto, conservate cambiando selezione.
+    pub drafts: HashMap<PathBuf, GpsDraft>,
     /// Ultima posizione su cui è stata centrata la mappa automaticamente.
     pub centered_for: Option<GpsLocation>,
     pub search_query: String,
@@ -271,6 +295,8 @@ impl Default for GpsState {
             location_mixed: BTreeSet::new(),
             location_dirty: BTreeSet::new(),
             draft_dirty: false,
+            coordinates_dirty: false,
+            drafts: HashMap::new(),
             centered_for: None,
             search_query: String::new(),
             search_results: Vec::new(),
@@ -287,8 +313,10 @@ impl GpsState {
     /// Imposta il marker riallineando i campi manuali. Non muove la mappa.
     pub fn set_marker(&mut self, marker: Option<GpsLocation>) {
         self.marker = marker;
+        self.marker_mixed = false;
         self.manual_error = None;
         self.draft_dirty = true;
+        self.coordinates_dirty = true;
         match marker {
             Some(location) => {
                 self.manual_lat = format!("{:.6}", location.latitude);
@@ -335,7 +363,10 @@ impl GpsState {
                     longitude: longitudine,
                     altitude: altitudine,
                 });
+                self.marker_mixed = false;
                 self.manual_error = None;
+                self.draft_dirty = true;
+                self.coordinates_dirty = true;
             }
             (Err(message), _) | (_, Err(message)) => {
                 self.marker = None;
@@ -358,6 +389,7 @@ impl GpsState {
         for (field, value) in coppie {
             if let Some(value) = value {
                 self.location_values.insert((role, field), value.clone());
+                self.location_mixed.remove(&(role, field));
                 self.location_dirty.insert((role, field));
             }
         }
@@ -419,8 +451,8 @@ pub struct EditState {
     pub preset_name: String,
     /// Errore dell'ultimo salvataggio di ricetta o preset.
     pub save_error: Option<String>,
-    /// La ricetta è cambiata e va scritta nel catalogo.
-    pub pending_save: bool,
+    /// Bozze non ancora salvate, conservate cambiando foto.
+    pub drafts: HashMap<PathBuf, EditRecipe>,
 }
 
 impl Default for EditState {
@@ -448,7 +480,7 @@ impl Default for EditState {
             presets: Vec::new(),
             preset_name: String::new(),
             save_error: None,
-            pending_save: false,
+            drafts: HashMap::new(),
         }
     }
 }
@@ -460,10 +492,12 @@ impl EditState {
         let preset = std::mem::take(&mut self.presets);
         let nome = std::mem::take(&mut self.preset_name);
         let errore = self.save_error.take();
+        let bozze = std::mem::take(&mut self.drafts);
         *self = Self::default();
         self.presets = preset;
         self.preset_name = nome;
         self.save_error = errore;
+        self.drafts = bozze;
         self.path = Some(path.to_path_buf());
         self.mtime = mtime;
         self.recipe = recipe;
@@ -475,10 +509,12 @@ impl EditState {
         let preset = std::mem::take(&mut self.presets);
         let nome = std::mem::take(&mut self.preset_name);
         let errore = self.save_error.take();
+        let bozze = std::mem::take(&mut self.drafts);
         *self = Self::default();
         self.presets = preset;
         self.preset_name = nome;
         self.save_error = errore;
+        self.drafts = bozze;
     }
 
     /// Registra lo stato attuale per l'annullamento e invalida il redo.
@@ -488,7 +524,6 @@ impl EditState {
             self.undo.remove(0);
         }
         self.redo.clear();
-        self.pending_save = true;
     }
 
     pub fn undo(&mut self) -> bool {
@@ -497,7 +532,6 @@ impl EditState {
         };
         self.redo.push(self.recipe);
         self.recipe = precedente;
-        self.pending_save = true;
         true
     }
 
@@ -507,7 +541,6 @@ impl EditState {
         };
         self.undo.push(self.recipe);
         self.recipe = successiva;
-        self.pending_save = true;
         true
     }
 
@@ -546,6 +579,90 @@ impl EditState {
     /// La ricetta differisce da quella salvata nel catalogo.
     pub fn is_dirty(&self) -> bool {
         self.recipe != self.saved
+    }
+
+    /// Ricetta in bozza da usare per una foto (quella aperta ha precedenza).
+    pub fn recipe_for(&self, path: &Path) -> EditRecipe {
+        if self.path.as_deref() == Some(path) {
+            self.recipe
+        } else {
+            self.drafts.get(path).copied().unwrap_or_default()
+        }
+    }
+
+    /// Ricorda la ricetta corrente come bozza in memoria, senza scrivere nel
+    /// catalogo: il salvataggio su file resta un gesto esplicito.
+    pub fn remember_draft(&mut self) {
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        if self.recipe == self.saved {
+            self.drafts.remove(&path);
+        } else {
+            self.drafts.insert(path, self.recipe);
+        }
+    }
+
+    /// Dimentica la bozza di una foto dopo che è stata salvata su file.
+    pub fn forget_draft(&mut self, path: &Path) {
+        self.drafts.remove(path);
+    }
+
+    /// Sposta la bozza quando il file viene spostato o rinominato.
+    pub fn remap_draft(&mut self, from: &Path, to: &Path) {
+        if let Some(recipe) = self.drafts.remove(from) {
+            self.drafts.insert(to.to_path_buf(), recipe);
+        }
+    }
+
+    /// Sposta tutte le bozze contenute in una cartella rinominata.
+    pub fn remap_drafts_in_dir(&mut self, from: &Path, to: &Path) {
+        let spostate: Vec<(PathBuf, PathBuf)> = self
+            .drafts
+            .keys()
+            .filter_map(|path| {
+                path.strip_prefix(from)
+                    .ok()
+                    .map(|relative| (path.clone(), to.join(relative)))
+            })
+            .collect();
+        for (vecchio, nuovo) in spostate {
+            if let Some(recipe) = self.drafts.remove(&vecchio) {
+                self.drafts.insert(nuovo, recipe);
+            }
+        }
+    }
+}
+
+/// Finestra di conferma del salvataggio manuale.
+#[derive(Debug, Clone)]
+pub struct SaveDialog {
+    pub mode: SaveMode,
+    pub overwrite_confirmed: bool,
+    pub busy: bool,
+    pub error: Option<String>,
+    /// Foto rimaste da salvare (dopo un eventuale errore parziale).
+    pub targets: Vec<PathBuf>,
+    /// Foto già salvate in questo tentativo (per i messaggi di riepilogo).
+    pub completed: BTreeSet<PathBuf>,
+    /// Quante nuove copie sono state create in questo tentativo.
+    pub created: usize,
+    /// Ultimo errore ricevuto dal servizio, mostrato nel dialogo.
+    pub failure: Option<String>,
+}
+
+impl Default for SaveDialog {
+    fn default() -> Self {
+        Self {
+            mode: SaveMode::NewCopy,
+            overwrite_confirmed: false,
+            busy: false,
+            error: None,
+            targets: Vec::new(),
+            completed: BTreeSet::new(),
+            created: 0,
+            failure: None,
+        }
     }
 }
 
@@ -593,6 +710,10 @@ pub struct AppState {
     pub exiftool: Option<String>,
     /// Logo dell'app, caricato una sola volta come texture della UI.
     pub logo: Option<egui::TextureHandle>,
+    /// Dialogo di salvataggio manuale (colore + metadati + posizione).
+    pub save_dialog: Option<SaveDialog>,
+    /// Foto da selezionare al termine della prossima scansione.
+    pub pending_select: Option<PathBuf>,
 }
 
 impl AppState {
@@ -637,6 +758,8 @@ impl AppState {
             meta: MetaState::default(),
             exiftool: None,
             logo: None,
+            save_dialog: None,
+            pending_select: None,
             gps,
             edit: EditState::default(),
             export: ExportState::default(),
@@ -664,6 +787,257 @@ impl AppState {
         self.recent_folders.retain(|existing| existing != dir);
         self.recent_folders.insert(0, dir.to_path_buf());
         self.recent_folders.truncate(10);
+    }
+
+    /// Vero se c'è almeno una modifica in bozza da salvare.
+    pub fn has_pending_changes(&self) -> bool {
+        !self.save_targets().is_empty()
+    }
+
+    /// Vero se esistono modifiche non salvate, anche fuori dalla selezione.
+    pub fn has_unsaved_changes(&self) -> bool {
+        !self.edit.drafts.is_empty()
+            || self.meta.drafts.values().any(|draft| !draft.is_empty())
+            || self.gps.drafts.values().any(|draft| !draft.is_empty())
+            || self.gps.manual_error.is_some()
+    }
+
+    /// Foto coinvolte dal salvataggio: quelle con colore, metadati o posizione
+    /// in bozza. Le modifiche condivise vengono registrate su tutta la
+    /// selezione al momento dell'edit, quindi restano per-foto.
+    pub fn save_targets(&self) -> Vec<PathBuf> {
+        self.selected_paths()
+            .into_iter()
+            .filter(|path| self.path_pending(path))
+            .collect()
+    }
+
+    pub fn path_pending(&self, path: &Path) -> bool {
+        self.recipe_pending(path) || self.meta_pending(path) || self.gps_pending(path)
+    }
+
+    /// Tutte le foto con almeno una bozza, dentro o fuori la selezione.
+    pub fn pending_paths(&self) -> BTreeSet<PathBuf> {
+        let mut paths: BTreeSet<PathBuf> = self
+            .edit
+            .drafts
+            .keys()
+            .chain(self.meta.drafts.keys())
+            .chain(self.gps.drafts.keys())
+            .cloned()
+            .collect();
+        if let Some(path) = &self.edit.path {
+            if self.edit.is_dirty() {
+                paths.insert(path.clone());
+            }
+        }
+        paths.retain(|path| self.path_pending(path));
+        paths
+    }
+
+    /// Vero se la foto ha una ricetta in bozza non ancora salvata.
+    pub fn recipe_pending(&self, path: &Path) -> bool {
+        if self.edit.path.as_deref() == Some(path) {
+            self.edit.is_dirty()
+        } else {
+            self.edit
+                .drafts
+                .get(path)
+                .is_some_and(|recipe| !recipe.is_identity())
+        }
+    }
+
+    pub fn meta_pending(&self, path: &Path) -> bool {
+        self.meta
+            .drafts
+            .get(path)
+            .is_some_and(|draft| !draft.is_empty())
+    }
+
+    pub fn gps_pending(&self, path: &Path) -> bool {
+        self.gps
+            .drafts
+            .get(path)
+            .is_some_and(|draft| !draft.is_empty())
+    }
+
+    /// Modifiche metadati in bozza di una singola foto.
+    pub fn metadata_edits(&self, path: &Path) -> Vec<MetadataEdit> {
+        let Some(draft) = self.meta.drafts.get(path) else {
+            return Vec::new();
+        };
+        draft
+            .iter()
+            .map(|(field, value)| {
+                let value = value
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned);
+                MetadataEdit::Field(*field, value)
+            })
+            .collect()
+    }
+
+    /// Modifiche GPS in bozza di una singola foto.
+    pub fn gps_edits(&self, path: &Path) -> Vec<MetadataEdit> {
+        let Some(draft) = self.gps.drafts.get(path) else {
+            return Vec::new();
+        };
+        let mut edits = Vec::new();
+        if let Some(coordinates) = draft.coordinates {
+            edits.push(MetadataEdit::Gps(coordinates));
+        }
+        for ((role, field), value) in &draft.locations {
+            let value = value
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+            edits.push(MetadataEdit::Location {
+                role: *role,
+                field: *field,
+                value,
+            });
+        }
+        edits
+    }
+
+    /// Registra il valore di un campo metadati su tutta la selezione.
+    pub fn set_meta_field(&mut self, field: MetadataField, value: Option<String>) {
+        let value = value.unwrap_or_default();
+        for path in self.selected_paths() {
+            self.meta
+                .drafts
+                .entry(path)
+                .or_default()
+                .insert(field, Some(value.clone()));
+        }
+        self.meta.form_values.insert(field, value);
+        self.meta.form_mixed.remove(&field);
+        self.meta.form_dirty.insert(field);
+    }
+
+    /// Scarta le modifiche metadati della selezione corrente.
+    pub fn discard_meta_drafts(&mut self) {
+        for path in self.selected_paths() {
+            self.meta.drafts.remove(&path);
+        }
+        self.rebuild_meta_form();
+    }
+
+    /// Registra il marker GPS su tutta la selezione.
+    pub fn set_gps_marker(&mut self, marker: Option<GpsLocation>) {
+        self.gps.set_marker(marker);
+        for path in self.selected_paths() {
+            self.gps.drafts.entry(path).or_default().coordinates = Some(marker);
+        }
+    }
+
+    /// Riallinea i campi manuali e, se validi, registra la bozza su tutta la
+    /// selezione.
+    pub fn apply_gps_manual_fields(&mut self) {
+        self.gps.apply_manual_fields();
+        if self.gps.manual_error.is_none() {
+            let marker = self.gps.marker;
+            for path in self.selected_paths() {
+                self.gps.drafts.entry(path).or_default().coordinates = Some(marker);
+            }
+        }
+    }
+
+    /// Registra un campo di località su tutta la selezione.
+    pub fn set_gps_location_field(
+        &mut self,
+        role: LocationRole,
+        field: LocationField,
+        value: String,
+    ) {
+        for path in self.selected_paths() {
+            self.gps
+                .drafts
+                .entry(path)
+                .or_default()
+                .locations
+                .insert((role, field), Some(value.clone()));
+        }
+        self.gps.location_values.insert((role, field), value);
+        self.gps.location_mixed.remove(&(role, field));
+        self.gps.location_dirty.insert((role, field));
+        self.gps.draft_dirty = true;
+    }
+
+    /// Applica un suggerimento geografico alla località di tutta la selezione.
+    pub fn fill_gps_location(&mut self, role: LocationRole, suggestion: &LocationSuggestion) {
+        let coppie: [(LocationField, &Option<String>); 6] = [
+            (LocationField::Place, &suggestion.place),
+            (LocationField::Sublocation, &suggestion.sublocation),
+            (LocationField::City, &suggestion.city),
+            (LocationField::State, &suggestion.state),
+            (LocationField::Country, &suggestion.country),
+            (LocationField::CountryCode, &suggestion.country_code),
+        ];
+        for path in self.selected_paths() {
+            let draft = self.gps.drafts.entry(path).or_default();
+            for (field, value) in coppie {
+                if let Some(value) = value {
+                    draft.locations.insert((role, field), Some(value.clone()));
+                }
+            }
+        }
+        self.gps.fill_location(role, suggestion);
+    }
+
+    /// Scarta le modifiche GPS della selezione corrente.
+    pub fn discard_gps_drafts(&mut self) {
+        for path in self.selected_paths() {
+            self.gps.drafts.remove(&path);
+        }
+        self.rebuild_gps_form();
+    }
+
+    /// Sposta le bozze metadati/GPS quando un file viene rinominato o spostato.
+    pub fn remap_photo_drafts(&mut self, from: &Path, to: &Path) {
+        if let Some(draft) = self.meta.drafts.remove(from) {
+            self.meta.drafts.insert(to.to_path_buf(), draft);
+        }
+        if let Some(draft) = self.gps.drafts.remove(from) {
+            self.gps.drafts.insert(to.to_path_buf(), draft);
+        }
+    }
+
+    /// Sposta le bozze metadati/GPS contenute in una cartella rinominata.
+    pub fn remap_photo_drafts_in_dir(&mut self, from: &Path, to: &Path) {
+        let meta: Vec<(PathBuf, PathBuf)> = self
+            .meta
+            .drafts
+            .keys()
+            .filter_map(|path| {
+                path.strip_prefix(from)
+                    .ok()
+                    .map(|relative| (path.clone(), to.join(relative)))
+            })
+            .collect();
+        for (vecchio, nuovo) in meta {
+            if let Some(draft) = self.meta.drafts.remove(&vecchio) {
+                self.meta.drafts.insert(nuovo, draft);
+            }
+        }
+        let gps: Vec<(PathBuf, PathBuf)> = self
+            .gps
+            .drafts
+            .keys()
+            .filter_map(|path| {
+                path.strip_prefix(from)
+                    .ok()
+                    .map(|relative| (path.clone(), to.join(relative)))
+            })
+            .collect();
+        for (vecchio, nuovo) in gps {
+            if let Some(draft) = self.gps.drafts.remove(&vecchio) {
+                self.gps.drafts.insert(nuovo, draft);
+            }
+        }
     }
 
     pub fn selected_assets(&self) -> Vec<&PhotoAsset> {
@@ -739,20 +1113,34 @@ impl AppState {
     /// quando la selezione è pronta.
     pub fn rebuild_meta_form(&mut self) {
         let paths = self.selected_paths();
-        self.meta.form_paths = paths.clone();
         self.meta.form_values.clear();
         self.meta.form_mixed.clear();
         self.meta.form_dirty.clear();
-        if paths.is_empty() {
+        if paths.is_empty() || paths.iter().any(|path| !self.meta.docs.contains_key(path)) {
+            // Nessun documento pronto: il form resta vuoto e `form_paths`
+            // diverso dalla selezione fa ritentare la ricostruzione.
+            self.meta.form_paths.clear();
             return;
         }
+        self.meta.form_paths = paths.clone();
         for field in MetadataField::ALL {
             let mut valori = Vec::with_capacity(paths.len());
+            let mut in_bozza = false;
             for path in &paths {
-                let Some(document) = self.meta.docs.get(path) else {
-                    return;
+                let document = &self.meta.docs[path];
+                let valore = match self
+                    .meta
+                    .drafts
+                    .get(path)
+                    .and_then(|draft| draft.get(&field))
+                {
+                    Some(value) => {
+                        in_bozza = true;
+                        value.clone().unwrap_or_default()
+                    }
+                    None => document.display(field),
                 };
-                valori.push(document.display(field));
+                valori.push(valore);
             }
             let primo = valori.first().cloned().unwrap_or_default();
             if valori.iter().all(|valore| *valore == primo) {
@@ -761,6 +1149,9 @@ impl AppState {
                 }
             } else {
                 self.meta.form_mixed.insert(field);
+            }
+            if in_bozza {
+                self.meta.form_dirty.insert(field);
             }
         }
     }
@@ -784,7 +1175,6 @@ impl AppState {
     /// quando la selezione è pronta.
     pub fn rebuild_gps_form(&mut self) {
         let paths = self.selected_paths();
-        self.gps.form_paths = paths.clone();
         self.gps.marker = None;
         self.gps.marker_mixed = false;
         self.gps.manual_lat.clear();
@@ -795,20 +1185,32 @@ impl AppState {
         self.gps.location_mixed.clear();
         self.gps.location_dirty.clear();
         self.gps.draft_dirty = false;
-        if paths.is_empty() {
+        self.gps.coordinates_dirty = false;
+        if paths.is_empty() || paths.iter().any(|path| !self.meta.docs.contains_key(path)) {
+            // Senza tutti i documenti la bozza non è attendibile: resta vuota
+            // e viene ricostruita appena la selezione è pronta.
+            self.gps.form_paths.clear();
             return;
         }
+        self.gps.form_paths = paths.clone();
 
         let mut posizioni: Vec<Option<GpsLocation>> = Vec::with_capacity(paths.len());
         for path in &paths {
-            let Some(document) = self.meta.docs.get(path) else {
-                return;
+            let document = &self.meta.docs[path];
+            let coordinate = match self
+                .gps
+                .drafts
+                .get(path)
+                .and_then(|draft| draft.coordinates)
+            {
+                Some(coordinate) => coordinate,
+                None => document.gps.map(|gps| GpsLocation {
+                    latitude: gps.latitude,
+                    longitude: gps.longitude,
+                    altitude: gps.altitude,
+                }),
             };
-            posizioni.push(document.gps.map(|gps| GpsLocation {
-                latitude: gps.latitude,
-                longitude: gps.longitude,
-                altitude: gps.altitude,
-            }));
+            posizioni.push(coordinate);
         }
         let primo = posizioni.first().copied().flatten();
         if posizioni.iter().all(|posizione| *posizione == primo) {
@@ -839,11 +1241,22 @@ impl AppState {
         for role in LocationRole::ALL {
             for field in LocationField::ALL {
                 let mut valori = Vec::with_capacity(paths.len());
+                let mut in_bozza = false;
                 for path in &paths {
-                    let Some(document) = self.meta.docs.get(path) else {
-                        return;
+                    let document = &self.meta.docs[path];
+                    let valore = match self
+                        .gps
+                        .drafts
+                        .get(path)
+                        .and_then(|draft| draft.locations.get(&(role, field)))
+                    {
+                        Some(value) => {
+                            in_bozza = true;
+                            value.clone().unwrap_or_default()
+                        }
+                        None => document.location(role).display(field),
                     };
-                    valori.push(document.location(role).display(field));
+                    valori.push(valore);
                 }
                 let primo = valori.first().cloned().unwrap_or_default();
                 if valori.iter().all(|valore| *valore == primo) {
@@ -853,8 +1266,24 @@ impl AppState {
                 } else {
                     self.gps.location_mixed.insert((role, field));
                 }
+                if in_bozza {
+                    self.gps.location_dirty.insert((role, field));
+                }
             }
         }
+
+        self.gps.coordinates_dirty = paths.iter().any(|path| {
+            self.gps
+                .drafts
+                .get(path)
+                .is_some_and(|draft| draft.coordinates.is_some())
+        });
+        self.gps.draft_dirty = paths.iter().any(|path| {
+            self.gps
+                .drafts
+                .get(path)
+                .is_some_and(|draft| !draft.is_empty())
+        });
     }
 
     /// Ordina `entries`; per data di acquisizione e valutazione la chiave
@@ -975,18 +1404,18 @@ pub struct UiActions {
     pub confirm_new_folder: Option<(PathBuf, String)>,
     /// Eliminazione cartella confermata dal prompt.
     pub confirm_delete_dir: Option<PathBuf>,
-    /// Salva i campi metadati modificati sulla selezione.
-    pub metadata_save: bool,
+    /// Apre il dialogo di salvataggio manuale.
+    pub save_open: bool,
+    /// Conferma il salvataggio nella modalità scelta.
+    pub save_confirm: Option<SaveMode>,
+    /// Chiude il dialogo di salvataggio.
+    pub save_cancel: bool,
     /// Rilegge i metadati della selezione.
     pub metadata_reload: bool,
     /// Imposta la valutazione (0–5 stelle) sulle foto indicate.
     pub metadata_rate: Option<(Vec<PathBuf>, u8)>,
-    /// Applica il marker GPS (coordinate in bozza) alla selezione.
-    pub gps_apply: bool,
-    /// Rimuove le coordinate GPS dalla selezione.
+    /// Rimuove le coordinate GPS dalla selezione (in bozza).
     pub gps_remove: bool,
-    /// Salva i campi di località modificati sulla selezione.
-    pub gps_save_location: bool,
     /// Scarta le modifiche in bozza e rilegge i valori dal file.
     pub gps_reset: bool,
     /// Avvia una ricerca Nominatim (solo su azione esplicita).
@@ -1317,6 +1746,207 @@ mod tests {
         assert!(edit.path.is_none());
         assert!(edit.recipe.is_identity());
         assert_eq!(edit.presets.len(), 1, "i preset appartengono al catalogo");
+    }
+
+    #[test]
+    fn le_bozze_colore_sopravvivono_al_cambio_foto() {
+        let mut edit = EditState::default();
+        edit.carica(Path::new("/foto/a.jpg"), None, EditRecipe::default());
+        edit.apply_preset(EditRecipe {
+            exposure: 2.0,
+            ..EditRecipe::default()
+        });
+        edit.remember_draft();
+        let bozza = edit.recipe;
+
+        edit.carica(Path::new("/foto/b.jpg"), None, EditRecipe::default());
+        assert_eq!(edit.recipe_for(Path::new("/foto/a.jpg")), bozza);
+        assert_eq!(
+            edit.recipe_for(Path::new("/foto/b.jpg")),
+            EditRecipe::default()
+        );
+    }
+
+    #[test]
+    fn le_bozze_seguono_file_e_cartelle_rinominati() {
+        let mut edit = EditState::default();
+        let bozza = EditRecipe {
+            contrast: 12.0,
+            ..EditRecipe::default()
+        };
+        edit.drafts.insert(PathBuf::from("/foto/a.jpg"), bozza);
+        edit.remap_draft(Path::new("/foto/a.jpg"), Path::new("/foto/b.jpg"));
+        assert_eq!(edit.drafts.get(Path::new("/foto/b.jpg")), Some(&bozza));
+
+        edit.remap_drafts_in_dir(Path::new("/foto"), Path::new("/archivio"));
+        assert_eq!(edit.drafts.get(Path::new("/archivio/b.jpg")), Some(&bozza));
+    }
+
+    #[test]
+    fn il_salvataggio_include_solo_le_foto_con_bozze() {
+        let mut state = AppState::new(PersistedState::default());
+        state.entries = vec![asset("/foto/a.jpg"), asset("/foto/b.jpg")];
+        let a = PathBuf::from("/foto/a.jpg");
+        let b = PathBuf::from("/foto/b.jpg");
+        state.selection.insert(a.clone());
+        state
+            .edit
+            .carica(Path::new("/foto/a.jpg"), None, EditRecipe::default());
+        state.edit.apply_preset(EditRecipe {
+            gamma: 1.2,
+            ..EditRecipe::default()
+        });
+        state.edit.remember_draft();
+        state.set_meta_field(MetadataField::Title, Some("Titolo".to_owned()));
+        assert_eq!(state.save_targets(), vec![a.clone()]);
+
+        state.selection.insert(b.clone());
+        assert_eq!(state.save_targets(), vec![a.clone()]);
+
+        state.set_meta_field(MetadataField::Title, Some("Insieme".to_owned()));
+        assert_eq!(state.save_targets(), vec![a, b]);
+    }
+
+    #[test]
+    fn le_bozze_metadati_e_gps_sopravvivono_al_cambio_selezione() {
+        let mut state = AppState::new(PersistedState::default());
+        let a = PathBuf::from("/foto/a.jpg");
+        let b = PathBuf::from("/foto/b.jpg");
+        state.entries = vec![asset("/foto/a.jpg"), asset("/foto/b.jpg")];
+        state
+            .meta
+            .docs
+            .insert(a.clone(), MetadataDocument::default());
+        state
+            .meta
+            .docs
+            .insert(b.clone(), MetadataDocument::default());
+
+        state.selection.insert(a.clone());
+        state.rebuild_meta_form();
+        state.rebuild_gps_form();
+        state.set_meta_field(MetadataField::Title, Some("Titolo".to_owned()));
+        let posizione = GpsLocation {
+            latitude: 45.0,
+            longitude: 9.0,
+            altitude: None,
+        };
+        state.set_gps_marker(Some(posizione));
+        state.set_gps_location_field(
+            LocationRole::Created,
+            LocationField::City,
+            "Milano".to_owned(),
+        );
+
+        state.selection.clear();
+        state.selection.insert(b.clone());
+        state.rebuild_meta_form();
+        state.rebuild_gps_form();
+        assert!(state.metadata_edits(&b).is_empty());
+        assert!(state.gps_edits(&b).is_empty());
+
+        state.selection.clear();
+        state.selection.insert(a.clone());
+        state.rebuild_meta_form();
+        state.rebuild_gps_form();
+        assert_eq!(
+            state.meta.form_values.get(&MetadataField::Title),
+            Some(&"Titolo".to_owned())
+        );
+        assert!(state.meta.form_dirty.contains(&MetadataField::Title));
+        assert_eq!(state.gps.marker, Some(posizione));
+        assert_eq!(
+            state
+                .gps
+                .location_value(LocationRole::Created, LocationField::City),
+            "Milano"
+        );
+        assert_eq!(state.metadata_edits(&a).len(), 1);
+        assert_eq!(state.gps_edits(&a).len(), 2);
+    }
+
+    #[test]
+    fn le_bozze_metadati_e_gps_seguono_i_file_rinominati() {
+        let mut state = AppState::new(PersistedState::default());
+        let a = PathBuf::from("/foto/a.jpg");
+        let b = PathBuf::from("/foto/b.jpg");
+        state
+            .meta
+            .drafts
+            .entry(a.clone())
+            .or_default()
+            .insert(MetadataField::Title, Some("Titolo".to_owned()));
+        state.gps.drafts.insert(
+            a.clone(),
+            GpsDraft {
+                coordinates: Some(Some(GpsLocation {
+                    latitude: 45.0,
+                    longitude: 9.0,
+                    altitude: None,
+                })),
+                ..GpsDraft::default()
+            },
+        );
+        state.remap_photo_drafts(&a, &b);
+        assert!(state.meta_pending(&b));
+        assert!(state.gps_pending(&b));
+        assert!(!state.meta_pending(&a));
+        assert!(!state.gps_pending(&a));
+
+        state.remap_photo_drafts_in_dir(Path::new("/foto"), Path::new("/archivio"));
+        assert!(state.meta_pending(Path::new("/archivio/b.jpg")));
+        assert!(state.gps_pending(Path::new("/archivio/b.jpg")));
+    }
+
+    #[test]
+    fn le_modifiche_fuori_selezione_contano_come_non_salvate() {
+        let mut state = AppState::new(PersistedState::default());
+        assert!(!state.has_unsaved_changes());
+
+        state.edit.drafts.insert(
+            PathBuf::from("/foto/a.jpg"),
+            EditRecipe {
+                exposure: 1.0,
+                ..EditRecipe::default()
+            },
+        );
+        assert!(state.has_unsaved_changes());
+
+        state.edit.drafts.clear();
+        state.gps.drafts.insert(
+            PathBuf::from("/foto/b.jpg"),
+            GpsDraft {
+                coordinates: Some(Some(GpsLocation {
+                    latitude: 45.0,
+                    longitude: 9.0,
+                    altitude: None,
+                })),
+                ..GpsDraft::default()
+            },
+        );
+        assert!(state.has_unsaved_changes());
+    }
+
+    #[test]
+    fn il_form_attende_i_documenti_prima_di_ricostruirsi() {
+        let mut state = AppState::new(PersistedState::default());
+        let path = PathBuf::from("/foto/a.jpg");
+        state.entries = vec![asset("/foto/a.jpg")];
+        state.selection.insert(path.clone());
+
+        state.rebuild_meta_form();
+        state.rebuild_gps_form();
+        assert!(state.meta.form_paths.is_empty());
+        assert!(state.gps.form_paths.is_empty());
+
+        state
+            .meta
+            .docs
+            .insert(path.clone(), MetadataDocument::default());
+        state.rebuild_meta_form();
+        state.rebuild_gps_form();
+        assert_eq!(state.meta.form_paths, vec![path.clone()]);
+        assert_eq!(state.gps.form_paths, vec![path]);
     }
 
     #[test]

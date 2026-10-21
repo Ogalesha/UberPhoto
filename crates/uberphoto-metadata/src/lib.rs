@@ -21,6 +21,6 @@ pub use model::{
     MetadataEdit, MetadataField, MetadataSummary, RawTag, Section, TechnicalInfo,
 };
 pub use service::{
-    exiftool_disponibile, exiftool_versione, FullDocument, MetadataOutcome, MetadataRequest,
-    MetadataService, MetadataWriteReport, WriteItem,
+    exiftool_disponibile, exiftool_versione, write_edits, FullDocument, MetadataOutcome,
+    MetadataRequest, MetadataService, MetadataWriteReport, WriteItem,
 };

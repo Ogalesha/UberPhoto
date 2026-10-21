@@ -13,7 +13,9 @@ use std::time::{Duration, UNIX_EPOCH};
 use eframe::egui;
 use uberphoto_core::GpsLocation;
 use uberphoto_db::{Index, MetadataIndex};
-use uberphoto_export::{ExportItem, ExportJob, ExportService};
+use uberphoto_export::{
+    ExportItem, ExportJob, ExportService, SaveEvent, SaveJob, SaveMode, SaveRequest, SaveService,
+};
 use uberphoto_files::{
     create_dir, delete_empty_dir, dir_item_count, rename_dir, ConflictPolicy, DirNode, DirWatcher,
     DirectoryScanner, FileOpRequest, FileOpsService,
@@ -55,11 +57,17 @@ pub struct UberPhotoApp {
     edit: EditService,
     /// Esportazione for web su thread dedicato.
     export: ExportService,
+    /// Salvataggio manuale su thread dedicato.
+    save: SaveService,
     /// Osservatore della cartella corrente per le modifiche esterne.
     watcher: Option<DirWatcher>,
     /// Chiusura automatica dopo N secondi, usata dagli smoke test di CI
     /// (variabile d'ambiente `UBERPHOTO_SMOKE_EXIT_SECS`).
     smoke_exit: Option<(std::time::Instant, f64)>,
+    /// Conferma di chiusura per modifiche non salvate.
+    close_prompt: bool,
+    /// La chiusura è stata confermata: non richiedere più il prompt.
+    allow_close: bool,
 }
 
 impl UberPhotoApp {
@@ -93,8 +101,11 @@ impl UberPhotoApp {
             geo: GeoService::new(geo_client(), repaint.clone()),
             edit: EditService::new(repaint.clone()),
             export: ExportService::new(repaint.clone()),
+            save: SaveService::new(repaint.clone()),
             watcher: DirWatcher::new(repaint),
             smoke_exit,
+            close_prompt: false,
+            allow_close: false,
         };
         app.state.logo = load_logo(&cc.egui_ctx);
         app.state.exiftool = exiftool_versione();
@@ -168,6 +179,14 @@ impl UberPhotoApp {
                     self.state.entries = result.entries;
                     self.refresh_index_rows(&result.dir);
                     self.state.apply_sort();
+                    if let Some(path) = self.state.pending_select.take() {
+                        if path.parent() == Some(result.dir.as_path())
+                            && self.state.entries.iter().any(|entry| entry.path == path)
+                        {
+                            self.state.selection.insert(path.clone());
+                            self.state.selection_anchor = Some(path);
+                        }
+                    }
                     self.request_metadata_summary();
                 }
             }
@@ -320,14 +339,10 @@ impl UberPhotoApp {
                             }
                         }
                     }
-                    if self.state.meta.form_paths == self.state.selected_paths()
-                        && self.state.meta.form_dirty.is_empty()
-                    {
+                    if self.state.meta.form_paths == self.state.selected_paths() {
                         self.state.rebuild_meta_form();
                     }
-                    if self.state.gps.form_paths == self.state.selected_paths()
-                        && !self.state.gps.draft_dirty
-                    {
+                    if self.state.gps.form_paths == self.state.selected_paths() {
                         self.state.rebuild_gps_form();
                     }
                 }
@@ -337,11 +352,8 @@ impl UberPhotoApp {
                         error: report.first_error(),
                         undo: None,
                     });
-                    self.state.meta.form_dirty.clear();
-                    if report.failed.is_empty() {
-                        self.state.gps.location_dirty.clear();
-                        self.state.gps.draft_dirty = false;
-                    }
+                    // Le bozze restano intatte: questa scrittura è la
+                    // valutazione rapida, non il salvataggio del form.
                     if report.updated.is_empty() {
                         continue;
                     }
@@ -402,7 +414,7 @@ impl UberPhotoApp {
                         Ok(Some(suggestion)) => {
                             self.state.gps.geo_error = None;
                             if self.state.gps.marker.is_some() {
-                                self.state.gps.fill_location(
+                                self.state.fill_gps_location(
                                     LocationRole::Created,
                                     &suggestion.location_suggestion(),
                                 );
@@ -444,14 +456,12 @@ impl UberPhotoApp {
             self.state.meta.loaded.remove(path);
         }
         if self.state.meta.form_paths != selected {
-            self.state.rebuild_meta_form();
             self.state.meta.raw_filter.clear();
-        } else if !da_ricaricare.is_empty() && self.state.meta.form_dirty.is_empty() {
+        }
+        if self.state.meta.form_paths != selected || !da_ricaricare.is_empty() {
             self.state.rebuild_meta_form();
         }
-        if self.state.gps.form_paths != selected
-            || (!da_ricaricare.is_empty() && !self.state.gps.draft_dirty)
-        {
+        if self.state.gps.form_paths != selected || !da_ricaricare.is_empty() {
             self.state.rebuild_gps_form();
         }
         if self.state.exiftool.is_none() {
@@ -491,14 +501,16 @@ impl UberPhotoApp {
                 let mtime = self.state.entry_mtime(path);
                 let corrente = self.state.edit.path.as_deref() == Some(path.as_path());
                 if !corrente || self.state.edit.mtime != mtime {
-                    let recipe = self
+                    let base = self
                         .index
                         .as_ref()
                         .and_then(|index| index.load_recipe(path).ok().flatten())
                         .and_then(|json| EditRecipe::from_json(&json).ok())
                         .map(|recipe| recipe.sanitized())
                         .unwrap_or_default();
-                    self.state.edit.carica(path, mtime, recipe);
+                    let bozza = self.state.edit.drafts.get(path).copied().unwrap_or(base);
+                    self.state.edit.carica(path, mtime, base);
+                    self.state.edit.recipe = bozza;
                     self.preview.clear_edited();
                     nuova_foto = true;
                 }
@@ -606,36 +618,10 @@ impl UberPhotoApp {
         self.state.edit.busy = self.edit.busy();
     }
 
-    /// Scrive nel catalogo la ricetta modificata (autosalvataggio distinto
-    /// dal salvataggio dei metadati e dai pixel dell'originale).
-    fn autosave_recipe(&mut self) {
-        if !self.state.edit.pending_save {
-            return;
-        }
-        let Some(path) = self.state.edit.path.clone() else {
-            self.state.edit.pending_save = false;
-            return;
-        };
-        let recipe = self.state.edit.recipe;
-        let Some(index) = &self.index else {
-            self.state.edit.pending_save = false;
-            return;
-        };
-        let esito = if recipe.is_identity() {
-            index.remove_recipe(&path)
-        } else {
-            index.save_recipe(&path, &recipe.to_json())
-        };
-        match esito {
-            Ok(()) => {
-                self.state.edit.saved = recipe;
-                self.state.edit.pending_save = false;
-                self.state.edit.save_error = None;
-            }
-            Err(err) => {
-                self.state.edit.save_error = Some(format!("Ricetta non salvata: {err:#}"));
-            }
-        }
+    /// Conserva la ricetta modificata come bozza in memoria: il salvataggio
+    /// su file (nuova copia o sovrascrittura) resta un gesto esplicito.
+    fn remember_edit_draft(&mut self) {
+        self.state.edit.remember_draft();
     }
 
     /// Raccoglie gli eventi del servizio di esportazione.
@@ -687,16 +673,7 @@ impl UberPhotoApp {
         let items: Vec<ExportItem> = selezionati
             .into_iter()
             .map(|(path, kind)| {
-                let recipe = if self.state.edit.path.as_deref() == Some(path.as_path()) {
-                    self.state.edit.recipe
-                } else {
-                    self.index
-                        .as_ref()
-                        .and_then(|index| index.load_recipe(&path).ok().flatten())
-                        .and_then(|json| EditRecipe::from_json(&json).ok())
-                        .map(|recipe| recipe.sanitized())
-                        .unwrap_or_default()
-                };
+                let recipe = self.save_recipe_for(&path);
                 ExportItem { path, kind, recipe }
             })
             .collect();
@@ -712,117 +689,273 @@ impl UberPhotoApp {
         }
     }
 
-    /// Scrive sulla selezione i soli campi modificati nel form.
-    fn save_metadata(&mut self) {
-        if self.state.meta.form_dirty.is_empty() {
+    /// Apre il dialogo di conferma del salvataggio manuale.
+    fn open_save_dialog(&mut self) {
+        if self.state.save_dialog.is_some() || self.save.busy() {
             return;
         }
-        let edits: Vec<MetadataEdit> = self
-            .state
-            .meta
-            .form_dirty
-            .iter()
-            .map(|field| {
-                let value = self
-                    .state
-                    .meta
-                    .form_values
-                    .get(field)
-                    .cloned()
-                    .unwrap_or_default();
-                let value = value.trim();
-                MetadataEdit::Field(*field, (!value.is_empty()).then(|| value.to_owned()))
-            })
-            .collect();
-        if edits.is_empty() {
+        if self.state.selection.is_empty() {
+            self.state.error = Some("Seleziona almeno una foto da salvare.".to_owned());
             return;
         }
-        let items: Vec<WriteItem> = self
-            .state
-            .selected_assets()
-            .into_iter()
-            .map(|asset| WriteItem {
-                path: asset.path.clone(),
-                format: asset.format,
-                edits: edits.clone(),
-            })
-            .collect();
-        if !items.is_empty() {
-            self.meta.request(MetadataRequest::Write { items });
+        if let Some(error) = &self.state.gps.manual_error {
+            self.state.error = Some(format!("Correggi la posizione prima di salvare: {error}"));
+            return;
         }
+        if !self.state.has_pending_changes() {
+            self.state.op_status = Some(OpStatus {
+                message: "Nessuna modifica da salvare.".to_owned(),
+                error: None,
+                undo: None,
+            });
+            return;
+        }
+        let dialog = crate::state::SaveDialog {
+            targets: self.state.save_targets(),
+            ..Default::default()
+        };
+        self.state.save_dialog = Some(dialog);
     }
 
-    /// Scrive le coordinate del marker sulla selezione.
-    fn apply_gps_draft(&mut self) {
-        let Some(location) = self.state.gps.marker else {
-            self.state.error =
-                Some("Posiziona il marker o inserisci le coordinate prima di applicare".to_owned());
+    /// Ricetta effettiva da salvare: bozza corrente, bozza in memoria o
+    /// ricetta del catalogo (compatibilità con le versioni precedenti).
+    fn save_recipe_for(&self, path: &Path) -> EditRecipe {
+        if self.state.edit.path.as_deref() == Some(path) {
+            return self.state.edit.recipe;
+        }
+        if let Some(bozza) = self.state.edit.drafts.get(path) {
+            return bozza.sanitized();
+        }
+        self.index
+            .as_ref()
+            .and_then(|index| index.load_recipe(path).ok().flatten())
+            .and_then(|json| EditRecipe::from_json(&json).ok())
+            .map(|recipe| recipe.sanitized())
+            .unwrap_or_default()
+    }
+
+    /// Avvia il salvataggio delle foto coinvolte, validando prima formati e
+    /// modalità per non lasciare file parziali.
+    fn start_save(&mut self, mode: SaveMode) {
+        let Some(mut dialog) = self.state.save_dialog.take() else {
             return;
         };
-        self.write_gps_edit(Some(location));
-    }
+        dialog.mode = mode;
+        dialog.error = None;
+        let targets = if dialog.targets.is_empty() {
+            self.state.save_targets()
+        } else {
+            dialog.targets.clone()
+        };
+        if targets.is_empty() {
+            dialog.error = Some("Nessuna modifica da salvare.".to_owned());
+            dialog.targets.clear();
+            self.state.save_dialog = Some(dialog);
+            return;
+        }
 
-    /// Rimuove le coordinate GPS dalla selezione.
-    fn remove_gps_selection(&mut self) {
-        self.write_gps_edit(None);
-    }
-
-    fn write_gps_edit(&mut self, location: Option<GpsLocation>) {
-        let items: Vec<WriteItem> = self
-            .state
-            .selected_assets()
-            .into_iter()
-            .map(|asset| WriteItem {
+        let mut requests = Vec::with_capacity(targets.len());
+        let mut formati_non_supportati = Vec::new();
+        for path in &targets {
+            let Some(asset) = self.state.entries.iter().find(|asset| &asset.path == path) else {
+                dialog.error = Some(format!(
+                    "{} non è più nella cartella corrente.",
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string())
+                ));
+                dialog.targets = targets.clone();
+                self.state.save_dialog = Some(dialog);
+                return;
+            };
+            let capabilities = asset.format.capabilities();
+            let recipe = self.save_recipe_for(path);
+            let mut edits = self.state.metadata_edits(path);
+            edits.extend(self.state.gps_edits(path));
+            if (mode == SaveMode::NewCopy || !recipe.is_identity()) && !capabilities.pixel_edit {
+                formati_non_supportati.push(asset.format.label());
+            }
+            if !edits.is_empty() && !capabilities.embedded_metadata && !capabilities.xmp_sidecar {
+                formati_non_supportati.push(asset.format.label());
+            }
+            requests.push(SaveRequest {
                 path: asset.path.clone(),
-                format: asset.format,
-                edits: vec![MetadataEdit::Gps(location)],
-            })
-            .collect();
-        if items.is_empty() {
+                kind: asset.format,
+                recipe,
+                edits,
+                mode,
+            });
+        }
+        formati_non_supportati.sort_unstable();
+        formati_non_supportati.dedup();
+        if !formati_non_supportati.is_empty() {
+            let formati = formati_non_supportati.join(", ");
+            dialog.error = Some(match mode {
+                SaveMode::NewCopy => format!(
+                    "La nuova copia è disponibile solo per JPEG, PNG, TIFF e WebP. \
+                     Formati non supportati: {formati}. Scegli “Sovrascrivi originale”."
+                ),
+                SaveMode::Overwrite => format!(
+                    "Le modifiche non possono essere applicate a: {formati}. \
+                     Il colore richiede un formato modificabile; i metadati richiedono \
+                     scrittura embedded o sidecar XMP."
+                ),
+            });
+            dialog.targets = targets;
+            self.state.save_dialog = Some(dialog);
             return;
         }
-        self.meta.request(MetadataRequest::Write { items });
+
+        dialog.busy = true;
+        dialog.targets = targets;
+        dialog.completed.clear();
+        dialog.created = 0;
+        dialog.failure = None;
+        self.state.save_dialog = Some(dialog);
+        if !self.save.start(SaveJob { requests }) {
+            if let Some(dialog) = self.state.save_dialog.as_mut() {
+                dialog.busy = false;
+                dialog.error = Some("Un salvataggio è già in corso.".to_owned());
+            }
+        }
     }
 
-    /// Scrive i soli campi di località modificati nella bozza.
-    fn save_location_edits(&mut self) {
-        if self.state.gps.location_dirty.is_empty() {
-            return;
-        }
-        let edits: Vec<MetadataEdit> = self
-            .state
-            .gps
-            .location_dirty
-            .iter()
-            .map(|(role, field)| {
-                let value = self
-                    .state
-                    .gps
-                    .location_values
-                    .get(&(*role, *field))
-                    .map(|text| text.trim().to_owned())
-                    .filter(|text| !text.is_empty());
-                MetadataEdit::Location {
-                    role: *role,
-                    field: *field,
-                    value,
+    /// Raccoglie gli esiti del salvataggio, aggiorna il dialogo e ricarica la
+    /// cartella per mostrare i file appena scritti.
+    fn pump_save_results(&mut self) {
+        let mut outcomes = Vec::new();
+        let mut failures = Vec::new();
+        let mut finished = None;
+        for event in self.save.drain() {
+            match event {
+                SaveEvent::Saved(outcome) => outcomes.push(outcome),
+                SaveEvent::Failed { source, error } => {
+                    if let Some(dialog) = self.state.save_dialog.as_mut() {
+                        if dialog.failure.is_none() {
+                            dialog.failure = Some(format!(
+                                "{}: {error}",
+                                source
+                                    .file_name()
+                                    .map(|name| name.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| source.display().to_string())
+                            ));
+                        }
+                    }
+                    failures.push((source, error));
                 }
-            })
-            .collect();
-        let items: Vec<WriteItem> = self
-            .state
-            .selected_assets()
-            .into_iter()
-            .map(|asset| WriteItem {
-                path: asset.path.clone(),
-                format: asset.format,
-                edits: edits.clone(),
-            })
-            .collect();
-        if items.is_empty() {
-            return;
+                SaveEvent::Finished {
+                    saved,
+                    failed,
+                    total,
+                } => finished = Some((saved, failed, total)),
+            }
         }
-        self.meta.request(MetadataRequest::Write { items });
+
+        for outcome in outcomes {
+            for warning in &outcome.warnings {
+                tracing::warn!(
+                    file = %outcome.output.display(),
+                    "salvataggio: {warning}"
+                );
+            }
+            self.state.edit.forget_draft(&outcome.source);
+            self.state.meta.drafts.remove(&outcome.source);
+            self.state.gps.drafts.remove(&outcome.source);
+            // I metadati possono essere cambiati anche via sidecar, senza
+            // toccare l'mtime dell'immagine: invalida le cache per rileggerli.
+            for path in [&outcome.source, &outcome.output] {
+                self.state.meta.docs.remove(path);
+                self.state.meta.raw.remove(path);
+                self.state.meta.loaded.remove(path);
+                self.state.meta.summarized.remove(path);
+            }
+            if let Some(index) = &self.index {
+                if let Err(err) = index.remove_recipe(&outcome.source) {
+                    tracing::warn!("rimozione della ricetta non riuscita: {err:#}");
+                }
+            }
+            if self.state.edit.path.as_deref() == Some(outcome.source.as_path()) {
+                self.state.edit.recipe = EditRecipe::default();
+                self.state.edit.saved = EditRecipe::default();
+                self.state.edit.undo.clear();
+                self.state.edit.redo.clear();
+                self.state.edit.drag_base = None;
+                self.state.edit.requested = None;
+                self.state.edit.edited = None;
+            }
+            self.state.pending_select = Some(outcome.output);
+            if let Some(dialog) = self.state.save_dialog.as_mut() {
+                dialog.completed.insert(outcome.source.clone());
+                dialog.targets.retain(|path| path != &outcome.source);
+                if outcome.created {
+                    dialog.created += 1;
+                }
+            }
+        }
+
+        let Some((_saved, _failed, total)) = finished else {
+            return;
+        };
+        let Some(mut dialog) = self.state.save_dialog.take() else {
+            return;
+        };
+        dialog.busy = false;
+        let saved = dialog.completed.len();
+        let failed = total.saturating_sub(saved);
+        let nuove = dialog.created;
+
+        if failed == 0 {
+            self.state.meta.form_dirty.clear();
+            self.state.gps.location_dirty.clear();
+            self.state.gps.coordinates_dirty = false;
+            self.state.gps.draft_dirty = false;
+            let messaggio = if nuove == saved {
+                format!("Salvate {saved} nuove foto.")
+            } else if nuove == 0 {
+                format!("Aggiornate {saved} foto.")
+            } else {
+                format!("Salvate {saved} foto ({nuove} nuove copie).")
+            };
+            self.state.op_status = Some(OpStatus {
+                message: messaggio,
+                error: None,
+                undo: None,
+            });
+        } else {
+            let primo = dialog
+                .failure
+                .clone()
+                .or_else(|| {
+                    failures.first().map(|(path, error)| {
+                        format!(
+                            "{}: {error}",
+                            path.file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| path.display().to_string())
+                        )
+                    })
+                })
+                .unwrap_or_default();
+            dialog.error = Some(format!(
+                "Salvate {saved} foto su {total}; {failed} non riuscite. {primo}"
+            ));
+            self.state.op_status = Some(OpStatus {
+                message: format!("Salvataggio incompleto: {saved} riuscite, {failed} fallite."),
+                error: Some(primo),
+                undo: None,
+            });
+        }
+        if failed == 0 {
+            self.state.save_dialog = None;
+        } else {
+            self.state.save_dialog = Some(dialog);
+        }
+
+        if saved > 0 {
+            if let Some(dir) = self.state.current_dir.clone() {
+                self.start_scan(dir);
+            }
+        }
     }
 
     /// Scrittura rapida della valutazione dal menu contestuale della griglia.
@@ -901,12 +1034,14 @@ impl UberPhotoApp {
         while let Some(outcome) = self.ops.try_recv() {
             let is_copy = outcome.description == "Copia";
             if !is_copy {
-                if let Some(index) = &self.index {
-                    for pair in &outcome.report.moved {
+                for pair in &outcome.report.moved {
+                    if let Some(index) = &self.index {
                         if let Err(err) = index.move_path(&pair.from, &pair.to) {
                             tracing::warn!("scrittura indice non riuscita: {err:#}");
                         }
                     }
+                    self.state.edit.remap_draft(&pair.from, &pair.to);
+                    self.state.remap_photo_drafts(&pair.from, &pair.to);
                 }
             }
             let undoable = outcome.description == "Spostamento"
@@ -1048,8 +1183,14 @@ impl UberPhotoApp {
             }
         }
 
-        if actions.metadata_save {
-            self.save_metadata();
+        if actions.save_open {
+            self.open_save_dialog();
+        }
+        if actions.save_cancel {
+            self.state.save_dialog = None;
+        }
+        if let Some(mode) = actions.save_confirm {
+            self.start_save(mode);
         }
         if actions.metadata_reload {
             let selected = self.state.selected_paths();
@@ -1069,23 +1210,17 @@ impl UberPhotoApp {
             self.rate_metadata(paths, stars);
         }
 
-        if actions.gps_apply {
-            self.apply_gps_draft();
-        }
         if actions.gps_remove {
-            self.remove_gps_selection();
-        }
-        if actions.gps_save_location {
-            self.save_location_edits();
+            self.state.set_gps_marker(None);
         }
         if actions.gps_reset {
-            self.state.rebuild_gps_form();
+            self.state.discard_gps_drafts();
         }
         if let Some((result, target)) = actions.gps_use_suggestion {
             match target {
                 SuggestionTarget::Marker => {
                     let altitude = self.state.gps.marker.and_then(|marker| marker.altitude);
-                    self.state.gps.set_marker(Some(GpsLocation {
+                    self.state.set_gps_marker(Some(GpsLocation {
                         latitude: result.latitude,
                         longitude: result.longitude,
                         altitude,
@@ -1097,14 +1232,12 @@ impl UberPhotoApp {
                 SuggestionTarget::Created => {
                     let suggestion = result.location_suggestion();
                     self.state
-                        .gps
-                        .fill_location(LocationRole::Created, &suggestion);
+                        .fill_gps_location(LocationRole::Created, &suggestion);
                 }
                 SuggestionTarget::Shown => {
                     let suggestion = result.location_suggestion();
                     self.state
-                        .gps
-                        .fill_location(LocationRole::Shown, &suggestion);
+                        .fill_gps_location(LocationRole::Shown, &suggestion);
                 }
             }
         }
@@ -1189,39 +1322,29 @@ impl UberPhotoApp {
         }
     }
 
-    /// Applica una ricetta (o la neutra) a tutte le foto selezionate.
+    /// Applica una ricetta (o la neutra) alla selezione come bozza in memoria:
+    /// nessun file viene modificato finché non si preme Salva.
     fn apply_edit_preset_to_selection(&mut self, recipe: EditRecipe) {
         let recipe = recipe.sanitized();
         let selezionati = self.state.selected_paths();
-        let Some(index) = &self.index else {
-            self.state.edit.save_error =
-                Some("Preset non applicato: catalogo locale non disponibile".to_owned());
-            return;
-        };
-        let mut errori = 0usize;
         for path in &selezionati {
-            let esito = if recipe.is_identity() {
-                index.remove_recipe(path)
+            if recipe.is_identity() {
+                self.state.edit.drafts.remove(path);
             } else {
-                index.save_recipe(path, &recipe.to_json())
-            };
-            if esito.is_err() {
-                errori += 1;
+                self.state.edit.drafts.insert(path.clone(), recipe);
             }
         }
-        if errori > 0 {
-            self.state.edit.save_error = Some(format!(
-                "Preset applicato con {errori} errori di salvataggio nel catalogo"
-            ));
-        } else {
-            self.state.edit.save_error = None;
+        if self.state.edit.path.is_some()
+            && self
+                .state
+                .edit
+                .path
+                .as_ref()
+                .is_some_and(|path| selezionati.contains(path))
+        {
+            self.state.edit.apply_preset(recipe);
         }
-        if let Some(path) = self.state.edit.path.clone() {
-            if selezionati.iter().any(|selezionata| selezionata == &path) {
-                let mtime = self.state.edit.mtime;
-                self.state.edit.carica(&path, mtime, recipe);
-            }
-        }
+        self.state.edit.save_error = None;
     }
 
     /// Elimina un preset dal catalogo locale.
@@ -1273,6 +1396,8 @@ impl UberPhotoApp {
                 tracing::warn!("scrittura indice non riuscita: {err:#}");
             }
         }
+        self.state.edit.remap_drafts_in_dir(dir, &new_path);
+        self.state.remap_photo_drafts_in_dir(dir, &new_path);
         if let Some(root) = &mut self.state.root {
             tree_repath(root, dir, &new_path);
         }
@@ -1314,6 +1439,392 @@ impl UberPhotoApp {
         self.rename_prompt_window(ctx, actions);
         self.new_folder_window(ctx, actions);
         self.delete_dir_window(ctx, actions);
+        self.save_dialog_modal(ctx, actions);
+    }
+
+    /// Modal di salvataggio: riepilogo delle modifiche e scelta tra nuova
+    /// copia e sovrascrittura dell'originale.
+    fn save_dialog_modal(&mut self, ctx: &egui::Context, actions: &mut UiActions) {
+        if self.state.save_dialog.is_none() {
+            return;
+        }
+
+        let targets = self
+            .state
+            .save_dialog
+            .as_ref()
+            .map(|dialog| {
+                if dialog.targets.is_empty() {
+                    self.state.save_targets()
+                } else {
+                    dialog.targets.clone()
+                }
+            })
+            .unwrap_or_default();
+        let total = targets.len();
+        let file_label = match targets.as_slice() {
+            [path] => path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string()),
+            _ => format!("{total} fotografie"),
+        };
+        let folder = targets
+            .first()
+            .and_then(|path| path.parent())
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+        let nomi: Vec<String> = targets
+            .iter()
+            .take(3)
+            .map(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string())
+            })
+            .collect();
+        let altri = total.saturating_sub(nomi.len());
+        let elenco = if altri > 0 {
+            format!("{} e altre {altri}", nomi.join(", "))
+        } else {
+            nomi.join(", ")
+        };
+        let copia_esempio = targets.first().map(|path| nome_copia_libera(path));
+        let modifiche_colore = targets
+            .iter()
+            .filter(|path| !self.state.edit.recipe_for(path).is_identity())
+            .count();
+        let campi_meta = targets
+            .iter()
+            .filter_map(|path| self.state.meta.drafts.get(path))
+            .flat_map(|draft| draft.keys())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        let campi_localita = targets
+            .iter()
+            .filter_map(|path| self.state.gps.drafts.get(path))
+            .flat_map(|draft| draft.locations.keys())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        let coordinate = targets.iter().any(|path| {
+            self.state
+                .gps
+                .drafts
+                .get(path)
+                .is_some_and(|draft| draft.coordinates.is_some())
+        });
+        let campi_posizione = campi_localita + usize::from(coordinate);
+        let formati_non_copiabili: Vec<&str> = targets
+            .iter()
+            .filter_map(|path| {
+                self.state
+                    .entries
+                    .iter()
+                    .find(|entry| &entry.path == path)
+                    .map(|entry| entry.format)
+            })
+            .filter(|kind| !kind.capabilities().pixel_edit)
+            .map(|kind| kind.label())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let anteprima = self
+            .state
+            .edit
+            .edited
+            .clone()
+            .or_else(|| self.state.edit.original.clone());
+        let assets_ready = targets
+            .iter()
+            .all(|path| self.state.entries.iter().any(|entry| &entry.path == path));
+        let pending = targets.iter().any(|path| self.state.path_pending(path));
+        let mut close = false;
+        let mut confirm = None;
+
+        let response = egui::Modal::new(egui::Id::unique("save_modal"))
+            .frame(
+                egui::Frame::popup(ctx.style_of(egui::Theme::Dark).as_ref())
+                    .inner_margin(egui::Margin::same(18))
+                    .corner_radius(egui::CornerRadius::same(12))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(58, 58, 64))),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(540.0);
+                let Some(dialog) = self.state.save_dialog.as_mut() else {
+                    return;
+                };
+                let busy = dialog.busy;
+
+                ui.horizontal(|ui| {
+                    if let Some(texture) = &anteprima {
+                        egui::Frame::new()
+                            .fill(egui::Color32::from_rgb(16, 16, 18))
+                            .corner_radius(egui::CornerRadius::same(8))
+                            .inner_margin(egui::Margin::same(4))
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::Image::new(texture)
+                                        .max_size(egui::vec2(112.0, 84.0))
+                                        .maintain_aspect_ratio(true),
+                                );
+                            });
+                    }
+                    ui.vertical(|ui| {
+                        ui.heading("Salva le modifiche");
+                        ui.add_space(2.0);
+                        ui.label(egui::RichText::new(file_label.clone()).strong());
+                        ui.weak(elide(&folder, 64));
+                        ui.add_space(8.0);
+                        ui.horizontal_wrapped(|ui| {
+                            if modifiche_colore > 0 {
+                                riepilogo_badge(
+                                    ui,
+                                    &format!("Colore · {modifiche_colore}"),
+                                    egui::Color32::from_rgb(110, 155, 209),
+                                );
+                            }
+                            if campi_meta > 0 {
+                                riepilogo_badge(
+                                    ui,
+                                    &format!("Metadati · {campi_meta}"),
+                                    egui::Color32::from_rgb(147, 190, 140),
+                                );
+                            }
+                            if campi_posizione > 0 {
+                                riepilogo_badge(
+                                    ui,
+                                    &format!("Posizione · {campi_posizione}"),
+                                    egui::Color32::from_rgb(209, 173, 110),
+                                );
+                            }
+                        });
+                    });
+                });
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new("Cosa vuoi fare?").strong());
+                ui.weak(format!("Interessa: {elenco}"));
+                ui.add_space(8.0);
+
+                let nuova = dialog.mode == SaveMode::NewCopy;
+                let nuova_abilitata = formati_non_copiabili.is_empty() && !busy && assets_ready;
+                let nuova_hint = match &copia_esempio {
+                    Some(nome) => format!(
+                        "Crea “{nome}” accanto all'originale. Il file di partenza non \
+                         viene toccato."
+                    ),
+                    None => "Crea una copia accanto all'originale.".to_owned(),
+                };
+                let nuova_response = mode_card(
+                    ui,
+                    ModeCard {
+                        id: ui.make_persistent_id("save_mode_new"),
+                        selected: nuova,
+                        enabled: nuova_abilitata,
+                        accent: egui::Color32::from_rgb(110, 155, 209),
+                        titolo: if total == 1 {
+                            "Nuova foto"
+                        } else {
+                            "Nuove foto"
+                        },
+                        sottotitolo: &nuova_hint,
+                        badge: Some("Consigliato"),
+                    },
+                );
+                if nuova_response.clicked() && nuova_abilitata {
+                    dialog.mode = SaveMode::NewCopy;
+                    dialog.overwrite_confirmed = false;
+                    dialog.error = None;
+                }
+
+                if !nuova_abilitata {
+                    ui.add_space(4.0);
+                    ui.weak(format!(
+                        "Non disponibile per {}: per questi formati scegli la \
+                         sovrascrittura (i metadati finiscono nel sidecar XMP).",
+                        formati_non_copiabili.join(", ")
+                    ));
+                }
+
+                ui.add_space(8.0);
+                let sovrascrivi = dialog.mode == SaveMode::Overwrite;
+                let overwrite_response = mode_card(
+                    ui,
+                    ModeCard {
+                        id: ui.make_persistent_id("save_mode_overwrite"),
+                        selected: sovrascrivi,
+                        enabled: !busy && assets_ready,
+                        accent: ERROR_COLOR,
+                        titolo: "Sovrascrivi originale",
+                        sottotitolo: if total == 1 {
+                            "Riscrive questa foto con colore e metadati. Non è annullabile."
+                        } else {
+                            "Riscrive le foto selezionate con colore e metadati. Non è annullabile."
+                        },
+                        badge: None,
+                    },
+                );
+                if overwrite_response.clicked() && !busy {
+                    dialog.mode = SaveMode::Overwrite;
+                    dialog.overwrite_confirmed = false;
+                    dialog.error = None;
+                }
+
+                if dialog.mode == SaveMode::Overwrite {
+                    ui.add_space(8.0);
+                    egui::Frame::new()
+                        .fill(ERROR_COLOR.gamma_multiply(0.12))
+                        .stroke(egui::Stroke::new(1.0, ERROR_COLOR.gamma_multiply(0.65)))
+                        .corner_radius(egui::CornerRadius::same(8))
+                        .inner_margin(egui::Margin::symmetric(10, 8))
+                        .show(ui, |ui| {
+                            ui.colored_label(ERROR_COLOR, "Attenzione");
+                            ui.weak(
+                                "L'originale verrà riscritto sul disco. Non esiste un \
+                                 annullamento: per sicurezza usa “Nuova foto”.",
+                            );
+                            ui.add_space(4.0);
+                            ui.checkbox(
+                                &mut dialog.overwrite_confirmed,
+                                if total == 1 {
+                                    "Confermo di voler sovrascrivere l'originale"
+                                } else {
+                                    "Confermo di voler sovrascrivere gli originali"
+                                },
+                            );
+                        });
+                }
+
+                if let Some(error) = &dialog.error {
+                    ui.add_space(8.0);
+                    ui.colored_label(ERROR_COLOR, error);
+                }
+
+                ui.add_space(14.0);
+                ui.separator();
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if busy {
+                        ui.spinner();
+                        ui.weak("Scrittura dei file…");
+                    } else if !assets_ready {
+                        ui.spinner();
+                        ui.weak("Aggiornamento della cartella…");
+                    } else {
+                        ui.weak(if dialog.mode == SaveMode::NewCopy {
+                            "Viene creato un nuovo file; l'originale resta intatto."
+                        } else {
+                            "Il salvataggio viene confermato solo dopo la verifica del file."
+                        });
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let etichetta = match dialog.mode {
+                            SaveMode::NewCopy if total == 1 => "Salva nuova foto",
+                            SaveMode::NewCopy => "Salva nuove foto",
+                            SaveMode::Overwrite => "Sovrascrivi",
+                        };
+                        let confermabile = pending
+                            && !busy
+                            && assets_ready
+                            && match dialog.mode {
+                                SaveMode::NewCopy => nuova_abilitata,
+                                SaveMode::Overwrite => dialog.overwrite_confirmed,
+                            };
+                        let colore = match dialog.mode {
+                            SaveMode::NewCopy => egui::Color32::from_rgb(110, 155, 209),
+                            SaveMode::Overwrite => ERROR_COLOR,
+                        };
+                        let testo = if dialog.mode == SaveMode::NewCopy {
+                            egui::Color32::from_rgb(14, 18, 24)
+                        } else {
+                            egui::Color32::from_rgb(24, 14, 14)
+                        };
+                        let pulsante =
+                            egui::Button::new(egui::RichText::new(etichetta).strong().color(testo))
+                                .fill(colore)
+                                .min_size(egui::vec2(150.0, 30.0));
+                        if ui.add_enabled(confermabile, pulsante).clicked() {
+                            confirm = Some(dialog.mode);
+                        }
+                        if ui
+                            .add_enabled(!busy, egui::Button::new("Annulla"))
+                            .clicked()
+                        {
+                            close = true;
+                        }
+                    });
+                });
+
+                if !busy && ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+                    close = true;
+                }
+            });
+        let backdrop_clicked = response.backdrop_response.clicked();
+
+        if let Some(mode) = confirm {
+            actions.save_confirm = Some(mode);
+        } else if close
+            || (backdrop_clicked && !self.state.save_dialog.as_ref().is_some_and(|d| d.busy))
+        {
+            actions.save_cancel = true;
+        }
+    }
+
+    /// Conferma la chiusura quando ci sono bozze non salvate.
+    fn close_prompt_modal(&mut self, ctx: &egui::Context) {
+        if !self.close_prompt {
+            return;
+        }
+        let mut close = false;
+        let mut stay = false;
+        let response = egui::Modal::new(egui::Id::unique("close_modal"))
+            .frame(
+                egui::Frame::popup(ctx.style_of(egui::Theme::Dark).as_ref())
+                    .inner_margin(egui::Margin::same(18))
+                    .corner_radius(egui::CornerRadius::same(12))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(58, 58, 64))),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(430.0);
+                ui.heading("Modifiche non salvate");
+                ui.add_space(6.0);
+                ui.label(
+                    "Le modifiche a colore, metadati o posizione non sono state \
+                     salvate su file. Se chiudi ora andranno perse.",
+                );
+                ui.add_space(14.0);
+                ui.separator();
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.weak("Puoi tornare indietro e usare Salva (Ctrl+S).");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let chiudi = egui::Button::new(
+                            egui::RichText::new("Chiudi senza salvare").color(ERROR_COLOR),
+                        );
+                        if ui.add(chiudi).clicked() {
+                            close = true;
+                        }
+                        if ui.button("Continua a lavorare").clicked() {
+                            stay = true;
+                        }
+                    });
+                });
+                if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+                    stay = true;
+                }
+            });
+        if response.backdrop_response.clicked() {
+            stay = true;
+        }
+        if close {
+            self.close_prompt = false;
+            self.allow_close = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else if stay {
+            self.close_prompt = false;
+        }
     }
 
     fn conflict_prompt_window(&mut self, ctx: &egui::Context, actions: &mut UiActions) {
@@ -1520,6 +2031,91 @@ impl UberPhotoApp {
         }
     }
 
+    /// Barra superiore con lo stato delle modifiche e il pulsante Salva.
+    fn save_bar(&mut self, ui: &mut egui::Ui, actions: &mut UiActions) {
+        let ctrl_s = ui
+            .ctx()
+            .input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::S));
+        let pending = self.state.has_pending_changes();
+        let count = self.state.save_targets().len();
+        let altrove = self
+            .state
+            .pending_paths()
+            .into_iter()
+            .filter(|path| !self.state.selection.contains(path))
+            .count();
+        let gps_error = self.state.gps.manual_error.is_some();
+        let busy = self.save.busy()
+            || self
+                .state
+                .save_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.busy);
+
+        ui.horizontal(|ui| {
+            if let Some(logo) = &self.state.logo {
+                ui.add(egui::Image::new(logo).max_height(20.0));
+            }
+            ui.strong("UberPhoto");
+            ui.separator();
+
+            if busy {
+                ui.spinner();
+                ui.weak("Salvataggio in corso…");
+            } else if gps_error {
+                ui.colored_label(
+                    ERROR_COLOR,
+                    "● Coordinate non valide: correggi prima di salvare",
+                );
+            } else if pending {
+                ui.colored_label(
+                    egui::Color32::from_rgb(110, 155, 209),
+                    if count == 1 {
+                        "● 1 foto con modifiche non salvate".to_owned()
+                    } else {
+                        format!("● {count} foto con modifiche non salvate")
+                    },
+                );
+                if altrove > 0 {
+                    ui.weak(format!("· {altrove} fuori selezione"));
+                }
+            } else if altrove > 0 {
+                ui.colored_label(
+                    egui::Color32::from_rgb(110, 155, 209),
+                    if altrove == 1 {
+                        "● 1 bozza non salvata fuori selezione".to_owned()
+                    } else {
+                        format!("● {altrove} bozze non salvate fuori selezione")
+                    },
+                )
+                .on_hover_text("Seleziona quelle foto per salvarle con Salva");
+            } else {
+                ui.weak("Tutto salvato");
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let salva = egui::Button::new(
+                    egui::RichText::new("Salva")
+                        .strong()
+                        .color(egui::Color32::from_rgb(14, 18, 24)),
+                )
+                .fill(egui::Color32::from_rgb(110, 155, 209))
+                .min_size(egui::vec2(96.0, 28.0));
+                if ui
+                    .add_enabled(pending && !busy && !gps_error, salva)
+                    .on_hover_text("Salva colore, metadati e posizione (Ctrl+S)")
+                    .clicked()
+                {
+                    actions.save_open = true;
+                }
+                if ctrl_s && pending && !busy && !gps_error {
+                    actions.save_open = true;
+                }
+                ui.weak("Ctrl+S");
+            });
+        });
+    }
+
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         let mut undo_requested = false;
         let mut clear_status = false;
@@ -1667,6 +2263,127 @@ fn reload_node(node: &mut DirNode, target: &Path, error: &mut Option<String>) ->
 
 /// Mondo visivo: scuro professionale fotografico — chrome neutro e accenti
 /// misurati, così le fotografie dominano la scena senza falsarne i colori.
+/// Piccolo badge colorato usato nel riepilogo del dialogo di salvataggio.
+fn riepilogo_badge(ui: &mut egui::Ui, testo: &str, colore: egui::Color32) {
+    egui::Frame::new()
+        .fill(colore.gamma_multiply(0.16))
+        .stroke(egui::Stroke::new(1.0, colore.gamma_multiply(0.45)))
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(egui::Margin::symmetric(8, 3))
+        .show(ui, |ui| {
+            ui.colored_label(colore, egui::RichText::new(testo).small());
+        });
+}
+
+/// Contenuto di una card selezionabile del dialogo di salvataggio.
+struct ModeCard<'a> {
+    id: egui::Id,
+    selected: bool,
+    enabled: bool,
+    accent: egui::Color32,
+    titolo: &'a str,
+    sottotitolo: &'a str,
+    badge: Option<&'a str>,
+}
+
+/// Card selezionabile del dialogo di salvataggio, con radio e descrizione.
+fn mode_card(ui: &mut egui::Ui, card: ModeCard<'_>) -> egui::Response {
+    let ModeCard {
+        id,
+        selected,
+        enabled,
+        accent,
+        titolo,
+        sottotitolo,
+        badge,
+    } = card;
+    let fill = if selected {
+        accent.gamma_multiply(0.14)
+    } else {
+        ui.visuals().faint_bg_color
+    };
+    let stroke = if selected {
+        egui::Stroke::new(1.5, accent)
+    } else {
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(52, 52, 58))
+    };
+    let testo = if enabled {
+        ui.visuals().strong_text_color()
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    let contenuto = egui::Frame::new()
+        .fill(fill)
+        .stroke(stroke)
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(egui::Margin::same(12))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
+                let centro = rect.center();
+                ui.painter()
+                    .circle_stroke(centro, 7.0, egui::Stroke::new(1.5, accent));
+                if selected {
+                    ui.painter().circle_filled(centro, 3.8, accent);
+                }
+                ui.add_space(2.0);
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(titolo).strong().color(testo));
+                        if let Some(badge) = badge {
+                            egui::Frame::new()
+                                .fill(accent.gamma_multiply(0.18))
+                                .corner_radius(egui::CornerRadius::same(8))
+                                .inner_margin(egui::Margin::symmetric(6, 2))
+                                .show(ui, |ui| {
+                                    ui.colored_label(accent, egui::RichText::new(badge).small());
+                                });
+                        }
+                    });
+                    ui.label(egui::RichText::new(sottotitolo).weak());
+                });
+            });
+        });
+    let response = ui.interact(
+        contenuto.response.rect,
+        id,
+        if enabled {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        },
+    );
+    if enabled && response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
+}
+
+/// Primo nome libero della copia che verrà creata accanto all'originale.
+fn nome_copia_libera(path: &Path) -> String {
+    let stem = path
+        .file_stem()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "foto".to_owned());
+    let estensione = path
+        .extension()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "jpg".to_owned());
+    for indice in 1..10_000 {
+        let nome = if indice == 1 {
+            format!("{stem}-modificata.{estensione}")
+        } else {
+            format!("{stem}-modificata-{indice}.{estensione}")
+        };
+        if !path.with_file_name(&nome).exists() {
+            return nome;
+        }
+    }
+    format!("{stem}-modificata-9999.{estensione}")
+}
+
 fn setup_visuals(ctx: &egui::Context) {
     let canvas = egui::Color32::from_rgb(16, 16, 18);
     let panel = egui::Color32::from_rgb(28, 28, 31);
@@ -1744,6 +2461,7 @@ impl eframe::App for UberPhotoApp {
         self.pump_geo_results();
         self.pump_edit_results(&ctx);
         self.pump_export_results();
+        self.pump_save_results();
         self.sync_metadata();
         self.sync_edit(&ctx);
 
@@ -1761,6 +2479,7 @@ impl eframe::App for UberPhotoApp {
 
         let mut actions = UiActions::default();
 
+        egui::Panel::top("save_bar").show(ui, |ui| self.save_bar(ui, &mut actions));
         egui::Panel::bottom("status_bar").show(ui, |ui| self.status_bar(ui));
         egui::Panel::left("explorer")
             .resizable(true)
@@ -1786,7 +2505,7 @@ impl eframe::App for UberPhotoApp {
 
         self.prompts(&ctx, &mut actions);
         self.handle_actions(actions);
-        self.autosave_recipe();
+        self.remember_edit_draft();
         self.preview.set_prefer_edited(!self.state.edit.compare);
         self.preview.ui(&ctx);
 
@@ -1797,10 +2516,34 @@ impl eframe::App for UberPhotoApp {
             || self.preview.is_loading()
             || self.state.edit.busy
             || self.state.export.busy
+            || self.save.busy()
             || watcher_pending
         {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
+
+        if self.smoke_exit.is_none()
+            && !self.allow_close
+            && ctx.input(|input| input.viewport().close_requested())
+        {
+            if self.state.save_dialog.is_some() || self.save.busy() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                let message = if self.save.busy() {
+                    "Salvataggio in corso: attendi la fine prima di chiudere."
+                } else {
+                    "Completa o annulla il salvataggio prima di chiudere."
+                };
+                self.state.op_status = Some(OpStatus {
+                    message: message.to_owned(),
+                    error: None,
+                    undo: None,
+                });
+            } else if self.state.has_unsaved_changes() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.close_prompt = true;
+            }
+        }
+        self.close_prompt_modal(&ctx);
 
         if let Some((start, seconds)) = self.smoke_exit {
             if start.elapsed().as_secs_f64() >= seconds {

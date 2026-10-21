@@ -30,14 +30,14 @@ UberPhoto is a **local-first desktop photo manager** written in Rust. It browses
 - Opens on double-click; zoom with the mouse wheel or the `−` / `+` buttons (2 %–3200 %), drag to pan, `Adatta` to fit, `1:1` for one image pixel per physical screen pixel, double-click to re-fit, `Esc` to close.
 - Decoded by a single dedicated background worker with a latest-wins policy; the oversize buffer is capped at 2560 px on the long edge.
 
-### Color editor (Phase 5) — non-destructive
-- Adjustments are stored as a **recipe** in the local catalog; original pixels are never rewritten.
+### Color editor (Phase 5) — non-destructive by default
+- Adjustments are kept as an in-memory **recipe draft**, so changing photo or tab never rewrites the original. A color draft can still be saved explicitly to disk with **Salva**.
 - Exposure (−5…+5 EV), brightness, contrast, highlights, shadows, whites, blacks, saturation, vibrance, temperature, tint, gamma, sharpness.
 - Straighten-free geometry: crop with adjustable region and 90° rotation steps.
 - Live preview computed on a reduced copy in a background worker; dragging a slider updates it in real time, undo is recorded on release rather than on every frame.
 - Undo/redo (`Ctrl+Z`, `Ctrl+Shift+Z` / `Ctrl+Y`), "Prima" press-and-hold comparison, per-field reset and full reset.
 - Named presets stored in the catalog; a preset can be applied to the current photo or to the whole multi-selection.
-- Recipes are applied to full-resolution pixels only on export; the editor is single-photo by design, while presets can be batch-applied.
+- Full-resolution pixels are produced only by export or by the explicit save flow; the editor is single-photo by design, while presets can be batch-applied.
 
 ### Metadata editor (Phase 3)
 - ExifTool runs as an external process on a dedicated thread; packages include their own copy, otherwise it is resolved from `UBERPHOTO_EXIFTOOL` or `PATH`.
@@ -47,15 +47,24 @@ UberPhoto is a **local-first desktop photo manager** written in Rust. It browses
 - Multi-selection editing: common values are shown, fields with different values are marked as mixed and are left untouched unless edited; clearing a field removes the tag.
 - Embedded metadata for JPEG, PNG, TIFF and WebP; native IPTC only where the format supports it (JPEG/TIFF), with matching XMP tags everywhere else.
 - RAW, HEIC and AVIF files are never rewritten: their XMP fields go to a `<file>.xmp` sidecar, created from the image's existing XMP or updated in place.
-- Post-write verification rereads every file and reports values that could not be confirmed; tags not managed by the editor are preserved.
+- Edited fields stay in a per-photo draft that survives selection changes until **Salva** is pressed. Post-write verification rereads every file and reports values that could not be confirmed; tags not managed by the editor are preserved.
 - Advanced read-only view of all ExifTool tags with group, name, value, writability and a live filter.
 
 ### GPS picker (Phase 4)
 - OpenStreetMap map with a draggable marker; click to place, drag to refine.
 - Manual latitude/longitude/altitude entry, decimal or DMS formatting, and "Centra" to recenter the map on the photo's coordinates.
-- Multi-selection aware: mixed coordinates are flagged; writing applies to every selected photo through the metadata editor.
+- Multi-selection aware: mixed coordinates are flagged; the marker and place fields are kept as per-photo drafts and written to every selected photo by **Salva**.
 - Optional place search through Nominatim, only on explicit user action, with the required User-Agent and attribution.
 - Tiles are created lazily on first map open; no network access otherwise.
+
+### Manual save
+- **Salva** in the top bar (or `Ctrl+S`) opens a confirmation dialog for the selected photos that have drafts. The save bar also reports pending photos outside the selection, so they are never lost silently.
+- **Nuova foto** creates `nome-modificata.ext` next to the original, with automatic `-2`, `-3`, … collision handling. The source file is never touched.
+- **Sovrascrivi originale** rewrites color and metadata in place and is irreversible; it requires an explicit confirmation checkbox. For batches, the dialog reports partial failures and keeps only the failed photos for retry.
+- Color changes are rendered to a temporary file in the same folder and atomically renamed over the original only after metadata application succeeds. Metadata-only overwrites are written by ExifTool and verified by reading the file back.
+- JPEG, PNG, TIFF and WebP support new copies. RAW, HEIC and AVIF are never rewritten: their XMP metadata goes to the sidecar, and color edits cannot be applied.
+- Metadata and GPS fields are verified after writing; the save is reported as successful only when the read-back matches.
+- Closing the app with unsaved drafts asks for confirmation; closing while a save is running is refused with a status message until the batch finishes.
 
 ### Export (Phase 6)
 - Three profiles: **Full metadata** (default), **Web optimized** (editorial EXIF/IPTC/XMP whitelist), **Privacy** (removes GPS, serial number and author/creator fields).
@@ -221,8 +230,8 @@ uberphoto/
 
 ## Architecture & design decisions
 
-- **The filesystem is the source of truth.** The SQLite index mirrors it for speed (sorting by capture date or rating, keyword/GPS filters) but never replaces it: deleting `index.db` simply rebuilds it on the next scan. Edit recipes and presets are the exception — they are catalog data, not filesystem metadata, until an explicit export.
-- **Non-destructive by principle.** Color edits are recipes; original pixels are never rewritten. RAW formats are never rewritten at all (sidecar XMP). Export is the only operation that produces new pixels, and it always writes a new file.
+- **The filesystem is the source of truth.** The SQLite index mirrors it for speed (sorting by capture date or rating, keyword/GPS filters) but never replaces it: deleting `index.db` simply rebuilds it on the next scan. Presets remain catalog data; color, metadata and GPS edits stay as drafts in memory until **Salva** writes them to disk.
+- **Non-destructive by default.** Color edits are recipes and the recommended save mode always creates a new copy. The original is rewritten only after the user explicitly chooses **Sovrascrivi originale** and confirms it. RAW, HEIC and AVIF files are never rewritten; their metadata uses sidecar XMP.
 - **Immediate-mode UI, background pipelines.** egui renders on the main thread; directory scans, thumbnail decoding (rayon pool sized to the machine), preview decoding, editing previews, metadata operations and export all run off-thread and deliver results through channels with **latest-wins** semantics, so stale work is discarded instead of blocking.
 - **Only visible work is done.** Thumbnails are requested for cells currently on screen; the LRU cache (2,000 textures, quantized size buckets) keeps memory bounded.
 - **Metadata reliability first.** All metadata read/write and export verification go through ExifTool as an external process with structured arguments (never a shell), so the same tag semantics apply on every platform.
@@ -233,7 +242,7 @@ uberphoto/
 ## Testing and CI
 
 - Unit and integration tests live next to the code plus a cross-crate smoke suite in `uberphoto-tests` (fixtures generated at runtime; no binary test assets in the repository).
-- Integration smoke tests cover Phases 2–6: filesystem operations, metadata round-trip, GPS writing/removal, editing recipes and export with metadata verification.
+- Integration smoke tests cover Phases 2–6: filesystem operations, metadata round-trip, GPS writing/removal, editing recipes and export with metadata verification. Save tests cover new-copy naming, atomic overwrite, metadata round-trip and rollback on error.
 - CI (`.github/workflows/ci.yml`) runs on **Ubuntu, macOS and Windows**: `rustfmt --check`, `clippy -D warnings`, `cargo test --workspace`, a release build, packaging checks that bundle ExifTool, and — on Linux only — a headless GUI smoke test under Xvfb.
 - Benchmark tests are `#[ignore]`d so they never slow the normal suite.
 
@@ -268,7 +277,7 @@ uberphoto/
 | 2 ✅ | Filesystem operations and drag & drop, sidecar moves, SQLite index, external-change detection |
 | 3 ✅ | Metadata engine via ExifTool: EXIF, IPTC, XMP; descriptive, author, time and technical fields; sidecars |
 | 4 ✅ | OpenStreetMap GPS picker with draggable marker and optional Nominatim search |
-| 5 ✅ | Non-destructive color editing, crop/rotate, presets, undo/redo, before/after |
+| 5 ✅ | Non-destructive color editing, crop/rotate, presets, undo/redo, before/after, explicit save with new copy or confirmed overwrite |
 | 6 ✅ | Export for web: profiles, ICC conversion, metadata embedding, verification reports |
 | 7 ✅ | Quality and distribution: regression/smoke tests, benchmarks, documentation, self-contained packages |
 

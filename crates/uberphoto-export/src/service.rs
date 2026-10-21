@@ -282,7 +282,7 @@ fn completa_metadati(
 }
 
 /// Costruisce gli argomenti ExifTool per la copia dei metadati.
-fn argomenti_copia(
+pub(crate) fn argomenti_copia(
     source: &Path,
     settings: &ExportSettings,
     icc_path: Option<&Path>,
@@ -297,7 +297,6 @@ fn argomenti_copia(
     let mut esclusioni: Vec<String> = Vec::new();
     // Tag strutturali o non coerenti con un file rigenerato.
     let strutturali = [
-        "--ICC_Profile",
         "--File:all",
         "--ThumbnailImage",
         "--ImageWidth",
@@ -310,6 +309,10 @@ fn argomenti_copia(
         "--PreviewImage",
         "--JpgFromRaw",
     ];
+
+    if icc_path.is_some() {
+        esclusioni.push("--ICC_Profile".to_owned());
+    }
 
     match settings.preset {
         ExportPreset::FullMetadata | ExportPreset::Privacy => {
@@ -360,7 +363,7 @@ fn argomenti_copia(
     args
 }
 
-fn write_icc_temporaneo(bytes: &[u8]) -> PathBuf {
+pub(crate) fn write_icc_temporaneo(bytes: &[u8]) -> PathBuf {
     static CONTATORE: AtomicU64 = AtomicU64::new(0);
     let indice = CONTATORE.fetch_add(1, Ordering::Relaxed);
     let millis = SystemTime::now()
@@ -402,6 +405,13 @@ mod tests {
         assert!(testuali.contains(&"--ICC_Profile".to_owned()));
         assert!(testuali.contains(&"-Orientation=1".to_owned()));
         assert!(testuali.iter().any(|arg| arg.starts_with("-icc_profile<=")));
+
+        let senza_srgb = argomenti_copia(Path::new("/tmp/orig.jpg"), &settings, None);
+        let testuali: Vec<String> = senza_srgb
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(!testuali.contains(&"--ICC_Profile".to_owned()));
     }
 
     #[test]

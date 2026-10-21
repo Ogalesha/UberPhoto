@@ -38,6 +38,26 @@ pub fn render_export(
     recipe: &EditRecipe,
     profilo_icc: Option<&[u8]>,
 ) -> Result<RenderOutput, ExportError> {
+    let destination = settings.destination_for(source);
+    std::fs::create_dir_all(&destination)?;
+    let nome = settings
+        .naming
+        .file_name(source, settings.format.extension());
+    let path = percorso_unico(&destination, &nome);
+    render_export_to(source, settings, recipe, profilo_icc, &path)
+}
+
+/// Applica la ricetta e scrive il file nel percorso esatto indicato.
+///
+/// Usata dal salvataggio manuale, che deve controllare nome, sostituzione e
+/// rollback del file di destinazione.
+pub(crate) fn render_export_to(
+    source: &Path,
+    settings: &ExportSettings,
+    recipe: &EditRecipe,
+    profilo_icc: Option<&[u8]>,
+    path: &Path,
+) -> Result<RenderOutput, ExportError> {
     let loaded = load_image_rgba(source, None).map_err(ExportError::Image)?;
     let mut rgba = loaded.rgba;
     let width = loaded.width;
@@ -64,17 +84,11 @@ pub fn render_export(
             .ok_or_else(|| ExportError::Invalid("buffer RGBA non coerente".to_owned()))?
     };
 
-    let destination = settings.destination_for(source);
-    std::fs::create_dir_all(&destination)?;
-    let nome = settings
-        .naming
-        .file_name(source, settings.format.extension());
-    let path = percorso_unico(&destination, &nome);
-    codifica(&path, &pixel, settings)?;
+    codifica(path, &pixel, settings)?;
 
-    let bytes = std::fs::metadata(&path)?.len();
+    let bytes = std::fs::metadata(path)?.len();
     Ok(RenderOutput {
-        path,
+        path: path.to_path_buf(),
         width: final_width,
         height: final_height,
         bytes,
