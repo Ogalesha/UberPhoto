@@ -48,3 +48,9 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
+
+; La disinstallazione rimuove anche i dati utente (indice, impostazioni,
+; preset, cronologia e cache), così non restano residui nel profilo.
+[UninstallDelete]
+Type: filesandordirs; Name: "{userappdata}\{#MyAppName}"
+Type: filesandordirs; Name: "{localappdata}\{#MyAppName}"

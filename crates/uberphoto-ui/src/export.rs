@@ -6,7 +6,9 @@
 use eframe::egui;
 use uberphoto_export::{ExportFormat, ExportPreset, NameMode};
 
+use crate::i18n::{export_format_label, export_preset_hint, export_preset_label, name_mode_label};
 use crate::state::{AppState, UiActions};
+use crate::t;
 use crate::util::format_bytes;
 
 pub fn ui(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
@@ -15,75 +17,80 @@ pub fn ui(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
     let export = &mut state.export;
 
     ui.add_space(4.0);
-    ui.strong("Export for Web");
+    ui.strong(t!("Export for Web"));
     ui.weak(
-        "UberPhoto garantisce solo i campi che scrive e riverifica con ExifTool \
-         nel file esportato.",
+        t!("UberPhoto garantisce solo i campi che scrive e riverifica con ExifTool nel file esportato."),
     );
     if exiftool.is_none() {
         ui.colored_label(
             ui.visuals().error_fg_color,
-            "ExifTool non disponibile: l'esportazione è disabilitata perché i \
-             metadati non possono essere copiati né verificati.",
+            t!("ExifTool non disponibile: l'esportazione è disabilitata perché i metadati non possono essere copiati né verificati."),
         );
     }
     ui.add_space(6.0);
 
-    egui::CollapsingHeader::new("Metadati")
+    egui::CollapsingHeader::new(t!("Metadati"))
         .default_open(true)
         .show(ui, |ui| {
             for preset in ExportPreset::ALL {
-                ui.radio_value(&mut export.settings.preset, preset, preset.label())
-                    .on_hover_text(preset.hint());
+                ui.radio_value(
+                    &mut export.settings.preset,
+                    preset,
+                    export_preset_label(preset),
+                )
+                .on_hover_text(export_preset_hint(preset));
             }
             if export.settings.preset == ExportPreset::Privacy {
                 ui.indent("privacy-options", |ui| {
                     ui.checkbox(
                         &mut export.settings.privacy.remove_gps,
-                        "Rimuovi posizione GPS",
+                        t!("Rimuovi posizione GPS"),
                     );
                     ui.checkbox(
                         &mut export.settings.privacy.remove_serial,
-                        "Rimuovi numeri di serie",
+                        t!("Rimuovi numeri di serie"),
                     );
                     ui.checkbox(
                         &mut export.settings.privacy.remove_author,
-                        "Rimuovi autore e proprietario",
+                        t!("Rimuovi autore e proprietario"),
                     );
                 });
             }
         });
 
-    egui::CollapsingHeader::new("Immagine")
+    egui::CollapsingHeader::new(t!("Immagine"))
         .default_open(true)
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label("Formato");
+                ui.label(t!("Formato"));
                 egui::ComboBox::from_id_salt("export-format")
-                    .selected_text(export.settings.format.label())
+                    .selected_text(export_format_label(export.settings.format))
                     .show_ui(ui, |ui| {
                         for formato in ExportFormat::ALL {
                             ui.selectable_value(
                                 &mut export.settings.format,
                                 formato,
-                                formato.label(),
+                                export_format_label(formato),
                             );
                         }
                     });
             });
             if export.settings.format.supports_quality() {
                 ui.add(
-                    egui::Slider::new(&mut export.settings.quality, 1..=100).text("Qualità JPEG"),
+                    egui::Slider::new(&mut export.settings.quality, 1..=100)
+                        .text(t!("Qualità JPEG")),
                 );
             } else if export.settings.format == ExportFormat::Webp {
-                ui.weak("WebP viene scritto senza perdita: la qualità non si applica.");
+                ui.weak(t!(
+                    "WebP viene scritto senza perdita: la qualità non si applica."
+                ));
             }
 
             ui.separator();
-            ui.checkbox(&mut export.settings.resize.enabled, "Ridimensiona");
+            ui.checkbox(&mut export.settings.resize.enabled, t!("Ridimensiona"));
             ui.add_enabled_ui(export.settings.resize.enabled, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label("Larghezza max");
+                    ui.label(t!("Larghezza max"));
                     ui.add(
                         egui::DragValue::new(&mut export.settings.resize.max_width)
                             .range(0..=20000)
@@ -92,7 +99,7 @@ pub fn ui(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
                     ui.label("px");
                 });
                 ui.horizontal(|ui| {
-                    ui.label("Altezza max");
+                    ui.label(t!("Altezza max"));
                     ui.add(
                         egui::DragValue::new(&mut export.settings.resize.max_height)
                             .range(0..=20000)
@@ -102,19 +109,21 @@ pub fn ui(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
                 });
                 ui.checkbox(
                     &mut export.settings.resize.keep_aspect,
-                    "Mantieni proporzioni",
+                    t!("Mantieni proporzioni"),
                 );
-                ui.weak("0 = nessun limite; l'immagine non viene mai ingrandita.");
+                ui.weak(t!(
+                    "0 = nessun limite; l'immagine non viene mai ingrandita."
+                ));
             });
         });
 
-    egui::CollapsingHeader::new("Destinazione e nome")
+    egui::CollapsingHeader::new(t!("Destinazione e nome"))
         .default_open(true)
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label("Cartella");
+                ui.label(t!("Cartella"));
                 if export.settings.destination.as_os_str().is_empty() {
-                    ui.weak("(cartella dell'originale)");
+                    ui.weak(t!("(cartella dell'originale)"));
                 } else {
                     ui.add(
                         egui::Label::new(export.settings.destination.display().to_string())
@@ -123,13 +132,13 @@ pub fn ui(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
                 }
             });
             ui.horizontal(|ui| {
-                if ui.button("Scegli…").clicked() {
+                if ui.button(t!("Scegli…")).clicked() {
                     actions.export_pick_destination = true;
                 }
                 if ui
                     .add_enabled(
                         !export.settings.destination.as_os_str().is_empty(),
-                        egui::Button::new("Usa cartella dell'originale"),
+                        egui::Button::new(t!("Usa cartella dell'originale")),
                     )
                     .clicked()
                 {
@@ -138,15 +147,15 @@ pub fn ui(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
             });
 
             ui.horizontal(|ui| {
-                ui.label("Nome");
+                ui.label(t!("Nome"));
                 egui::ComboBox::from_id_salt("export-naming")
-                    .selected_text(export.settings.naming.mode.label())
+                    .selected_text(name_mode_label(export.settings.naming.mode))
                     .show_ui(ui, |ui| {
                         for modo in NameMode::ALL {
                             ui.selectable_value(
                                 &mut export.settings.naming.mode,
                                 modo,
-                                modo.label(),
+                                name_mode_label(modo),
                             );
                         }
                     });
@@ -154,24 +163,30 @@ pub fn ui(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
             match export.settings.naming.mode {
                 NameMode::Prefix => {
                     ui.horizontal(|ui| {
-                        ui.label("Prefisso");
+                        ui.label(t!("Prefisso"));
                         ui.text_edit_singleline(&mut export.settings.naming.prefix);
                     });
                 }
                 NameMode::Suffix => {
                     ui.horizontal(|ui| {
-                        ui.label("Suffisso");
+                        ui.label(t!("Suffisso"));
                         ui.text_edit_singleline(&mut export.settings.naming.suffix);
                     });
                 }
                 NameMode::KeepName => {
-                    ui.weak("Mantiene il nome dell'originale (con estensione del formato).");
+                    ui.weak(t!(
+                        "Mantiene il nome dell'originale (con estensione del formato)."
+                    ));
                 }
                 NameMode::WebSafe => {
-                    ui.weak("Minuscole, solo lettere e cifre, spazi e simboli diventano «-».");
+                    ui.weak(t!(
+                        "Minuscole, solo lettere e cifre, spazi e simboli diventano «-»."
+                    ));
                 }
             }
-            ui.weak("I file esistenti non vengono sovrascritti: si aggiunge -2, -3, …");
+            ui.weak(t!(
+                "I file esistenti non vengono sovrascritti: si aggiunge -2, -3, …"
+            ));
         });
 
     ui.add_space(8.0);
@@ -179,16 +194,20 @@ pub fn ui(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
     ui.horizontal(|ui| {
         if export.busy {
             ui.spinner();
-            ui.label(format!("Esportazione… {}/{}", export.done, export.total));
-            if ui.button("Annulla").clicked() {
+            ui.label(t!(
+                "Esportazione… {done}/{total}",
+                done = export.done,
+                total = export.total
+            ));
+            if ui.button(t!("Annulla")).clicked() {
                 actions.export_cancel = true;
             }
         } else {
             let abilitato = selezionati > 0 && exiftool.is_some();
             let etichetta = if selezionati == 1 {
-                "Esporta 1 foto".to_owned()
+                t!("Esporta 1 foto").to_owned()
             } else {
-                format!("Esporta {selezionati} foto")
+                t!("Esporta {count} foto", count = selezionati)
             };
             if ui
                 .add_enabled(abilitato, egui::Button::new(etichetta))
@@ -197,10 +216,10 @@ pub fn ui(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
                 actions.export_start = true;
             }
             if selezionati == 0 {
-                ui.weak("Seleziona almeno una foto.");
+                ui.weak(t!("Seleziona almeno una foto."));
             }
             if (!export.reports.is_empty() || !export.failures.is_empty())
-                && ui.button("Pulisci report").clicked()
+                && ui.button(t!("Pulisci report")).clicked()
             {
                 actions.export_clear = true;
             }
@@ -223,7 +242,7 @@ pub fn ui(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
 
     if !export.reports.is_empty() {
         ui.add_space(6.0);
-        ui.strong(format!("Report ({})", export.reports.len()));
+        ui.strong(t!("Report ({count})", count = export.reports.len()));
         for (indice, report) in export.reports.iter().enumerate() {
             let titolo = format!(
                 "{} · {}×{} · {}",
@@ -239,37 +258,42 @@ pub fn ui(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
                     if report.verified() {
                         ui.colored_label(
                             egui::Color32::from_rgb(126, 196, 130),
-                            "Verifica superata: nessun campo atteso è andato perso.",
+                            t!("Verifica superata: nessun campo atteso è andato perso."),
                         );
                     } else {
                         ui.colored_label(
                             ui.visuals().error_fg_color,
-                            "Verifica incompleta: alcuni campi attesi non sono nel file.",
+                            t!("Verifica incompleta: alcuni campi attesi non sono nel file."),
                         );
                     }
                     ui.weak(report.output.display().to_string());
-                    elenco(ui, "Preservati", &report.preserved, None);
+                    elenco(ui, t!("Preservati"), &report.preserved, None);
                     elenco(
                         ui,
-                        "Modificati",
+                        t!("Modificati"),
                         &report.adjusted,
                         Some(egui::Color32::from_rgb(196, 178, 118)),
                     );
                     elenco(
                         ui,
-                        "Non supportati",
+                        t!("Non supportati"),
                         &report.unsupported,
                         Some(egui::Color32::from_rgb(214, 160, 110)),
                     );
-                    elenco(ui, "Persi", &report.lost, Some(ui.visuals().error_fg_color));
-                    elenco(ui, "Avvisi", &report.warnings, None);
+                    elenco(
+                        ui,
+                        t!("Persi"),
+                        &report.lost,
+                        Some(ui.visuals().error_fg_color),
+                    );
+                    elenco(ui, t!("Avvisi"), &report.warnings, None);
                 });
         }
     }
 
     if !export.failures.is_empty() {
         ui.add_space(6.0);
-        egui::CollapsingHeader::new(format!("Errori ({})", export.failures.len()))
+        egui::CollapsingHeader::new(t!("Errori ({count})", count = export.failures.len()))
             .default_open(true)
             .show(ui, |ui| {
                 for (path, errore) in &export.failures {

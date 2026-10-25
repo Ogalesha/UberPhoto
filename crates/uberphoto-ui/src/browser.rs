@@ -11,9 +11,11 @@ use eframe::egui;
 use uberphoto_files::SortKey;
 use uberphoto_image::ImageService;
 
+use crate::i18n::sort_key_label;
 use crate::state::{
     AppState, DragPhotos, FormatFilter, TransferRequest, UiActions, MAX_THUMB_SIZE, MIN_THUMB_SIZE,
 };
+use crate::t;
 use crate::thumbnails::{ThumbCache, ThumbState};
 use crate::util::{elide, format_bytes};
 
@@ -32,7 +34,8 @@ pub fn ui(
         return;
     }
 
-    let visible = visible_indices(state);
+    subfolder_strip(ui, state, actions);
+    let visible = state.visible_indices().to_vec();
 
     if state.loading_dir.is_some() && state.entries.is_empty() {
         ui.centered_and_justified(|ui| {
@@ -43,9 +46,9 @@ pub fn ui(
 
     if visible.is_empty() {
         let message = if state.entries.is_empty() {
-            "Nessuna fotografia in questa cartella"
+            t!("Nessuna fotografia in questa cartella")
         } else {
-            "Nessuna foto corrisponde al filtro"
+            t!("Nessuna foto corrisponde al filtro")
         };
         ui.centered_and_justified(|ui| {
             ui.weak(message);
@@ -93,27 +96,29 @@ pub fn ui(
 fn toolbar(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
     ui.horizontal(|ui| {
         if ui
-            .button("🔄 Aggiorna")
-            .on_hover_text("Riscansiona la cartella e rileva le modifiche esterne")
+            .button(t!("🔄 Aggiorna"))
+            .on_hover_text(t!(
+                "Riscansiona la cartella, le sottocartelle e rileva le modifiche esterne"
+            ))
             .clicked()
         {
             actions.refresh = true;
         }
 
         ui.separator();
-        ui.label("Ordina:");
+        ui.label(t!("Ordina:"));
         let before = (state.sort_key, state.sort_ascending);
         egui::ComboBox::from_id_salt("sort_key")
-            .selected_text(state.sort_key.label())
+            .selected_text(sort_key_label(state.sort_key))
             .show_ui(ui, |ui| {
                 for key in SortKey::ALL {
-                    ui.selectable_value(&mut state.sort_key, key, key.label());
+                    ui.selectable_value(&mut state.sort_key, key, sort_key_label(key));
                 }
             });
         let direction = if state.sort_ascending { "↑" } else { "↓" };
         if ui
             .button(direction)
-            .on_hover_text("Inverti l'ordine")
+            .on_hover_text(t!("Inverti l'ordine"))
             .clicked()
         {
             state.sort_ascending = !state.sort_ascending;
@@ -123,7 +128,7 @@ fn toolbar(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
         }
 
         ui.separator();
-        ui.label("Miniature:");
+        ui.label(t!("Miniature:"));
         ui.add(
             egui::Slider::new(&mut state.thumb_size, MIN_THUMB_SIZE..=MAX_THUMB_SIZE)
                 .show_value(false),
@@ -131,8 +136,8 @@ fn toolbar(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
 
         if !state.selection.is_empty() {
             ui.separator();
-            ui.weak(format!("{} sel.", state.selection.len()));
-            if ui.small_button("Deseleziona").clicked() {
+            ui.weak(t!("{count} sel.", count = state.selection.len()));
+            if ui.small_button(t!("Deseleziona")).clicked() {
                 state.selection.clear();
                 state.selection_anchor = None;
             }
@@ -140,10 +145,10 @@ fn toolbar(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
     });
 
     ui.horizontal(|ui| {
-        ui.label("Filtri:");
+        ui.label(t!("Filtri:"));
         ui.add(
             egui::TextEdit::singleline(&mut state.filter_text)
-                .hint_text("Filtra per nome…")
+                .hint_text(t!("Filtra per nome…"))
                 .desired_width(130.0),
         );
         if !state.filter_text.is_empty() && ui.small_button("✕").clicked() {
@@ -159,13 +164,13 @@ fn toolbar(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
             });
 
         let rating_label = match state.filter_rating {
-            None => "Valutazione".to_owned(),
-            Some(minimum) => format!("≥ {minimum} ★"),
+            None => t!("Valutazione").to_owned(),
+            Some(minimum) => t!("≥ {minimum} ★", minimum = minimum),
         };
         egui::ComboBox::from_id_salt("filter_rating")
             .selected_text(rating_label)
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut state.filter_rating, None, "Tutte le valutazioni");
+                ui.selectable_value(&mut state.filter_rating, None, t!("Tutte le valutazioni"));
                 for stars in 1..=5u8 {
                     let label = "★".repeat(stars as usize);
                     ui.selectable_value(&mut state.filter_rating, Some(stars), label);
@@ -173,17 +178,53 @@ fn toolbar(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
             });
 
         ui.toggle_value(&mut state.filter_gps, "GPS")
-            .on_hover_text("Mostra solo le foto con coordinate GPS");
+            .on_hover_text(t!("Mostra solo le foto con coordinate GPS"));
 
         ui.add(
             egui::TextEdit::singleline(&mut state.filter_keywords)
-                .hint_text("Keyword…")
+                .hint_text(t!("Keyword…"))
                 .desired_width(110.0),
         );
         if !state.filter_keywords.is_empty() && ui.small_button("✕").clicked() {
             state.filter_keywords.clear();
         }
     });
+}
+
+/// Barra delle sotto-cartelle dirette: un clic limita la griglia a quella
+/// cartella e al suo sottoalbero.
+fn subfolder_strip(ui: &mut egui::Ui, state: &AppState, actions: &mut UiActions) {
+    if state.subdirs.is_empty() {
+        return;
+    }
+
+    ui.horizontal(|ui| {
+        ui.strong(t!("Sottocartelle"));
+        ui.weak(format!("({})", state.subdirs.len()));
+        ui.separator();
+        egui::ScrollArea::horizontal()
+            .id_salt("subfolders")
+            .auto_shrink([false, true])
+            .max_height(24.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for dir in &state.subdirs {
+                        let label = format!("📁 {}", elide(&dir.name, 26));
+                        if ui
+                            .small_button(label)
+                            .on_hover_text(t!(
+                                "Mostra questa cartella e le sue sottocartelle\n{path}",
+                                path = dir.path.display()
+                            ))
+                            .clicked()
+                        {
+                            actions.browse_dir = Some(dir.path.clone());
+                        }
+                    }
+                });
+            });
+    });
+    ui.add_space(2.0);
 }
 
 /// Schermata iniziale senza cartella aperta: logo, invito e azione primaria.
@@ -200,30 +241,20 @@ fn schermata_iniziale(ui: &mut egui::Ui, state: &AppState, actions: &mut UiActio
         }
         ui.heading("UberPhoto");
         ui.add_space(6.0);
-        ui.weak("Le tue fotografie restano sul tuo disco: apri una cartella per iniziare.");
+        ui.weak(t!(
+            "Le tue fotografie restano sul tuo disco: apri una cartella per iniziare."
+        ));
         ui.add_space(18.0);
         if ui
-            .add_sized([210.0, 34.0], egui::Button::new("📂 Apri una cartella…"))
+            .add_sized(
+                [210.0, 34.0],
+                egui::Button::new(t!("📂 Apri una cartella…")),
+            )
             .clicked()
         {
             actions.pick_folder = true;
         }
     });
-}
-
-/// Indici di `state.entries` visibili con i filtri correnti.
-fn visible_indices(state: &AppState) -> Vec<usize> {
-    let filter = state.filter_text.trim().to_lowercase();
-    state
-        .entries
-        .iter()
-        .enumerate()
-        .filter(|(_, entry)| {
-            filter.is_empty() || entry.file_name().to_lowercase().contains(&filter)
-        })
-        .filter(|(_, entry)| state.asset_visible(entry))
-        .map(|(index, _)| index)
-        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -290,7 +321,10 @@ fn cell(
             );
         }
         Some(ThumbState::Failed { error }) => {
-            hover_detail.push_str(&format!("\nanteprima non disponibile: {error}"));
+            hover_detail.push_str(&format!(
+                "\n{}",
+                t!("anteprima non disponibile: {error}", error = error)
+            ));
             painter.rect_filled(
                 image_rect,
                 egui::CornerRadius::same(4),
@@ -299,7 +333,7 @@ fn cell(
             painter.text(
                 image_rect.center(),
                 egui::Align2::CENTER_CENTER,
-                "n/d",
+                t!("n/d"),
                 egui::FontId::proportional(13.0),
                 ui.visuals().weak_text_color(),
             );
@@ -392,18 +426,18 @@ fn cell(
 
     response.context_menu(|ui| {
         let paths = state.selection_paths(&path);
-        if ui.button("🔍 Apri anteprima").clicked() {
+        if ui.button(t!("🔍 Apri anteprima")).clicked() {
             actions.open_preview = Some(path.clone());
             ui.close();
         }
-        if ui.button("✏ Rinomina…").clicked() {
+        if ui.button(t!("✏ Rinomina…")).clicked() {
             actions.rename_photo = Some(path.clone());
             ui.close();
         }
-        ui.menu_button("Valutazione", |ui| {
+        ui.menu_button(t!("Valutazione"), |ui| {
             for stars in 0..=5u8 {
                 let label = if stars == 0 {
-                    "Nessuna".to_owned()
+                    t!("Nessuna").to_owned()
                 } else {
                     "★".repeat(stars as usize)
                 };
@@ -414,14 +448,14 @@ fn cell(
             }
         });
         ui.separator();
-        if ui.button("📄 Copia in…").clicked() {
+        if ui.button(t!("📄 Copia in…")).clicked() {
             actions.transfer = Some(TransferRequest {
                 paths: paths.clone(),
                 copy: true,
             });
             ui.close();
         }
-        if ui.button("📦 Sposta in…").clicked() {
+        if ui.button(t!("📦 Sposta in…")).clicked() {
             actions.transfer = Some(TransferRequest { paths, copy: false });
             ui.close();
         }
@@ -534,7 +568,6 @@ mod tests {
 
     use uberphoto_core::{FormatKind, PhotoAsset};
 
-    use super::visible_indices;
     use crate::state::{AppState, FormatFilter};
 
     fn asset(name: &str) -> PhotoAsset {
@@ -555,20 +588,20 @@ mod tests {
 
     fn state_with(entries: Vec<PhotoAsset>, filter: &str) -> AppState {
         let mut state = AppState::new(Default::default());
-        state.entries = entries;
+        state.set_entries(entries);
         state.filter_text = filter.to_owned();
         state
     }
 
     #[test]
     fn senza_filtro_tutte_le_voci_sono_visibili() {
-        let state = state_with(vec![asset("a.jpg"), asset("b.jpg")], "");
-        assert_eq!(visible_indices(&state), vec![0, 1]);
+        let mut state = state_with(vec![asset("a.jpg"), asset("b.jpg")], "");
+        assert_eq!(state.visible_indices().to_vec(), vec![0, 1]);
     }
 
     #[test]
     fn il_filtro_e_case_insensitive() {
-        let state = state_with(
+        let mut state = state_with(
             vec![
                 asset("Foto_Mare.jpg"),
                 asset("montagna.png"),
@@ -576,20 +609,20 @@ mod tests {
             ],
             "MARE",
         );
-        assert_eq!(visible_indices(&state), vec![0, 2]);
+        assert_eq!(state.visible_indices().to_vec(), vec![0, 2]);
     }
 
     #[test]
     fn il_filtro_formato_limita_le_voci() {
         let mut state = state_with(vec![asset("a.jpg"), png_asset("b.png")], "");
         state.filter_format = FormatFilter::Kind(FormatKind::Png);
-        assert_eq!(visible_indices(&state), vec![1]);
+        assert_eq!(state.visible_indices().to_vec(), vec![1]);
 
         state.filter_format = FormatFilter::Kind(FormatKind::Jpeg);
-        assert_eq!(visible_indices(&state), vec![0]);
+        assert_eq!(state.visible_indices().to_vec(), vec![0]);
 
         state.filter_format = FormatFilter::All;
-        assert_eq!(visible_indices(&state), vec![0, 1]);
+        assert_eq!(state.visible_indices().to_vec(), vec![0, 1]);
     }
 
     #[test]
@@ -599,6 +632,6 @@ mod tests {
         let state_entries = vec![asset("a.jpg"), raw];
         let mut state = state_with(state_entries, "");
         state.filter_format = FormatFilter::Raw;
-        assert_eq!(visible_indices(&state), vec![1]);
+        assert_eq!(state.visible_indices().to_vec(), vec![1]);
     }
 }

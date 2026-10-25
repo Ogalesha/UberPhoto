@@ -5,6 +5,7 @@
 //! richiesta di repaint al termine.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, OnceLock};
 
@@ -139,32 +140,44 @@ impl MetadataWriteReport {
 pub struct MetadataService {
     tx: Sender<MetadataRequest>,
     rx: Receiver<MetadataOutcome>,
+    /// True mentre il worker sta servendo una richiesta (lettura o scrittura).
+    busy: Arc<AtomicBool>,
 }
 
 impl MetadataService {
     pub fn new(repaint: Arc<dyn Fn() + Send + Sync>) -> Self {
         let (tx, requests) = channel::<MetadataRequest>();
         let (outcomes_tx, rx) = channel::<MetadataOutcome>();
+        let busy = Arc::new(AtomicBool::new(false));
+        let worker_busy = Arc::clone(&busy);
 
         std::thread::Builder::new()
             .name("metadata".to_owned())
             .spawn(move || {
                 while let Ok(request) = requests.recv() {
+                    worker_busy.store(true, Ordering::Relaxed);
                     if outcomes_tx.send(execute(request)).is_err() {
+                        worker_busy.store(false, Ordering::Relaxed);
                         break;
                     }
+                    worker_busy.store(false, Ordering::Relaxed);
                     repaint();
                 }
             })
             .expect("avvio del thread metadata");
 
-        Self { tx, rx }
+        Self { tx, rx, busy }
     }
 
     pub fn request(&self, request: MetadataRequest) {
         if self.tx.send(request).is_err() {
             tracing::error!("servizio metadati non disponibile");
         }
+    }
+
+    /// True se il worker sta elaborando una richiesta.
+    pub fn busy(&self) -> bool {
+        self.busy.load(Ordering::Relaxed)
     }
 
     pub fn try_recv(&self) -> Option<MetadataOutcome> {

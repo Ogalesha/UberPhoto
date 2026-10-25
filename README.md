@@ -19,9 +19,10 @@ UberPhoto is a **local-first desktop photo manager** for real folders, built in 
 - Open any real filesystem folder as a root, through the native OS folder dialog.
 - Lazy folder tree: subfolders are loaded only when a branch is expanded.
 - Recent folders list, persisted across restarts.
-- Loading a folder with thousands of photos stays responsive: directories are scanned on a dedicated worker thread (a local benchmark scans 2,000 entries in ~3 ms).
+- Loading a folder with thousands of photos stays responsive: the folder tree is scanned on demand and the photo grid on a dedicated worker thread (a local benchmark scans 2,000 entries in ~3 ms).
 
 ### Center panel — Photo browser
+- Opening a folder shows its photos together with the photos in every subfolder. A strip above the grid lists the direct subfolders; clicking one narrows the view to that folder and its subtree.
 - Virtualized thumbnail grid: only the visible rows are drawn (`ScrollArea::show_rows`), so scrolling remains smooth with thousands of photos.
 - Adjustable thumbnail size (96–320 px), sort by name / modified date / size / capture date / rating, live name filter.
 - Single click to select, `Ctrl`/`Cmd`+click to toggle, `Shift`+click for a range; double-click opens the large preview.
@@ -87,12 +88,13 @@ UberPhoto is a **local-first desktop photo manager** for real folders, built in 
 - XMP sidecars travel with their photo; cross-device moves fall back to copy + delete.
 - Create and delete empty subfolders, rename folders from the explorer or context menu.
 - Local SQLite index (`index.db` in the data directory) mirrors file info, image dimensions, ratings, keywords and camera data; WAL mode, incremental updates and upserts. Edit recipes and presets live in the same catalog.
-- External changes are detected with `notify` (debounced); read-only access events are ignored, so browsing never triggers spurious rescans.
+- External changes are detected recursively with `notify` (debounced), so edits inside subfolders also refresh the aggregated view; read-only access events are ignored, so browsing never triggers spurious rescans.
 
 ### Application
 - Dark "photographic" theme: neutral chrome so photographs dominate the scene and colours are not biased by the surroundings.
+- Interface languages: Italian, English, German, French, Spanish, Polish, Turkish, Russian and Albanian. The selector lives in the top bar; the choice is persisted and otherwise follows the system locale, falling back to English.
 - Welcome screen with the app logo; the same icon is used by the window / taskbar and by packaged desktop entries.
-- Session persistence (recent folders, last folder, thumbnail size), logging via `tracing` with `RUST_LOG` control.
+- Session persistence (recent folders, last folder, thumbnail size, interface language), logging via `tracing` with `RUST_LOG` control.
 - Headless-friendly: `UBERPHOTO_SMOKE_EXIT_SECS` closes the app gracefully after N seconds for CI.
 
 ### Recognized formats
@@ -113,6 +115,7 @@ Capabilities per format are declared explicitly in code (`FormatKind::capabiliti
 - WebP cannot store IPTC; export reports that explicitly instead of pretending success.
 - The color editor is single-photo; batch color operations use presets.
 - Interactive GUI behaviour is covered by headless egui tests and boot smoke tests, not by automated clicking.
+- Some low-level diagnostics are shown exactly as returned by ExifTool, the filesystem or the operating system and are not translated.
 
 ---
 
@@ -175,6 +178,43 @@ shasum -a 256 -c SHA256SUMS      # macOS
 On Windows compare `Get-FileHash <file> -Algorithm SHA256` with the matching line.
 
 Packages are complete and self-contained, but they are **not code-signed** (the project has no Apple Developer ID or Windows code-signing certificate). The warnings above are the only consequence: downloads and installation work normally.
+
+### Uninstalling completely
+
+UberPhoto stores the SQLite index, preferences, edit presets, recent folders and the map cache in the per-user data directory:
+
+- **Linux**: `$XDG_DATA_HOME/uberphoto` (usually `~/.local/share/uberphoto`)
+- **macOS**: `~/Library/Application Support/UberPhoto`
+- **Windows**: `%APPDATA%\UberPhoto`
+
+The commands below remove both the program and that directory, leaving no residues.
+
+**Linux — Debian/Ubuntu package**
+
+```bash
+uberphoto --uninstall        # index, settings, presets, recent folders, map cache
+sudo apt remove uberphoto    # binary, desktop entry, icon, bundled ExifTool
+```
+
+**Linux — portable archive**
+
+```bash
+./uberphoto --uninstall
+rm -rf <extracted-folder>
+```
+
+**macOS**
+
+```bash
+/Applications/UberPhoto.app/Contents/MacOS/uberphoto --uninstall
+rm -rf /Applications/UberPhoto.app
+```
+
+**Windows**
+
+Open **Settings → Apps → Installed apps → UberPhoto → Uninstall**. The uninstaller removes the program, the Start Menu entry and `%APPDATA%\UberPhoto` (index, settings, presets and caches).
+
+For the portable ZIP, run `uberphoto.exe --uninstall` and then delete the extracted folder.
 
 ## Getting started
 
@@ -254,7 +294,7 @@ uberphoto/
 
 - The project follows **[Semantic Versioning](https://semver.org/)** and keeps a **[Keep a Changelog](https://keepachangelog.com/en/1.1.0/)** file.
 - The repository tracks **source code only**; compiled artifacts, local databases, logs and photographs are never committed (see `.gitignore`).
-- Pushing a tag like `v0.3.0` triggers the release workflow, which builds and attaches **self-contained** packages:
+- Pushing a tag like `v0.4.0` triggers the release workflow, which builds and attaches **self-contained** packages:
   - `uberphoto_<version>_amd64.deb` — Debian/Ubuntu package with desktop entry and bundled ExifTool
   - `uberphoto-linux-x86_64.tar.gz` — portable Linux archive with bundled ExifTool
   - `uberphoto-macos-aarch64.app.tar.gz` — macOS application bundle with bundled ExifTool

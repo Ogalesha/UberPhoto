@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -6,7 +6,7 @@ use std::time::SystemTime;
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 use uberphoto_core::{FormatKind, GpsLocation, PhotoAsset};
-use uberphoto_db::IndexRow;
+use uberphoto_db::{IndexRow, MetadataIndex};
 use uberphoto_export::{ExportReport, ExportSettings, SaveMode};
 use uberphoto_files::{sort_assets, ConflictPolicy, DirNode, FileOpReport, SortKey};
 use uberphoto_geo::{GeocodeResult, LocationSuggestion};
@@ -14,6 +14,9 @@ use uberphoto_image::{EditRecipe, EditSource};
 use uberphoto_metadata::{
     LocationField, LocationRole, MetadataDocument, MetadataEdit, MetadataField, RawTag,
 };
+
+use crate::i18n::{self, Language};
+use crate::t;
 
 /// Schede del pannello destro.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,11 +39,11 @@ impl InspectorTab {
 
     pub fn label(self) -> &'static str {
         match self {
-            InspectorTab::Colori => "Colori",
-            InspectorTab::Informazioni => "Informazioni",
-            InspectorTab::Metadati => "Metadati",
-            InspectorTab::Gps => "Posizione GPS",
-            InspectorTab::Esportazione => "Esportazione",
+            InspectorTab::Colori => t!("Colori"),
+            InspectorTab::Informazioni => t!("Informazioni"),
+            InspectorTab::Metadati => t!("Metadati"),
+            InspectorTab::Gps => t!("Posizione GPS"),
+            InspectorTab::Esportazione => t!("Esportazione"),
         }
     }
 }
@@ -49,7 +52,7 @@ pub const MIN_THUMB_SIZE: f32 = 96.0;
 pub const MAX_THUMB_SIZE: f32 = 320.0;
 
 /// Filtro per formato nella griglia.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FormatFilter {
     All,
     /// Tutti i RAW fotografici (DNG, CR2, CR3, NEF, ARW, RAF).
@@ -73,7 +76,7 @@ impl FormatFilter {
 
     pub fn label(self) -> &'static str {
         match self {
-            FormatFilter::All => "Tutti i formati",
+            FormatFilter::All => t!("Tutti i formati"),
             FormatFilter::Raw => "RAW",
             FormatFilter::Kind(kind) => kind.label(),
         }
@@ -95,6 +98,8 @@ pub struct PersistedState {
     pub recent_folders: Vec<PathBuf>,
     pub last_dir: Option<PathBuf>,
     pub thumb_size: Option<f32>,
+    /// Lingua scelta dall'utente; assente nei salvataggi precedenti.
+    pub language: Option<Language>,
     /// Ultimo centro della mappa GPS (longitudine, latitudine) e zoom.
     pub map_center: Option<(f64, f64)>,
     pub map_zoom: Option<f64>,
@@ -592,14 +597,18 @@ impl EditState {
 
     /// Ricorda la ricetta corrente come bozza in memoria, senza scrivere nel
     /// catalogo: il salvataggio su file resta un gesto esplicito.
+    /// Viene chiamata ogni frame: evita di riscrivere la mappa se la bozza
+    /// corrisponde già alla ricetta corrente.
     pub fn remember_draft(&mut self) {
-        let Some(path) = self.path.clone() else {
+        let Some(path) = self.path.as_deref() else {
             return;
         };
         if self.recipe == self.saved {
-            self.drafts.remove(&path);
-        } else {
-            self.drafts.insert(path, self.recipe);
+            if self.drafts.contains_key(path) {
+                self.drafts.remove(path);
+            }
+        } else if self.drafts.get(path) != Some(&self.recipe) {
+            self.drafts.insert(path.to_path_buf(), self.recipe);
         }
     }
 
@@ -669,9 +678,14 @@ impl Default for SaveDialog {
 /// Stato applicativo della UI. Il filesystem resta l'autorità: qui vivono
 /// soltanto le viste correnti (cartella aperta, elenco scansionato, selezione).
 pub struct AppState {
+    /// Lingua attiva dell'interfaccia.
+    pub language: Language,
     pub root: Option<DirNode>,
     pub current_dir: Option<PathBuf>,
+    /// Foto della cartella corrente e di tutte le sue sottocartelle.
     pub entries: Vec<PhotoAsset>,
+    /// Sotto-cartelle dirette della cartella corrente, mostrate sopra la griglia.
+    pub subdirs: Vec<DirNode>,
     pub selection: BTreeSet<PathBuf>,
     pub selection_anchor: Option<PathBuf>,
     pub sort_key: SortKey,
@@ -714,10 +728,22 @@ pub struct AppState {
     pub save_dialog: Option<SaveDialog>,
     /// Foto da selezionare al termine della prossima scansione.
     pub pending_select: Option<PathBuf>,
+    /// Indice percorso → posizione in `entries`, per evitare scansioni lineari
+    /// a ogni frame (selezione, mtime, schede dell'inspector).
+    entry_index: HashMap<PathBuf, usize>,
+    /// Revisione di `entries`: invalida le cache derivate (visibili, asset).
+    entries_revision: u64,
+    /// Revisione dei metadati nell'indice: invalida i filtri che li usano.
+    index_revision: u64,
+    /// Indici visibili con i filtri correnti, ricalcolati solo al bisogno.
+    visible_cache: Vec<usize>,
+    visible_key: Option<u64>,
 }
 
 impl AppState {
     pub fn new(persisted: PersistedState) -> Self {
+        let language = persisted.language.unwrap_or_else(Language::detect);
+        i18n::set_current(language);
         let mut gps = GpsState::default();
         if let Some((longitude, latitude)) = persisted.map_center {
             let position = walkers::lon_lat(longitude, latitude);
@@ -728,9 +754,11 @@ impl AppState {
             let _ = gps.memory.set_zoom(zoom.clamp(2.0, 19.0));
         }
         Self {
+            language,
             root: None,
             current_dir: None,
             entries: Vec::new(),
+            subdirs: Vec::new(),
             selection: BTreeSet::new(),
             selection_anchor: None,
             sort_key: SortKey::Name,
@@ -760,6 +788,11 @@ impl AppState {
             logo: None,
             save_dialog: None,
             pending_select: None,
+            entry_index: HashMap::new(),
+            entries_revision: 0,
+            index_revision: 0,
+            visible_cache: Vec::new(),
+            visible_key: None,
             gps,
             edit: EditState::default(),
             export: ExportState::default(),
@@ -777,9 +810,16 @@ impl AppState {
             recent_folders: self.recent_folders.clone(),
             last_dir: self.current_dir.clone(),
             thumb_size: Some(self.thumb_size),
+            language: Some(self.language),
             map_center: Some((longitude, latitude)),
             map_zoom: Some(self.gps.memory.zoom()),
         }
+    }
+
+    /// Cambia la lingua dell'interfaccia e la rende effettiva subito.
+    pub fn set_language(&mut self, language: Language) {
+        self.language = language;
+        i18n::set_current(language);
     }
 
     /// Inserisce `dir` in testa ai recenti (deduplicando, massimo 10 voci).
@@ -791,7 +831,16 @@ impl AppState {
 
     /// Vero se c'è almeno una modifica in bozza da salvare.
     pub fn has_pending_changes(&self) -> bool {
-        !self.save_targets().is_empty()
+        self.has_unsaved_changes() && self.save_target_count() > 0
+    }
+
+    /// Numero di foto selezionate con modifiche in sospeso, senza allocare
+    /// l'elenco dei percorsi (usato ogni frame dalla barra di salvataggio).
+    pub fn save_target_count(&self) -> usize {
+        self.selection
+            .iter()
+            .filter(|path| self.entry(path).is_some() && self.path_pending(path))
+            .count()
     }
 
     /// Vero se esistono modifiche non salvate, anche fuori dalla selezione.
@@ -816,23 +865,30 @@ impl AppState {
         self.recipe_pending(path) || self.meta_pending(path) || self.gps_pending(path)
     }
 
-    /// Tutte le foto con almeno una bozza, dentro o fuori la selezione.
-    pub fn pending_paths(&self) -> BTreeSet<PathBuf> {
-        let mut paths: BTreeSet<PathBuf> = self
+    /// Quante foto con bozze restano fuori dalla selezione corrente.
+    ///
+    /// Aggrega le bozze di colore, metadati e GPS senza clonare i percorsi:
+    /// la barra di salvataggio la usa a ogni frame e con molte bozze la
+    /// differenza si sente.
+    pub fn pending_outside_selection_count(&self) -> usize {
+        let mut seen: HashSet<&Path> = HashSet::new();
+        for path in self
             .edit
             .drafts
             .keys()
             .chain(self.meta.drafts.keys())
             .chain(self.gps.drafts.keys())
-            .cloned()
-            .collect();
-        if let Some(path) = &self.edit.path {
-            if self.edit.is_dirty() {
-                paths.insert(path.clone());
+        {
+            if !self.selection.contains(path) && self.path_pending(path) {
+                seen.insert(path.as_path());
             }
         }
-        paths.retain(|path| self.path_pending(path));
-        paths
+        if let Some(path) = &self.edit.path {
+            if !self.selection.contains(path) && self.edit.is_dirty() {
+                seen.insert(path.as_path());
+            }
+        }
+        seen.len()
     }
 
     /// Vero se la foto ha una ricetta in bozza non ancora salvata.
@@ -1041,17 +1097,152 @@ impl AppState {
     }
 
     pub fn selected_assets(&self) -> Vec<&PhotoAsset> {
-        self.entries
+        if self.entry_index.len() != self.entries.len() {
+            return self
+                .entries
+                .iter()
+                .filter(|entry| self.selection.contains(&entry.path))
+                .collect();
+        }
+        let mut indices: Vec<usize> = self
+            .selection
             .iter()
-            .filter(|entry| self.selection.contains(&entry.path))
+            .filter_map(|path| self.entry_index.get(path).copied())
+            .collect();
+        indices.sort_unstable();
+        indices
+            .into_iter()
+            .map(|index| &self.entries[index])
             .collect()
     }
 
     pub fn entry_mtime(&self, path: &Path) -> Option<SystemTime> {
-        self.entries
-            .iter()
-            .find(|entry| entry.path == path)
-            .and_then(|entry| entry.modified)
+        self.entry(path).and_then(|entry| entry.modified)
+    }
+
+    /// Voce corrente per percorso. Usa la mappa interna quando è allineata,
+    /// con fallback lineare per gli stati costruiti a mano.
+    pub fn entry(&self, path: &Path) -> Option<&PhotoAsset> {
+        if self.entry_index.len() == self.entries.len() {
+            if let Some(&index) = self.entry_index.get(path) {
+                return self.entries.get(index);
+            }
+        }
+        self.entries.iter().find(|entry| entry.path == path)
+    }
+
+    /// Sostituisce le foto della vista e riallinea gli indici interni.
+    pub fn set_entries(&mut self, entries: Vec<PhotoAsset>) {
+        self.entries = entries;
+        self.entries_revision = self.entries_revision.wrapping_add(1);
+        self.rebuild_entry_index();
+    }
+
+    /// Ricostruisce la mappa percorso → posizione usata dalle operazioni
+    /// per-frame. Va chiamata dopo ogni modifica dell'ordine o del contenuto
+    /// di `entries`.
+    pub fn rebuild_entry_index(&mut self) {
+        self.entry_index.clear();
+        self.entry_index.extend(
+            self.entries
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| (entry.path.clone(), index)),
+        );
+    }
+
+    /// Segnala che l'indice metadati è cambiato: i filtri per valutazione,
+    /// GPS e parole chiave vanno ricalcolati.
+    pub fn mark_index_changed(&mut self) {
+        self.index_revision = self.index_revision.wrapping_add(1);
+    }
+
+    /// Aggiorna in memoria la riga d'indice di una foto con i metadati appena
+    /// letti, senza rileggere l'intera tabella SQLite.
+    pub fn apply_index_metadata(
+        &mut self,
+        path: &Path,
+        mtime: Option<i64>,
+        metadata: &MetadataIndex,
+    ) {
+        if let Some(row) = self.index_rows.get_mut(path) {
+            row.mtime = mtime;
+            row.has_gps = metadata.has_gps;
+            row.rating = metadata.rating;
+            row.date_original.clone_from(&metadata.date_original);
+            row.keywords.clone_from(&metadata.keywords);
+            row.camera_make.clone_from(&metadata.camera_make);
+            row.camera_model.clone_from(&metadata.camera_model);
+            row.lens.clone_from(&metadata.lens);
+            row.iso = metadata.iso;
+            row.f_number.clone_from(&metadata.f_number);
+            row.exposure_time.clone_from(&metadata.exposure_time);
+            row.focal_length.clone_from(&metadata.focal_length);
+            row.gps_lat = metadata.gps_lat;
+            row.gps_lon = metadata.gps_lon;
+            return;
+        }
+        self.index_rows.insert(
+            path.to_path_buf(),
+            IndexRow {
+                path: path.to_path_buf(),
+                mtime,
+                has_gps: metadata.has_gps,
+                rating: metadata.rating,
+                date_original: metadata.date_original.clone(),
+                keywords: metadata.keywords.clone(),
+                camera_make: metadata.camera_make.clone(),
+                camera_model: metadata.camera_model.clone(),
+                lens: metadata.lens.clone(),
+                iso: metadata.iso,
+                f_number: metadata.f_number.clone(),
+                exposure_time: metadata.exposure_time.clone(),
+                focal_length: metadata.focal_length.clone(),
+                gps_lat: metadata.gps_lat,
+                gps_lon: metadata.gps_lon,
+                ..IndexRow::default()
+            },
+        );
+    }
+
+    /// Indici di `entries` visibili con i filtri correnti.
+    ///
+    /// Il risultato è memorizzato: il filtro testuale e la ricerca per parole
+    /// chiave non vengono ripetuti a ogni frame, ma solo quando cambiano i
+    /// filtri, la cartella o i metadati indicizzati.
+    pub fn visible_indices(&mut self) -> &[usize] {
+        let key = self.visible_key_value();
+        if self.visible_key == Some(key) {
+            return &self.visible_cache;
+        }
+        let filter = self.filter_text.trim().to_lowercase();
+        let keyword = self.filter_keywords.trim().to_lowercase();
+        let mut visible = Vec::with_capacity(self.entries.len());
+        for (index, entry) in self.entries.iter().enumerate() {
+            if !filter.is_empty() && !entry.file_name().to_lowercase().contains(&filter) {
+                continue;
+            }
+            if self.asset_visible_with_keyword(entry, &keyword) {
+                visible.push(index);
+            }
+        }
+        self.visible_cache = visible;
+        self.visible_key = Some(key);
+        &self.visible_cache
+    }
+
+    fn visible_key_value(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.filter_text.hash(&mut hasher);
+        self.filter_keywords.hash(&mut hasher);
+        self.filter_rating.hash(&mut hasher);
+        self.filter_gps.hash(&mut hasher);
+        self.filter_format.hash(&mut hasher);
+        self.entries.len().hash(&mut hasher);
+        self.entries_revision.hash(&mut hasher);
+        self.index_revision.hash(&mut hasher);
+        hasher.finish()
     }
 
     /// Percorsi su cui operare partendo da una cella: l'intera selezione se la
@@ -1070,20 +1261,37 @@ impl AppState {
 
     /// Percorsi selezionati nell'ordine della griglia.
     pub fn selected_paths(&self) -> Vec<PathBuf> {
-        self.entries
+        if self.entry_index.len() != self.entries.len() {
+            return self
+                .entries
+                .iter()
+                .filter(|entry| self.selection.contains(&entry.path))
+                .map(|entry| entry.path.clone())
+                .collect();
+        }
+        let mut indices: Vec<(usize, &PathBuf)> = self
+            .selection
             .iter()
-            .filter(|entry| self.selection.contains(&entry.path))
-            .map(|entry| entry.path.clone())
-            .collect()
+            .filter_map(|path| self.entry_index.get(path).map(|&index| (index, path)))
+            .collect();
+        indices.sort_unstable_by_key(|(index, _)| *index);
+        indices.into_iter().map(|(_, path)| path.clone()).collect()
     }
 
     /// True se la voce supera i filtri della griglia (formato, valutazione,
     /// GPS, parole chiave). I filtri sui metadati richiedono una riga indice.
+    #[cfg(test)]
     pub fn asset_visible(&self, entry: &PhotoAsset) -> bool {
+        let keyword = self.filter_keywords.trim().to_lowercase();
+        self.asset_visible_with_keyword(entry, &keyword)
+    }
+
+    /// Variante usata dal filtro della griglia, che calcola una sola volta la
+    /// parola chiave normalizzata invece di farlo per ogni foto.
+    fn asset_visible_with_keyword(&self, entry: &PhotoAsset, keyword: &str) -> bool {
         if !self.filter_format.matches(entry.format) {
             return false;
         }
-        let keyword = self.filter_keywords.trim().to_lowercase();
         let richiede_riga = self.filter_rating.is_some() || self.filter_gps || !keyword.is_empty();
         if !richiede_riga {
             return true;
@@ -1101,7 +1309,7 @@ impl AppState {
         }
         if !keyword.is_empty() {
             let keywords = row.keywords.as_deref().unwrap_or_default().to_lowercase();
-            if !keywords.contains(&keyword) {
+            if !keywords.contains(keyword) {
                 return false;
             }
         }
@@ -1288,37 +1496,51 @@ impl AppState {
 
     /// Ordina `entries`; per data di acquisizione e valutazione la chiave
     /// arriva dall'indice (le righe mancanti vanno in fondo).
+    ///
+    /// Le chiavi vengono calcolate una sola volta per foto: il comparatore non
+    /// clona più le stringhe (era il costo dominante con migliaia di foto).
     pub fn apply_sort(&mut self) {
         match self.sort_key {
             SortKey::AcquisitionDate => {
                 let rows = &self.index_rows;
-                let key = |asset: &PhotoAsset| {
-                    rows.get(&asset.path)
-                        .and_then(|row| row.date_original.clone())
-                };
-                self.entries.sort_by(|a, b| match (key(a), key(b)) {
-                    (Some(left), Some(right)) => left.cmp(&right),
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => std::cmp::Ordering::Equal,
-                });
+                let mut keyed: Vec<(bool, Option<&str>, PhotoAsset)> =
+                    std::mem::take(&mut self.entries)
+                        .into_iter()
+                        .map(|asset| {
+                            let date = rows
+                                .get(&asset.path)
+                                .and_then(|row| row.date_original.as_deref());
+                            (date.is_none(), date, asset)
+                        })
+                        .collect();
+                keyed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
                 if !self.sort_ascending {
-                    self.entries.reverse();
+                    keyed.reverse();
                 }
+                self.entries = keyed.into_iter().map(|(_, _, asset)| asset).collect();
             }
             SortKey::Rating => {
                 let rows = &self.index_rows;
-                self.entries.sort_by_key(|asset| {
-                    rows.get(&asset.path)
-                        .and_then(|row| row.rating)
-                        .unwrap_or(0)
-                });
+                let mut keyed: Vec<(u8, PhotoAsset)> = std::mem::take(&mut self.entries)
+                    .into_iter()
+                    .map(|asset| {
+                        let rating = rows
+                            .get(&asset.path)
+                            .and_then(|row| row.rating)
+                            .unwrap_or(0);
+                        (rating, asset)
+                    })
+                    .collect();
+                keyed.sort_by_key(|(rating, _)| *rating);
                 if !self.sort_ascending {
-                    self.entries.reverse();
+                    keyed.reverse();
                 }
+                self.entries = keyed.into_iter().map(|(_, asset)| asset).collect();
             }
             _ => sort_assets(&mut self.entries, self.sort_key, self.sort_ascending),
         }
+        self.entries_revision = self.entries_revision.wrapping_add(1);
+        self.rebuild_entry_index();
     }
 }
 
@@ -1667,6 +1889,78 @@ mod tests {
     }
 
     #[test]
+    fn la_cache_dei_visibili_si_aggiorna_con_filtri_e_indice() {
+        let mut state = AppState::new(PersistedState::default());
+        state.set_entries(vec![
+            asset("/foto/a.jpg"),
+            asset("/foto/b.jpg"),
+            asset("/foto/c.jpg"),
+        ]);
+        assert_eq!(state.visible_indices().to_vec(), vec![0, 1, 2]);
+
+        state.filter_text = "B".to_owned();
+        assert_eq!(state.visible_indices().to_vec(), vec![1]);
+
+        state.filter_text.clear();
+        state.filter_rating = Some(4);
+        assert!(
+            state.visible_indices().is_empty(),
+            "senza righe indice il filtro valutazione esclude tutto"
+        );
+
+        state.apply_index_metadata(
+            Path::new("/foto/b.jpg"),
+            None,
+            &MetadataIndex {
+                rating: Some(5),
+                ..MetadataIndex::default()
+            },
+        );
+        state.mark_index_changed();
+        assert_eq!(state.visible_indices().to_vec(), vec![1]);
+    }
+
+    #[test]
+    fn selected_paths_usa_l_indice_e_segue_l_ordine_della_griglia() {
+        let mut state = AppState::new(PersistedState::default());
+        state.set_entries(vec![
+            asset("/foto/a.jpg"),
+            asset("/foto/b.jpg"),
+            asset("/foto/c.jpg"),
+        ]);
+        state.selection.insert(PathBuf::from("/foto/c.jpg"));
+        state.selection.insert(PathBuf::from("/foto/a.jpg"));
+
+        assert_eq!(
+            state.selected_paths(),
+            vec![PathBuf::from("/foto/a.jpg"), PathBuf::from("/foto/c.jpg")]
+        );
+        let selezionati: Vec<&Path> = state
+            .selected_assets()
+            .into_iter()
+            .map(|asset| asset.path.as_path())
+            .collect();
+        assert_eq!(
+            selezionati,
+            vec![Path::new("/foto/a.jpg"), Path::new("/foto/c.jpg")]
+        );
+
+        // Dopo il riordino l'indice percorso → posizione resta allineato.
+        state.index_rows.insert(
+            PathBuf::from("/foto/c.jpg"),
+            row("/foto/c.jpg", Some(5), None),
+        );
+        state.sort_key = SortKey::Rating;
+        state.sort_ascending = false;
+        state.apply_sort();
+        assert_eq!(state.entries[0].path, PathBuf::from("/foto/c.jpg"));
+        assert_eq!(
+            state.selected_paths(),
+            vec![PathBuf::from("/foto/c.jpg"), PathBuf::from("/foto/a.jpg")]
+        );
+    }
+
+    #[test]
     fn la_cronologia_annulla_e_ripete_le_regolazioni() {
         let mut edit = EditState {
             recipe: EditRecipe {
@@ -1928,6 +2222,34 @@ mod tests {
     }
 
     #[test]
+    fn le_bozze_fuori_selezione_vengono_contate_senza_duplicati() {
+        let mut state = AppState::new(PersistedState::default());
+        let fuori = PathBuf::from("/foto/a.jpg");
+        let dentro = PathBuf::from("/foto/b.jpg");
+        state.entries = vec![asset("/foto/a.jpg"), asset("/foto/b.jpg")];
+        state.selection.insert(dentro.clone());
+        state.edit.drafts.insert(
+            fuori.clone(),
+            EditRecipe {
+                exposure: 1.0,
+                ..EditRecipe::default()
+            },
+        );
+        // La stessa foto ha anche una bozza metadati: va contata una volta.
+        state.meta.drafts.insert(
+            fuori.clone(),
+            BTreeMap::from([(MetadataField::Title, Some("Titolo".to_owned()))]),
+        );
+        state.meta.drafts.insert(
+            dentro.clone(),
+            BTreeMap::from([(MetadataField::Title, Some("Dentro".to_owned()))]),
+        );
+
+        assert_eq!(state.pending_outside_selection_count(), 1);
+        assert_eq!(state.save_target_count(), 1);
+    }
+
+    #[test]
     fn il_form_attende_i_documenti_prima_di_ricostruirsi() {
         let mut state = AppState::new(PersistedState::default());
         let path = PathBuf::from("/foto/a.jpg");
@@ -1964,5 +2286,17 @@ mod tests {
         // Applicare la ricetta già attiva non crea voci.
         edit.apply_preset(EditRecipe::default());
         assert!(edit.undo.is_empty());
+    }
+
+    #[test]
+    fn la_lingua_scelta_viene_persistita_e_ripristinata() {
+        let mut state = AppState::new(PersistedState::default());
+        state.set_language(Language::De);
+        assert_eq!(state.language, Language::De);
+        assert_eq!(state.persisted().language, Some(Language::De));
+
+        let restored = AppState::new(state.persisted());
+        assert_eq!(restored.language, Language::De);
+        assert_eq!(restored.persisted().language, Some(Language::De));
     }
 }

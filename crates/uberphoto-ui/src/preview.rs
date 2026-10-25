@@ -14,6 +14,8 @@ use std::time::SystemTime;
 use eframe::egui;
 use uberphoto_image::{ImageService, LoadedImage};
 
+use crate::t;
+
 pub struct PreviewState {
     open: bool,
     path: Option<PathBuf>,
@@ -131,8 +133,8 @@ impl PreviewState {
             .path
             .as_ref()
             .and_then(|path| path.file_name())
-            .map(|name| format!("Anteprima — {}", name.to_string_lossy()))
-            .unwrap_or_else(|| "Anteprima".to_owned());
+            .map(|name| t!("Anteprima — {name}", name = name.to_string_lossy()))
+            .unwrap_or_else(|| t!("Anteprima").to_owned());
 
         let mut open = self.open;
         egui::Window::new(title)
@@ -163,21 +165,21 @@ impl PreviewState {
         }
 
         ui.horizontal(|ui| {
-            if ui.button("−").on_hover_text("Riduci").clicked() {
+            if ui.button("−").on_hover_text(t!("Riduci")).clicked() {
                 self.zoom = (self.zoom / 1.25).clamp(0.02, 32.0);
                 self.needs_fit = false;
             }
             ui.label(format!("{:.0}%", self.zoom * 100.0));
-            if ui.button("+").on_hover_text("Ingrandisci").clicked() {
+            if ui.button("+").on_hover_text(t!("Ingrandisci")).clicked() {
                 self.zoom = (self.zoom * 1.25).clamp(0.02, 32.0);
                 self.needs_fit = false;
             }
-            if ui.button("Adatta").clicked() {
+            if ui.button(t!("Adatta")).clicked() {
                 self.needs_fit = true;
             }
             if ui
                 .button("1:1")
-                .on_hover_text("Un pixel fisico dello schermo per pixel dell'immagine")
+                .on_hover_text(t!("Un pixel fisico dello schermo per pixel dell'immagine"))
                 .clicked()
             {
                 self.zoom = 1.0;
@@ -185,11 +187,13 @@ impl PreviewState {
                 self.needs_fit = false;
             }
             ui.separator();
-            if ui.button("Chiudi").clicked() {
+            if ui.button(t!("Chiudi")).clicked() {
                 self.open = false;
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.weak("trascina per spostare · rotella per zoomare · doppio clic per adattare");
+                ui.weak(t!(
+                    "trascina per spostare · rotella per zoomare · doppio clic per adattare"
+                ));
             });
         });
         ui.separator();
@@ -220,7 +224,7 @@ impl PreviewState {
             painter.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                format!("Impossibile mostrare l'anteprima:\n{error}"),
+                t!("Impossibile mostrare l'anteprima:\n{error}", error = error),
                 egui::FontId::proportional(14.0),
                 egui::Color32::LIGHT_RED,
             );
@@ -240,7 +244,7 @@ impl PreviewState {
             painter.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                "Caricamento anteprima…",
+                t!("Caricamento anteprima…"),
                 egui::FontId::proportional(14.0),
                 egui::Color32::GRAY,
             );
@@ -267,7 +271,11 @@ impl PreviewState {
         );
 
         if self.edited.is_some() {
-            let etichetta = if self.prefer_edited { "DOPO" } else { "PRIMA" };
+            let etichetta = if self.prefer_edited {
+                t!("DOPO")
+            } else {
+                t!("PRIMA")
+            };
             painter.text(
                 rect.left_top() + egui::vec2(10.0, 10.0),
                 egui::Align2::LEFT_TOP,

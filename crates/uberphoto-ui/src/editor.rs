@@ -17,7 +17,9 @@
 use eframe::egui;
 use uberphoto_image::{CropRect, EditField, EditRecipe};
 
+use crate::i18n::edit_field_label;
 use crate::state::{AppState, EditState, UiActions};
+use crate::t;
 use crate::util::elide;
 
 pub fn ui(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
@@ -25,20 +27,20 @@ pub fn ui(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
     let path = match selected.as_slice() {
         [] => {
             ui.add_space(8.0);
-            ui.weak("Nessuna foto selezionata.");
+            ui.weak(t!("Nessuna foto selezionata."));
             ui.add_space(6.0);
-            ui.weak("Seleziona una foto nel browser per modificarne colore ed esposizione.");
+            ui.weak(t!(
+                "Seleziona una foto nel browser per modificarne colore ed esposizione."
+            ));
             return;
         }
         [path] => path.clone(),
         many => {
             ui.add_space(8.0);
-            ui.strong(format!("{} foto selezionate", many.len()));
+            ui.strong(t!("{count} foto selezionate", count = many.len()));
             ui.add_space(6.0);
             ui.weak(
-                "Le regolazioni colore si applicano a una foto alla volta: \
-                 seleziona una sola foto per aprire la ricetta. \
-                 Puoi però applicare un preset all'intera selezione.",
+                t!("Le regolazioni colore si applicano a una foto alla volta: seleziona una sola foto per aprire la ricetta. Puoi però applicare un preset all'intera selezione."),
             );
             ui.add_space(6.0);
             preset_alla_selezione(ui, &state.edit.presets, many.len(), actions);
@@ -56,7 +58,7 @@ pub fn ui(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.spinner();
-            ui.weak("Caricamento della ricetta…");
+            ui.weak(t!("Caricamento della ricetta…"));
         });
         return;
     }
@@ -70,22 +72,22 @@ pub fn ui(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
         ui.add_space(6.0);
         ui.colored_label(
             ui.visuals().error_fg_color,
-            format!("Anteprima non disponibile: {error}"),
+            t!("Anteprima non disponibile: {error}", error = error),
         );
     } else if edit.source.is_none() {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.spinner();
-            ui.weak("Decodifica dell'immagine…");
+            ui.weak(t!("Decodifica dell'immagine…"));
         });
     }
 
-    egui::CollapsingHeader::new("Regolazioni")
+    egui::CollapsingHeader::new(t!("Regolazioni"))
         .default_open(true)
         .show(ui, |ui| {
             ui.spacing_mut().slider_width = (ui.available_width() - 200.0).max(60.0);
 
-            egui::CollapsingHeader::new("Esposizione e tono")
+            egui::CollapsingHeader::new(t!("Esposizione e tono"))
                 .default_open(true)
                 .show(ui, |ui| {
                     riga_slider(
@@ -108,7 +110,7 @@ pub fn ui(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
                     );
                 });
 
-            egui::CollapsingHeader::new("Colore")
+            egui::CollapsingHeader::new(t!("Colore"))
                 .default_open(true)
                 .show(ui, |ui| {
                     riga_slider(
@@ -137,7 +139,7 @@ pub fn ui(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
                     );
                 });
 
-            egui::CollapsingHeader::new("Luci e ombre")
+            egui::CollapsingHeader::new(t!("Luci e ombre"))
                 .default_open(false)
                 .show(ui, |ui| {
                     riga_slider(
@@ -167,7 +169,7 @@ pub fn ui(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
                     riga_slider(ui, edit, EditField::Gamma, &limiti(0.2, 3.0, 1.0, 2, 0.01));
                 });
 
-            egui::CollapsingHeader::new("Dettaglio")
+            egui::CollapsingHeader::new(t!("Dettaglio"))
                 .default_open(false)
                 .show(ui, |ui| {
                     riga_slider(
@@ -178,7 +180,7 @@ pub fn ui(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
                     );
                 });
 
-            egui::CollapsingHeader::new("Geometria")
+            egui::CollapsingHeader::new(t!("Geometria"))
                 .default_open(false)
                 .show(ui, |ui| {
                     riga_rotazione(ui, edit);
@@ -188,14 +190,11 @@ pub fn ui(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
 
     ui.add_space(6.0);
     ui.weak(
-        "Editing non distruttivo: la ricetta è salvata nel catalogo locale, separata \
-         dai metadati; i pixel vengono rigenerati solo all'esportazione e l'originale \
-         non viene mai modificato.",
+        t!("Editing non distruttivo: la ricetta è salvata nel catalogo locale, separata dai metadati; i pixel vengono rigenerati solo all'esportazione e l'originale non viene mai modificato."),
     );
     if raw {
         ui.weak(
-            "Le fotografie RAW ricevono un supporto progressivo: senza un'anteprima \
-             decodificabile le regolazioni restano salvate ma non visibili qui.",
+            t!("Le fotografie RAW ricevono un supporto progressivo: senza un'anteprima decodificabile le regolazioni restano salvate ma non visibili qui."),
         );
     }
 }
@@ -246,7 +245,7 @@ fn anteprima(ui: &mut egui::Ui, edit: &mut EditState) {
         let testo = edit
             .source_error
             .as_deref()
-            .unwrap_or("Caricamento dell'anteprima…");
+            .unwrap_or(t!("Caricamento dell'anteprima…"));
         painter.text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
@@ -276,7 +275,11 @@ fn anteprima(ui: &mut egui::Ui, edit: &mut EditState) {
     }
 
     if edit.showing_edited() {
-        let etichetta = if edit.compare { "PRIMA" } else { "DOPO" };
+        let etichetta = if edit.compare {
+            t!("PRIMA")
+        } else {
+            t!("DOPO")
+        };
         let angolo = if edit.compare {
             rect.right_top() + egui::vec2(-10.0, 10.0)
         } else {
@@ -298,7 +301,7 @@ fn anteprima(ui: &mut egui::Ui, edit: &mut EditState) {
         painter.text(
             rect.left_top() + egui::vec2(10.0, 10.0),
             egui::Align2::LEFT_TOP,
-            "ORIGINALE",
+            t!("ORIGINALE"),
             egui::FontId::proportional(11.0),
             egui::Color32::from_gray(150),
         );
@@ -308,7 +311,7 @@ fn anteprima(ui: &mut egui::Ui, edit: &mut EditState) {
         painter.text(
             rect.right_bottom() + egui::vec2(-10.0, -10.0),
             egui::Align2::RIGHT_BOTTOM,
-            "Elaborazione…",
+            t!("Elaborazione…"),
             egui::FontId::proportional(11.0),
             egui::Color32::from_gray(150),
         );
@@ -324,28 +327,28 @@ fn barra_comandi(
 ) {
     ui.horizontal_wrapped(|ui| {
         let confronta = ui
-            .button("Prima")
-            .on_hover_text("Tieni premuto per confrontare con l'originale");
+            .button(t!("Prima"))
+            .on_hover_text(t!("Tieni premuto per confrontare con l'originale"));
         edit.compare = confronta.is_pointer_button_down_on();
 
-        let annulla = egui::Button::new(format!("Annulla ({})", edit.undo.len()));
+        let annulla = egui::Button::new(t!("Annulla ({count})", count = edit.undo.len()));
         if ui.add_enabled(!edit.undo.is_empty(), annulla).clicked() {
             edit.undo();
         }
-        let ripeti = egui::Button::new(format!("Ripeti ({})", edit.redo.len()));
+        let ripeti = egui::Button::new(t!("Ripeti ({count})", count = edit.redo.len()));
         if ui.add_enabled(!edit.redo.is_empty(), ripeti).clicked() {
             edit.redo();
         }
         if ui
             .add_enabled(
                 !edit.recipe.is_identity(),
-                egui::Button::new("Ripristina tutto"),
+                egui::Button::new(t!("Ripristina tutto")),
             )
             .clicked()
         {
             edit.reset_all();
         }
-        if ui.button("Anteprima grande").clicked() {
+        if ui.button(t!("Anteprima grande")).clicked() {
             actions.open_preview = Some(path.to_path_buf());
         }
     });
@@ -354,41 +357,43 @@ fn barra_comandi(
         ui.colored_label(ui.visuals().error_fg_color, error);
     }
     if edit.is_dirty() {
-        ui.weak("Bozza non salvata: premi Salva (Ctrl+S) per scrivere la foto.");
+        ui.weak(t!(
+            "Bozza non salvata: premi Salva (Ctrl+S) per scrivere la foto."
+        ));
     }
 }
 
 /// Gestione dei preset salvati nel catalogo locale.
 fn preset(ui: &mut egui::Ui, edit: &mut EditState, actions: &mut UiActions) {
-    egui::CollapsingHeader::new("Preset")
+    egui::CollapsingHeader::new(t!("Preset"))
         .default_open(false)
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut edit.preset_name)
-                        .hint_text("Nome del preset")
+                        .hint_text(t!("Nome del preset"))
                         .desired_width(150.0),
                 );
                 let salvabile = !edit.preset_name.trim().is_empty();
                 if ui
-                    .add_enabled(salvabile, egui::Button::new("Salva"))
+                    .add_enabled(salvabile, egui::Button::new(t!("Salva")))
                     .clicked()
                 {
                     actions.edit_save_preset = true;
                 }
             });
             if edit.presets.is_empty() {
-                ui.weak("Nessun preset salvato.");
+                ui.weak(t!("Nessun preset salvato."));
             }
             let mut da_applicare: Option<EditRecipe> = None;
             let mut da_eliminare: Option<String> = None;
             for (nome, ricetta) in &edit.presets {
                 ui.horizontal(|ui| {
                     ui.label(elide(nome, 22));
-                    if ui.small_button("Applica").clicked() {
+                    if ui.small_button(t!("Applica")).clicked() {
                         da_applicare = Some(*ricetta);
                     }
-                    if ui.small_button("Elimina").clicked() {
+                    if ui.small_button(t!("Elimina")).clicked() {
                         da_eliminare = Some(nome.clone());
                     }
                 });
@@ -409,25 +414,32 @@ fn preset_alla_selezione(
     quante: usize,
     actions: &mut UiActions,
 ) {
-    ui.strong("Preset");
+    ui.strong(t!("Preset"));
     if presets.is_empty() {
-        ui.weak("Nessun preset salvato: creane uno aprendo una singola foto.");
+        ui.weak(t!(
+            "Nessun preset salvato: creane uno aprendo una singola foto."
+        ));
     }
     for (nome, ricetta) in presets {
         ui.horizontal(|ui| {
             ui.label(elide(nome, 24));
             if ui
-                .small_button(format!("Applica a {quante} foto"))
+                .small_button(t!("Applica a {count} foto", count = quante))
                 .clicked()
             {
                 actions.edit_apply_preset = Some(*ricetta);
             }
         });
     }
-    if ui.small_button("Rimuovi le regolazioni da tutte").clicked() {
+    if ui
+        .small_button(t!("Rimuovi le regolazioni da tutte"))
+        .clicked()
+    {
         actions.edit_apply_preset = Some(EditRecipe::default());
     }
-    ui.weak("Le regolazioni applicate restano in bozza finché non premi Salva.");
+    ui.weak(t!(
+        "Le regolazioni applicate restano in bozza finché non premi Salva."
+    ));
 }
 
 /// Esito dell'interazione con una riga di regolazione.
@@ -481,7 +493,7 @@ fn slider_row(ui: &mut egui::Ui, etichetta: &str, valore: &mut f32, limiti: &Lim
         );
         let ripristina = ui
             .small_button("↺")
-            .on_hover_text("Ripristina questa regolazione");
+            .on_hover_text(t!("Ripristina questa regolazione"));
         if ripristina.clicked() {
             *valore = limiti.neutro;
         }
@@ -561,7 +573,7 @@ fn imposta_campo(recipe: &mut EditRecipe, field: EditField, value: f32) {
 /// Una regolazione numerica completa di cronologia e salvataggio.
 fn riga_slider(ui: &mut egui::Ui, edit: &mut EditState, field: EditField, limiti: &Limiti) {
     let mut valore = valore_campo(&edit.recipe, field);
-    let esito = slider_row(ui, field.label(), &mut valore, limiti);
+    let esito = slider_row(ui, edit_field_label(field), &mut valore, limiti);
     if !esito.changed {
         return;
     }
@@ -572,7 +584,10 @@ fn riga_slider(ui: &mut egui::Ui, edit: &mut EditState, field: EditField, limiti
 /// Rotazione in passi di 90°.
 fn riga_rotazione(ui: &mut egui::Ui, edit: &mut EditState) {
     ui.horizontal(|ui| {
-        ui.add_sized([88.0, 18.0], egui::Label::new("Rotazione"));
+        ui.add_sized(
+            [88.0, 18.0],
+            egui::Label::new(edit_field_label(EditField::Rotation)),
+        );
         for (gradi, testo) in [(0u16, "0°"), (90, "90°"), (180, "180°"), (270, "270°")] {
             let attivo = edit.recipe.rotation == gradi;
             if ui.selectable_label(attivo, testo).clicked() && !attivo {
@@ -595,25 +610,25 @@ fn riga_ritaglio(ui: &mut egui::Ui, edit: &mut EditState) {
     let esiti = [
         slider_row(
             ui,
-            "Bordo sinistro %",
+            t!("Bordo sinistro %"),
             &mut sinistra,
             &limiti(0.0, 98.0, 0.0, 0, 0.5),
         ),
         slider_row(
             ui,
-            "Bordo superiore %",
+            t!("Bordo superiore %"),
             &mut alto,
             &limiti(0.0, 98.0, 0.0, 0, 0.5),
         ),
         slider_row(
             ui,
-            "Larghezza %",
+            t!("Larghezza %"),
             &mut larghezza,
             &limiti(2.0, 100.0, 100.0, 0, 0.5),
         ),
         slider_row(
             ui,
-            "Altezza %",
+            t!("Altezza %"),
             &mut altezza,
             &limiti(2.0, 100.0, 100.0, 0, 0.5),
         ),
@@ -622,7 +637,7 @@ fn riga_ritaglio(ui: &mut egui::Ui, edit: &mut EditState) {
     let attivo = edit.recipe.crop.is_some();
     ui.horizontal(|ui| {
         if ui
-            .add_enabled(attivo, egui::Button::new("Ripristina ritaglio"))
+            .add_enabled(attivo, egui::Button::new(t!("Ripristina ritaglio")))
             .clicked()
         {
             edit.push_undo();

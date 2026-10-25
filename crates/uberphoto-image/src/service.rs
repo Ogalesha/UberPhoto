@@ -10,6 +10,7 @@
 //! per frame; il callback `repaint` risveglia la UI quando un job termina.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -30,6 +31,8 @@ pub struct ImageResult {
     pub mtime: Option<SystemTime>,
     pub kind: ImageKind,
     pub outcome: Result<LoadedImage, String>,
+    /// Epoca della richiesta: i risultati superati vengono scartati dalla UI.
+    pub epoch: u64,
 }
 
 struct Job {
@@ -44,6 +47,9 @@ pub struct ImageService {
     results_tx: Sender<ImageResult>,
     results_rx: Receiver<ImageResult>,
     repaint: Arc<dyn Fn() + Send + Sync>,
+    /// Cambia quando si passa a un'altra cartella: i job vecchi si fermano
+    /// prima di decodificare e i risultati non vengono più recapitati.
+    epoch: Arc<AtomicU64>,
 }
 
 impl ImageService {
@@ -55,12 +61,16 @@ impl ImageService {
         let parallelism = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
-        let thumb_threads = parallelism.saturating_sub(1).clamp(1, 8);
+        // Lasciamo almeno due core alla UI: la decodifica a piena risoluzione
+        // satura banda di memoria e allocatore, non solo CPU.
+        let thumb_threads = parallelism.saturating_sub(2).clamp(2, 6);
         let thumb_pool = rayon::ThreadPoolBuilder::new()
             .num_threads(thumb_threads)
             .thread_name(|index| format!("uberphoto-thumb-{index}"))
             .build()
             .expect("impossibile creare il pool di decodifica miniature");
+
+        let epoch = Arc::new(AtomicU64::new(0));
 
         // Worker anteprime: elabora la prima richiesta, poi salta tutte le
         // richieste accodate nel frattempo tranne l'ultima.
@@ -82,6 +92,7 @@ impl ImageService {
                                 mtime: job.mtime,
                                 kind: ImageKind::Preview,
                                 outcome,
+                                epoch: 0,
                             })
                             .is_err()
                         {
@@ -99,15 +110,42 @@ impl ImageService {
             results_tx,
             results_rx,
             repaint,
+            epoch,
         }
     }
 
+    /// Epoca corrente delle miniature.
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Relaxed)
+    }
+
+    /// Invalida i job di miniature in corso (cambio cartella) e restituisce
+    /// la nuova epoca.
+    pub fn bump_epoch(&self) -> u64 {
+        self.epoch.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
     /// Richiede una miniatura (lato lungo `max_dim` pixel). Non bloccante.
-    pub fn request_thumb(&self, path: PathBuf, mtime: Option<SystemTime>, max_dim: u32) {
+    pub fn request_thumb(
+        &self,
+        path: PathBuf,
+        mtime: Option<SystemTime>,
+        max_dim: u32,
+        epoch: u64,
+    ) {
         let results_tx = self.results_tx.clone();
         let repaint = self.repaint.clone();
+        let current_epoch = self.epoch.clone();
         self.thumb_pool.spawn(move || {
+            if current_epoch.load(Ordering::Relaxed) != epoch {
+                return;
+            }
             let outcome = load_image_rgba(&path, Some(max_dim));
+            // La cartella può essere cambiata mentre la decodifica era in
+            // corso: in quel caso il risultato non serve più.
+            if current_epoch.load(Ordering::Relaxed) != epoch {
+                return;
+            }
             if let Err(message) = &outcome {
                 tracing::debug!(path = %path.display(), "miniatura non disponibile: {message}");
             }
@@ -116,6 +154,7 @@ impl ImageService {
                 mtime,
                 kind: ImageKind::Thumbnail,
                 outcome,
+                epoch,
             });
             repaint();
         });
@@ -150,7 +189,7 @@ mod tests {
             .expect("salvataggio");
 
         let service = ImageService::new(Arc::new(|| {}));
-        service.request_thumb(path.clone(), None, 32);
+        service.request_thumb(path.clone(), None, 32, 0);
 
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let mut result = None;

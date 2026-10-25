@@ -14,6 +14,7 @@ mod editor;
 mod explorer;
 mod export;
 mod gps;
+mod i18n;
 mod inspector;
 mod preview;
 mod state;

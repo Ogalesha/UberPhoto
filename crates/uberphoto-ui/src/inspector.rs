@@ -10,7 +10,9 @@ use eframe::egui;
 use uberphoto_core::PhotoAsset;
 use uberphoto_metadata::{MetadataDocument, MetadataField, Section};
 
+use crate::i18n::{metadata_field_hint, metadata_field_label, metadata_section_label};
 use crate::state::{AppState, InspectorTab, UiActions};
+use crate::t;
 use crate::thumbnails::ThumbCache;
 use crate::util::{elide, format_bytes, format_time};
 
@@ -44,12 +46,11 @@ fn informazioni(ui: &mut egui::Ui, state: &AppState, thumbs: &ThumbCache) {
     match selected.as_slice() {
         [] => {
             ui.add_space(8.0);
-            ui.weak("Nessuna foto selezionata.");
+            ui.weak(t!("Nessuna foto selezionata."));
             ui.add_space(6.0);
-            ui.weak(
-                "Seleziona una o più foto nel browser: i dettagli si aggiornano \
-                 automaticamente.",
-            );
+            ui.weak(t!(
+                "Seleziona una o più foto nel browser: i dettagli si aggiornano automaticamente."
+            ));
         }
         [asset] => singola(ui, asset, thumbs),
         many => multipla(ui, many),
@@ -57,8 +58,8 @@ fn informazioni(ui: &mut egui::Ui, state: &AppState, thumbs: &ThumbCache) {
 
     ui.add_space(10.0);
     match &state.exiftool {
-        Some(version) => ui.weak(format!("Motore metadati: ExifTool {version}")),
-        None => ui.weak("Motore metadati: ExifTool non trovato"),
+        Some(version) => ui.weak(t!("Motore metadati: ExifTool {version}", version = version)),
+        None => ui.weak(t!("Motore metadati: ExifTool non trovato")),
     };
 }
 
@@ -68,58 +69,63 @@ fn singola(ui: &mut egui::Ui, asset: &PhotoAsset, thumbs: &ThumbCache) {
         .spacing([12.0, 4.0])
         .striped(true)
         .show(ui, |ui| {
-            row(ui, "Nome", &asset.file_name());
-            row(ui, "Percorso", &asset.path.display().to_string());
-            row(ui, "Formato", asset.format.label());
-            row(ui, "Dimensione", &format_bytes(asset.byte_size));
+            row(ui, t!("Nome"), &asset.file_name());
+            row(ui, t!("Percorso"), &asset.path.display().to_string());
+            row(ui, t!("Formato"), asset.format.label());
+            row(ui, t!("Dimensione"), &format_bytes(asset.byte_size));
             if let Some((width, height)) = thumbs.dims(&asset.path) {
-                row(ui, "Dimensioni", &format!("{width} × {height} px"));
+                row(
+                    ui,
+                    t!("Dimensioni"),
+                    &t!("{width} × {height} px", width = width, height = height),
+                );
                 let megapixel = (width as f64 * height as f64) / 1_000_000.0;
-                row(ui, "Risoluzione", &format!("{megapixel:.1} MP"));
+                row(ui, t!("Risoluzione"), &format!("{megapixel:.1} MP"));
             }
             if let Some(modified) = asset.modified {
-                row(ui, "Modificato", &format_time(modified));
+                row(ui, t!("Modificato"), &format_time(modified));
             }
             if asset.is_raw() {
-                row(ui, "RAW", "sì — l'originale resta di sola lettura");
+                row(ui, "RAW", t!("sì — l'originale resta di sola lettura"));
             }
         });
 
     ui.add_space(10.0);
     let capabilities = asset.format.capabilities();
-    ui.strong("Capacità del formato");
+    ui.strong(t!("Capacità del formato"));
     ui.add_space(4.0);
     egui::Grid::new("capabilities_grid")
         .num_columns(2)
         .spacing([12.0, 4.0])
         .striped(true)
         .show(ui, |ui| {
-            capability_row(ui, "Anteprima integrata", capabilities.view);
-            capability_row(ui, "Editing colore", capabilities.pixel_edit);
-            capability_row(ui, "Metadati embedded", capabilities.embedded_metadata);
-            capability_row(ui, "Sidecar XMP", capabilities.xmp_sidecar);
-            capability_row(ui, "Formato di export", capabilities.export_target);
+            capability_row(ui, t!("Anteprima integrata"), capabilities.view);
+            capability_row(ui, t!("Editing colore"), capabilities.pixel_edit);
+            capability_row(ui, t!("Metadati embedded"), capabilities.embedded_metadata);
+            capability_row(ui, t!("Sidecar XMP"), capabilities.xmp_sidecar);
+            capability_row(ui, t!("Formato di export"), capabilities.export_target);
         });
 }
 
 fn multipla(ui: &mut egui::Ui, assets: &[&PhotoAsset]) {
     ui.add_space(8.0);
-    ui.strong(format!("{} foto selezionate", assets.len()));
+    ui.strong(t!("{count} foto selezionate", count = assets.len()));
     ui.add_space(6.0);
 
     let total_bytes: u64 = assets.iter().map(|asset| asset.byte_size).sum();
-    ui.label(format!("Dimensione totale: {}", format_bytes(total_bytes)));
+    ui.label(t!(
+        "Dimensione totale: {size}",
+        size = format_bytes(total_bytes)
+    ));
 
     let mut formats: Vec<&str> = assets.iter().map(|asset| asset.format.label()).collect();
     formats.sort_unstable();
     formats.dedup();
-    ui.label(format!("Formati: {}", formats.join(", ")));
+    ui.label(t!("Formati: {formats}", formats = formats.join(", ")));
 
     ui.add_space(10.0);
     ui.weak(
-        "Usa la scheda Metadati per modificare i campi comuni a tutte le foto \
-         selezionate: i campi con valori diversi restano invariati finché non \
-         li modifichi.",
+        t!("Usa la scheda Metadati per modificare i campi comuni a tutte le foto selezionate: i campi con valori diversi restano invariati finché non li modifichi."),
     );
 }
 
@@ -132,9 +138,9 @@ fn row(ui: &mut egui::Ui, key: &str, value: &str) {
 fn capability_row(ui: &mut egui::Ui, key: &str, supported: bool) {
     ui.label(egui::RichText::new(key).strong());
     if supported {
-        ui.label("sì");
+        ui.label(t!("sì"));
     } else {
-        ui.weak("no");
+        ui.weak(t!("no"));
     }
     ui.end_row();
 }
@@ -143,13 +149,10 @@ fn capability_row(ui: &mut egui::Ui, key: &str, supported: bool) {
 fn metadati(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
     if state.exiftool.is_none() {
         ui.add_space(10.0);
-        ui.strong("Editor metadati non disponibile");
+        ui.strong(t!("Editor metadati non disponibile"));
         ui.add_space(6.0);
         ui.weak(
-            "ExifTool non è stato trovato. Installa exiftool (pacchetto \
-             libimage-exiftool-perl su Ubuntu) oppure imposta la variabile \
-             UBERPHOTO_EXIFTOOL con il percorso dell'eseguibile, poi riavvia \
-             UberPhoto.",
+            t!("ExifTool non è stato trovato. Installa exiftool (pacchetto libimage-exiftool-perl su Ubuntu) oppure imposta la variabile UBERPHOTO_EXIFTOOL con il percorso dell'eseguibile, poi riavvia UberPhoto."),
         );
         return;
     }
@@ -157,9 +160,11 @@ fn metadati(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
     let selected = state.selected_paths();
     if selected.is_empty() {
         ui.add_space(8.0);
-        ui.weak("Nessuna foto selezionata.");
+        ui.weak(t!("Nessuna foto selezionata."));
         ui.add_space(6.0);
-        ui.weak("Seleziona una o più foto per leggerne e modificarne i metadati.");
+        ui.weak(t!(
+            "Seleziona una o più foto per leggerne e modificarne i metadati."
+        ));
         return;
     }
 
@@ -173,7 +178,7 @@ fn metadati(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
                 let nome = path
                     .file_name()
                     .and_then(|name| name.to_str())
-                    .unwrap_or("file")
+                    .unwrap_or(t!("file"))
                     .to_owned();
                 state
                     .meta
@@ -183,17 +188,20 @@ fn metadati(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
             })
             .collect();
         for (nome, errore) in &errori {
-            ui.colored_label(ui.visuals().error_fg_color, format!("{nome}: {errore}"));
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                t!("{name}: {error}", name = nome, error = errore),
+            );
         }
         if errori.is_empty() {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.weak("Lettura dei metadati…");
+                ui.weak(t!("Lettura dei metadati…"));
             });
         }
         ui.add_space(6.0);
-        if ui.button("Ricarica").clicked() {
+        if ui.button(t!("Ricarica")).clicked() {
             actions.metadata_reload = true;
         }
         return;
@@ -201,20 +209,23 @@ fn metadati(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
 
     ui.horizontal(|ui| {
         ui.strong(if selected.len() == 1 {
-            "1 foto selezionata".to_owned()
+            t!("1 foto selezionata").to_owned()
         } else {
-            format!("{} foto selezionate", selected.len())
+            t!("{count} foto selezionate", count = selected.len())
         });
-        if ui.small_button("Ricarica").clicked() {
+        if ui.small_button(t!("Ricarica")).clicked() {
             actions.metadata_reload = true;
         }
     });
     ui.add_space(4.0);
 
     for (titolo, section) in [
-        ("Descrittive", Section::Descriptive),
-        ("Autore e copyright", Section::Author),
-        ("Data e orientamento", Section::Temporal),
+        (
+            metadata_section_label(Section::Descriptive),
+            Section::Descriptive,
+        ),
+        (metadata_section_label(Section::Author), Section::Author),
+        (metadata_section_label(Section::Temporal), Section::Temporal),
     ] {
         egui::CollapsingHeader::new(titolo)
             .default_open(true)
@@ -235,32 +246,30 @@ fn metadati(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
 
     ui.add_space(8.0);
     ui.horizontal(|ui| {
-        let salva = egui::Button::new("Salva…").min_size(egui::vec2(110.0, 28.0));
+        let salva = egui::Button::new(t!("Salva…")).min_size(egui::vec2(110.0, 28.0));
         if ui
             .add_enabled(
                 state.has_pending_changes() && state.gps.manual_error.is_none(),
                 salva,
             )
-            .on_hover_text("Salva colore, metadati e posizione (Ctrl+S)")
+            .on_hover_text(t!("Salva colore, metadati e posizione (Ctrl+S)"))
             .clicked()
         {
             actions.save_open = true;
         }
-        if ui.button("Annulla modifiche").clicked() {
+        if ui.button(t!("Annulla modifiche")).clicked() {
             state.discard_meta_drafts();
         }
     });
     ui.add_space(4.0);
     ui.weak(
-        "I campi svuotati vengono rimossi dai metadati; le modifiche a colore, \
-         metadati e posizione si salvano insieme con Salva.",
+        t!("I campi svuotati vengono rimossi dai metadati; le modifiche a colore, metadati e posizione si salvano insieme con Salva."),
     );
     if let Some(asset) = state.selected_assets().first() {
         if !asset.format.capabilities().embedded_metadata {
-            ui.weak(format!(
-                "{} non supporta metadati incorporati: i campi XMP saranno scritti \
-                 nel sidecar accanto al file.",
-                asset.format.label()
+            ui.weak(t!(
+                "{format} non supporta metadati incorporati: i campi XMP saranno scritti nel sidecar accanto al file.",
+                format = asset.format.label()
             ));
         }
     }
@@ -276,7 +285,7 @@ fn metadati(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
 /// Riga del form: etichetta, indicatore "modificato" ed editor del campo.
 fn campo(ui: &mut egui::Ui, state: &mut AppState, field: MetadataField) {
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(field.label()).strong());
+        ui.label(egui::RichText::new(metadata_field_label(field)).strong());
         if state.meta.form_dirty.contains(&field) {
             ui.colored_label(ui.visuals().selection.stroke.color, "•");
         }
@@ -294,14 +303,14 @@ fn campo(ui: &mut egui::Ui, state: &mut AppState, field: MetadataField) {
         MetadataField::Rating => {
             let value = current.parse::<u8>().ok().filter(|value| *value <= 5);
             let label = match value {
-                Some(0) | None => "Nessuna".to_owned(),
+                Some(0) | None => t!("Nessuna").to_owned(),
                 Some(stars) => format!("{stars} {}", "★".repeat(stars as usize)),
             };
             let mut scelto = value;
             egui::ComboBox::from_id_salt("meta_rating")
                 .selected_text(label)
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut scelto, None, "Nessuna");
+                    ui.selectable_value(&mut scelto, None, t!("Nessuna"));
                     for stars in 1..=5u8 {
                         ui.selectable_value(
                             &mut scelto,
@@ -324,7 +333,7 @@ fn campo(ui: &mut egui::Ui, state: &mut AppState, field: MetadataField) {
             egui::ComboBox::from_id_salt("meta_orientation")
                 .selected_text(orientation_label(value))
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut scelto, None, "Non impostato");
+                    ui.selectable_value(&mut scelto, None, t!("Non impostato"));
                     for code in 1..=8u8 {
                         ui.selectable_value(&mut scelto, Some(code), orientation_label(Some(code)));
                     }
@@ -336,9 +345,9 @@ fn campo(ui: &mut egui::Ui, state: &mut AppState, field: MetadataField) {
         }
         _ => {
             let hint = if mixed {
-                "valori diversi"
+                t!("valori diversi")
             } else {
-                field.hint()
+                metadata_field_hint(field)
             };
             let mut text = current;
             let response = ui.add(
@@ -356,22 +365,22 @@ fn campo(ui: &mut egui::Ui, state: &mut AppState, field: MetadataField) {
 
 fn orientation_label(value: Option<u8>) -> &'static str {
     match value {
-        Some(1) => "1 — Normale",
-        Some(2) => "2 — Specchiata orizzontalmente",
-        Some(3) => "3 — Ruotata di 180°",
-        Some(4) => "4 — Specchiata verticalmente",
-        Some(5) => "5 — Specchiata e ruotata 90° CW",
-        Some(6) => "6 — Ruotata di 90° CW",
-        Some(7) => "7 — Specchiata e ruotata 90° CCW",
-        Some(8) => "8 — Ruotata di 90° CCW",
-        _ => "Non impostato",
+        Some(1) => t!("1 — Normale"),
+        Some(2) => t!("2 — Specchiata orizzontalmente"),
+        Some(3) => t!("3 — Ruotata di 180°"),
+        Some(4) => t!("4 — Specchiata verticalmente"),
+        Some(5) => t!("5 — Specchiata e ruotata 90° CW"),
+        Some(6) => t!("6 — Ruotata di 90° CW"),
+        Some(7) => t!("7 — Specchiata e ruotata 90° CCW"),
+        Some(8) => t!("8 — Ruotata di 90° CCW"),
+        _ => t!("Non impostato"),
     }
 }
 
 /// Dati della fotocamera: sola lettura, per non falsificare la provenienza.
 fn tecnica(ui: &mut egui::Ui, document: &MetadataDocument) {
     ui.add_space(6.0);
-    egui::CollapsingHeader::new("Informazioni tecniche (sola lettura)")
+    egui::CollapsingHeader::new(t!("Informazioni tecniche (sola lettura)"))
         .default_open(false)
         .show(ui, |ui| {
             let technical = &document.technical;
@@ -387,15 +396,15 @@ fn tecnica(ui: &mut egui::Ui, document: &MetadataDocument) {
                 .striped(true)
                 .show(ui, |ui| {
                     for (key, value) in [
-                        ("Fotocamera", camera),
-                        ("Obiettivo", technical.lens.clone()),
-                        ("Esposizione", technical.exposure_time.clone()),
-                        ("Apertura", technical.f_number.clone()),
+                        (t!("Fotocamera"), camera),
+                        (t!("Obiettivo"), technical.lens.clone()),
+                        (t!("Esposizione"), technical.exposure_time.clone()),
+                        (t!("Apertura"), technical.f_number.clone()),
                         ("ISO", technical.iso.map(|iso| iso.to_string())),
-                        ("Lunghezza focale", technical.focal_length.clone()),
-                        ("Profilo colore", technical.color_profile.clone()),
-                        ("Digitalizzazione", technical.date_created.clone()),
-                        ("Ultima modifica", technical.date_modified.clone()),
+                        (t!("Lunghezza focale"), technical.focal_length.clone()),
+                        (t!("Profilo colore"), technical.color_profile.clone()),
+                        (t!("Digitalizzazione"), technical.date_created.clone()),
+                        (t!("Ultima modifica"), technical.date_modified.clone()),
                     ] {
                         if let Some(value) = value {
                             row(ui, key, &value);
@@ -404,7 +413,7 @@ fn tecnica(ui: &mut egui::Ui, document: &MetadataDocument) {
                     if let Some(gps) = document.gps {
                         row(
                             ui,
-                            "Coordinate",
+                            t!("Coordinate"),
                             &format!("{:.6}, {:.6}", gps.latitude, gps.longitude),
                         );
                     }
@@ -414,16 +423,16 @@ fn tecnica(ui: &mut egui::Ui, document: &MetadataDocument) {
 
 /// Vista avanzata dei tag ExifTool: sola lettura, con filtro e scrivibilità.
 fn avanzata(ui: &mut egui::Ui, state: &mut AppState, path: &std::path::Path) {
-    egui::CollapsingHeader::new("Tag ExifTool (avanzato)")
+    egui::CollapsingHeader::new(t!("Tag ExifTool (avanzato)"))
         .default_open(false)
         .show(ui, |ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut state.meta.raw_filter)
-                    .hint_text("Filtra per gruppo o nome del tag…")
+                    .hint_text(t!("Filtra per gruppo o nome del tag…"))
                     .desired_width(f32::INFINITY),
             );
             let Some(raw) = state.meta.raw.get(path) else {
-                ui.weak("Tag non ancora letti.");
+                ui.weak(t!("Tag non ancora letti."));
                 return;
             };
             let filter = state.meta.raw_filter.trim().to_lowercase();
@@ -436,9 +445,9 @@ fn avanzata(ui: &mut egui::Ui, state: &mut AppState, path: &std::path::Path) {
                         .spacing([8.0, 2.0])
                         .striped(true)
                         .show(ui, |ui| {
-                            ui.label(egui::RichText::new("Tag").strong());
-                            ui.label(egui::RichText::new("Valore").strong());
-                            ui.label(egui::RichText::new("Scrivibile").strong());
+                            ui.label(egui::RichText::new(t!("Tag")).strong());
+                            ui.label(egui::RichText::new(t!("Valore")).strong());
+                            ui.label(egui::RichText::new(t!("Scrivibile")).strong());
                             ui.end_row();
                             for tag in raw {
                                 let nome = format!("{}:{}", tag.group, tag.name);
@@ -448,16 +457,16 @@ fn avanzata(ui: &mut egui::Ui, state: &mut AppState, path: &std::path::Path) {
                                 ui.label(&nome);
                                 ui.label(elide(&tag.value, 60));
                                 if tag.writable {
-                                    ui.label("sì");
+                                    ui.label(t!("sì"));
                                 } else {
-                                    ui.weak("no");
+                                    ui.weak(t!("no"));
                                 }
                                 ui.end_row();
                             }
                         });
                 });
-            ui.weak(
-                "Vista di sola lettura: l'editing dei singoli tag arriverà in una fase successiva.",
-            );
+            ui.weak(t!(
+                "Vista di sola lettura: l'editing dei singoli tag arriverà in una fase successiva."
+            ));
         });
 }

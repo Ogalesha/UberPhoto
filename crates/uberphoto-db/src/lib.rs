@@ -124,6 +124,9 @@ impl Index {
     fn new(conn: Connection) -> Result<Self> {
         // WAL non è disponibile per i database in memoria: l'errore è ignorato.
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
+        // L'indice è una cache ricostruibile: in WAL `NORMAL` evita un fsync
+        // per ogni transazione senza rischiare corruzione del database.
+        let _ = conn.pragma_update(None, "synchronous", "NORMAL");
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS photo_index (
                 path TEXT PRIMARY KEY,
@@ -198,6 +201,37 @@ impl Index {
         Ok(())
     }
 
+    /// Versione in blocco di [`Index::upsert_file_info`]: una sola transazione
+    /// per l'intera cartella e nessuna scrittura per le righe invariate.
+    pub fn upsert_file_info_batch(&self, assets: &[PhotoAsset]) -> Result<()> {
+        if assets.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO photo_index (path, mtime, byte_size, format) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(path) DO UPDATE SET
+                    mtime = excluded.mtime,
+                    byte_size = excluded.byte_size,
+                    format = excluded.format
+                 WHERE photo_index.mtime IS NOT excluded.mtime
+                    OR photo_index.byte_size IS NOT excluded.byte_size
+                    OR photo_index.format IS NOT excluded.format",
+            )?;
+            for asset in assets {
+                stmt.execute(params![
+                    path_text(&asset.path),
+                    mtime_secs(asset.modified),
+                    asset.byte_size as i64,
+                    asset.format.label(),
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Salva le dimensioni in pixel, creando la riga se non esiste.
     pub fn set_dimensions(&self, path: &Path, width: u32, height: u32) -> Result<()> {
         self.conn.execute(
@@ -205,6 +239,34 @@ impl Index {
              ON CONFLICT(path) DO UPDATE SET width = excluded.width, height = excluded.height",
             params![path_text(path), i64::from(width), i64::from(height)],
         )?;
+        Ok(())
+    }
+
+    /// Versione in blocco di [`Index::set_dimensions`], usata quando arrivano
+    /// molte miniature nello stesso frame.
+    pub fn set_dimensions_batch(&self, items: &[(PathBuf, u32, u32)]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO photo_index (path, width, height) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(path) DO UPDATE SET
+                    width = excluded.width,
+                    height = excluded.height
+                 WHERE photo_index.width IS NOT excluded.width
+                    OR photo_index.height IS NOT excluded.height",
+            )?;
+            for (path, width, height) in items {
+                stmt.execute(params![
+                    path_text(path),
+                    i64::from(*width),
+                    i64::from(*height)
+                ])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -257,6 +319,77 @@ impl Index {
         Ok(())
     }
 
+    /// Versione in blocco di [`Index::upsert_metadata`]: una transazione per
+    /// batch di riassunti e nessuna scrittura per le righe invariate.
+    pub fn upsert_metadata_batch(
+        &self,
+        items: &[(PathBuf, Option<i64>, MetadataIndex)],
+    ) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO photo_index (
+                    path, mtime, has_gps, rating, date_original, keywords,
+                    camera_make, camera_model, lens, iso,
+                    f_number, exposure_time, focal_length, gps_lat, gps_lon
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                 ON CONFLICT(path) DO UPDATE SET
+                    mtime = excluded.mtime,
+                    has_gps = excluded.has_gps,
+                    rating = excluded.rating,
+                    date_original = excluded.date_original,
+                    keywords = excluded.keywords,
+                    camera_make = excluded.camera_make,
+                    camera_model = excluded.camera_model,
+                    lens = excluded.lens,
+                    iso = excluded.iso,
+                    f_number = excluded.f_number,
+                    exposure_time = excluded.exposure_time,
+                    focal_length = excluded.focal_length,
+                    gps_lat = excluded.gps_lat,
+                    gps_lon = excluded.gps_lon
+                 WHERE photo_index.mtime IS NOT excluded.mtime
+                    OR photo_index.has_gps IS NOT excluded.has_gps
+                    OR photo_index.rating IS NOT excluded.rating
+                    OR photo_index.date_original IS NOT excluded.date_original
+                    OR photo_index.keywords IS NOT excluded.keywords
+                    OR photo_index.camera_make IS NOT excluded.camera_make
+                    OR photo_index.camera_model IS NOT excluded.camera_model
+                    OR photo_index.lens IS NOT excluded.lens
+                    OR photo_index.iso IS NOT excluded.iso
+                    OR photo_index.f_number IS NOT excluded.f_number
+                    OR photo_index.exposure_time IS NOT excluded.exposure_time
+                    OR photo_index.focal_length IS NOT excluded.focal_length
+                    OR photo_index.gps_lat IS NOT excluded.gps_lat
+                    OR photo_index.gps_lon IS NOT excluded.gps_lon",
+            )?;
+            for (path, mtime, metadata) in items {
+                stmt.execute(params![
+                    path_text(path),
+                    mtime,
+                    metadata.has_gps as i64,
+                    metadata.rating.map(i64::from),
+                    metadata.date_original,
+                    metadata.keywords,
+                    metadata.camera_make,
+                    metadata.camera_model,
+                    metadata.lens,
+                    metadata.iso,
+                    metadata.f_number,
+                    metadata.exposure_time,
+                    metadata.focal_length,
+                    metadata.gps_lat,
+                    metadata.gps_lon,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Riga relativa a `path`, se presente.
     pub fn get(&self, path: &Path) -> Result<Option<IndexRow>> {
         let sql = format!("SELECT {COLUMNS} FROM photo_index WHERE path = ?1");
@@ -268,13 +401,42 @@ impl Index {
 
     /// Righe delle foto contenute direttamente in `dir` (non ricorsivo).
     pub fn load_dir(&self, dir: &Path) -> Result<Vec<IndexRow>> {
-        let sql = format!("SELECT {COLUMNS} FROM photo_index WHERE path LIKE ?1 ESCAPE '\\'");
+        let (lower, upper) = subtree_bounds(dir);
+        let sql = format!(
+            "SELECT {COLUMNS} FROM photo_index \
+             WHERE path >= ?1 AND path < ?2 AND path LIKE ?3 ESCAPE '\\'"
+        );
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![like_dir_pattern(dir)], IndexRow::from_row)?;
+        let rows = stmt.query_map(
+            params![lower, upper, like_dir_pattern(dir)],
+            IndexRow::from_row,
+        )?;
         let mut out = Vec::new();
         for row in rows {
             let row = row?;
             if row.path.parent() == Some(dir) {
+                out.push(row);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Righe delle foto contenute in `dir` e in tutte le sue sottocartelle.
+    pub fn load_subtree(&self, dir: &Path) -> Result<Vec<IndexRow>> {
+        let (lower, upper) = subtree_bounds(dir);
+        let sql = format!(
+            "SELECT {COLUMNS} FROM photo_index \
+             WHERE path >= ?1 AND path < ?2 AND path LIKE ?3 ESCAPE '\\'"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            params![lower, upper, like_dir_pattern(dir)],
+            IndexRow::from_row,
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            let row = row?;
+            if row.path.starts_with(dir) {
                 out.push(row);
             }
         }
@@ -505,6 +667,23 @@ fn like_dir_pattern(dir: &Path) -> String {
     like_pattern_for(&path_text(dir))
 }
 
+/// Estremi semi-aperti dei percorsi che iniziano con il testo di `dir`.
+/// Il confronto testuale sfrutta l'indice BINARY della chiave primaria,
+/// evitando di scandire l'intera tabella a ogni scansione. L'estremo superiore
+/// è il prefisso con l'ultimo carattere incrementato: può includere qualche
+/// cartella sorella con lo stesso inizio, che il filtro LIKE e il controllo
+/// esatto in Rust scartano subito.
+fn subtree_bounds(dir: &Path) -> (String, String) {
+    let lower = path_text(dir);
+    if lower.is_empty() {
+        return (String::new(), "\u{10FFFF}".to_owned());
+    }
+    let mut upper = lower.clone();
+    let last = upper.pop().unwrap_or('\0');
+    upper.push(char::from_u32(last as u32 + 1).unwrap_or('\u{10FFFF}'));
+    (lower, upper)
+}
+
 fn like_recipe_dir_pattern(dir: &Path) -> String {
     like_pattern_for(&recipe_path_text(dir))
 }
@@ -604,6 +783,59 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, vec!["a.jpg", "b.jpg"]);
+    }
+
+    #[test]
+    fn i_limiti_del_sottoalbero_includono_i_figli() {
+        let (lower, upper) = subtree_bounds(Path::new("/base"));
+        assert!(lower.as_str() <= "/base/a.jpg");
+        assert!("/base/a.jpg" < upper.as_str());
+        assert!("/base/sub/c.jpg" < upper.as_str());
+        assert!("/basix/e.jpg" >= upper.as_str());
+
+        let (root_lower, root_upper) = subtree_bounds(Path::new("/"));
+        assert!(root_lower.as_str() <= "/qualsiasi/foto.jpg");
+        assert!("/qualsiasi/foto.jpg" < root_upper.as_str());
+    }
+
+    #[test]
+    fn la_lettura_del_sottoalbero_usa_l_indice() {
+        let index = Index::open_in_memory().unwrap();
+        let (lower, upper) = subtree_bounds(Path::new("/base"));
+        let sql = "EXPLAIN QUERY PLAN SELECT path FROM photo_index \
+                   WHERE path >= ?1 AND path < ?2 AND path LIKE ?3 ESCAPE '\\'";
+        let mut stmt = index.conn.prepare(sql).unwrap();
+        let plan: String = stmt
+            .query_row(
+                params![lower, upper, like_dir_pattern(Path::new("/base"))],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            !plan.contains("SCAN photo_index"),
+            "la query deve usare l'indice, piano: {plan}"
+        );
+    }
+
+    #[test]
+    fn load_subtree_include_i_discendenti() {
+        let index = Index::open_in_memory().unwrap();
+        for path in [
+            "/base/a.jpg",
+            "/base/b.jpg",
+            "/base/sub/c.jpg",
+            "/base/sub/deep/d.jpg",
+            "/basix/e.jpg",
+        ] {
+            index.upsert_file_info(&asset(path, 1)).unwrap();
+        }
+        let rows = index.load_subtree(Path::new("/base")).unwrap();
+        let mut names: Vec<String> = rows
+            .iter()
+            .map(|row| row.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["a.jpg", "b.jpg", "c.jpg", "d.jpg"]);
     }
 
     #[test]
@@ -789,5 +1021,65 @@ mod tests {
             .load_recipe(Path::new("/altrove/d.jpg"))
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn batch_filesystem_scrive_e_conserva_i_dati_esistenti() {
+        let index = Index::open_in_memory().unwrap();
+        index.upsert_file_info(&asset("/base/a.jpg", 10)).unwrap();
+        index
+            .set_dimensions(Path::new("/base/a.jpg"), 6000, 4000)
+            .unwrap();
+
+        let assets = [
+            asset("/base/a.jpg", 20),
+            asset("/base/b.jpg", 30),
+            asset("/base/sub/c.jpg", 40),
+        ];
+        index.upsert_file_info_batch(&assets).unwrap();
+
+        assert_eq!(index.count().unwrap(), 3);
+        let a = index.get(Path::new("/base/a.jpg")).unwrap().unwrap();
+        assert_eq!(a.byte_size, Some(20));
+        assert_eq!(a.width, Some(6000), "le dimensioni non vengono azzerate");
+        let c = index.get(Path::new("/base/sub/c.jpg")).unwrap().unwrap();
+        assert_eq!(c.byte_size, Some(40));
+    }
+
+    #[test]
+    fn batch_metadati_e_dimensioni_scrivono_tutto() {
+        let index = Index::open_in_memory().unwrap();
+        let items = vec![
+            (
+                PathBuf::from("/base/a.jpg"),
+                Some(1_700_000_000),
+                sample_metadata(),
+            ),
+            (
+                PathBuf::from("/base/b.jpg"),
+                Some(1_700_000_001),
+                MetadataIndex {
+                    rating: Some(2),
+                    ..MetadataIndex::default()
+                },
+            ),
+        ];
+        index.upsert_metadata_batch(&items).unwrap();
+        let a = index.get(Path::new("/base/a.jpg")).unwrap().unwrap();
+        assert_eq!(a.rating, Some(4));
+        assert_eq!(a.gps_lat, Some(45.4642));
+        let b = index.get(Path::new("/base/b.jpg")).unwrap().unwrap();
+        assert_eq!(b.rating, Some(2));
+        assert!(!b.has_gps);
+
+        let dimensions = vec![
+            (PathBuf::from("/base/a.jpg"), 6000u32, 4000u32),
+            (PathBuf::from("/base/b.jpg"), 3000u32, 2000u32),
+        ];
+        index.set_dimensions_batch(&dimensions).unwrap();
+        let a = index.get(Path::new("/base/a.jpg")).unwrap().unwrap();
+        assert_eq!((a.width, a.height), (Some(6000), Some(4000)));
+        let b = index.get(Path::new("/base/b.jpg")).unwrap().unwrap();
+        assert_eq!((b.width, b.height), (Some(3000), Some(2000)));
     }
 }

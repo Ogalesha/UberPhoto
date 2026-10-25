@@ -1,7 +1,7 @@
 //! Gestione del filesystem per UberPhoto.
 //!
-//! Fase 1: scansione asincrona delle cartelle, ordinamento naturale,
-//! listing delle sotto-cartelle per l'albero di navigazione.
+//! Scansione asincrona delle cartelle, aggregazione ricorsiva del sottoalbero,
+//! ordinamento naturale e listing delle sotto-cartelle per la navigazione.
 //!
 //! Fase 2: spostamenti sicuri, gestione conflitti, sidecar, undo,
 //! osservazione delle modifiche esterne, esecuzione su thread dedicato.
@@ -20,7 +20,7 @@ pub use ops::{
     rename_dir, undo, ConflictPolicy, FileOpReport, PathMove,
 };
 pub use ops_service::{FileOpOutcome, FileOpRequest, FileOpsService};
-pub use scan::{scan_directory, DirectoryScanner, ScanResult};
+pub use scan::{scan_directory, scan_tree, DirectoryScanner, ScanResult};
 pub use sort::{sort_assets, SortKey};
 pub use tree::{load_subdirs, DirNode};
 pub use watch::DirWatcher;

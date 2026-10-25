@@ -6,10 +6,12 @@
 //! 3. disegno dei pannelli e dei prompt, che raccolgono [`UiActions`];
 //! 4. esecuzione delle azioni (navigazione, operazioni, annullamento).
 
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
+use crate::t;
 use eframe::egui;
 use uberphoto_core::GpsLocation;
 use uberphoto_db::{Index, MetadataIndex};
@@ -18,10 +20,10 @@ use uberphoto_export::{
 };
 use uberphoto_files::{
     create_dir, delete_empty_dir, dir_item_count, rename_dir, ConflictPolicy, DirNode, DirWatcher,
-    DirectoryScanner, FileOpRequest, FileOpsService,
+    DirectoryScanner, FileOpRequest, FileOpsService, SortKey,
 };
 use uberphoto_geo::{GeoOutcome, GeoRequest, GeoService, NominatimClient};
-use uberphoto_image::{EditRecipe, EditService, EditSource, ImageKind, ImageService};
+use uberphoto_image::{EditRecipe, EditService, EditSource, ImageKind, ImageResult, ImageService};
 use uberphoto_metadata::{
     exiftool_versione, LocationRole, MetadataEdit, MetadataField, MetadataOutcome, MetadataRequest,
     MetadataService, WriteItem,
@@ -29,6 +31,7 @@ use uberphoto_metadata::{
 
 use crate::browser;
 use crate::explorer;
+use crate::i18n::Language;
 use crate::inspector;
 use crate::preview::PreviewState;
 use crate::state::{
@@ -68,6 +71,12 @@ pub struct UberPhotoApp {
     close_prompt: bool,
     /// La chiusura è stata confermata: non richiedere più il prompt.
     allow_close: bool,
+    /// L'indice è cambiato: l'ordinamento va riallineato.
+    index_dirty: bool,
+    /// Ultimo riallineamento dell'ordinamento, per calmierare i batch.
+    last_index_sort: Instant,
+    /// Risultati immagine in attesa di essere applicati alla UI.
+    pending_images: VecDeque<ImageResult>,
 }
 
 impl UberPhotoApp {
@@ -106,6 +115,9 @@ impl UberPhotoApp {
             smoke_exit,
             close_prompt: false,
             allow_close: false,
+            index_dirty: false,
+            last_index_sort: Instant::now(),
+            pending_images: VecDeque::new(),
         };
         app.state.logo = load_logo(&cc.egui_ctx);
         app.state.exiftool = exiftool_versione();
@@ -152,10 +164,16 @@ impl UberPhotoApp {
     fn start_scan(&mut self, dir: PathBuf) {
         self.state.current_dir = Some(dir.clone());
         self.state.loading_dir = Some(dir.clone());
-        self.state.entries.clear();
+        self.state.set_entries(Vec::new());
+        self.state.subdirs.clear();
         self.state.index_rows.clear();
+        self.state.mark_index_changed();
         self.state.selection.clear();
         self.state.selection_anchor = None;
+        // I job di miniature della cartella precedente non servono più.
+        let epoch = self.images.bump_epoch();
+        self.thumbs.set_epoch(epoch);
+        self.pending_images.clear();
         if let Some(watcher) = &mut self.watcher {
             watcher.watch(&dir);
         }
@@ -173,16 +191,16 @@ impl UberPhotoApp {
                 Some(error) => {
                     tracing::warn!(dir = %result.dir.display(), "scansione fallita: {error}");
                     self.state.error = Some(error);
-                    self.state.entries.clear();
+                    self.state.set_entries(Vec::new());
+                    self.state.subdirs.clear();
                 }
                 None => {
-                    self.state.entries = result.entries;
+                    self.state.set_entries(result.entries);
+                    self.state.subdirs = result.subdirs;
                     self.refresh_index_rows(&result.dir);
                     self.state.apply_sort();
                     if let Some(path) = self.state.pending_select.take() {
-                        if path.parent() == Some(result.dir.as_path())
-                            && self.state.entries.iter().any(|entry| entry.path == path)
-                        {
+                        if path.starts_with(&result.dir) && self.state.entry(&path).is_some() {
                             self.state.selection.insert(path.clone());
                             self.state.selection_anchor = Some(path);
                         }
@@ -193,21 +211,23 @@ impl UberPhotoApp {
         }
     }
 
-    /// Allinea l'indice SQLite alla cartella appena scansionata e ne carica
+    /// Allinea l'indice SQLite al sottoalbero appena scansionato e ne carica
     /// le righe nello stato per ordinamenti e filtri.
+    ///
+    /// La scrittura avviene in un'unica transazione: con migliaia di foto
+    /// l'autocommit riga per riga bloccava il thread UI per decine di secondi.
     fn refresh_index_rows(&mut self, dir: &Path) {
         let Some(index) = &self.index else { return };
-        for entry in &self.state.entries {
-            if let Err(err) = index.upsert_file_info(entry) {
-                tracing::warn!("scrittura indice non riuscita: {err:#}");
-            }
+        if let Err(err) = index.upsert_file_info_batch(&self.state.entries) {
+            tracing::warn!("scrittura indice non riuscita: {err:#}");
         }
-        match index.load_dir(dir) {
+        match index.load_subtree(dir) {
             Ok(rows) => {
                 self.state.index_rows = rows
                     .into_iter()
                     .map(|row| (row.path.clone(), row))
                     .collect();
+                self.state.mark_index_changed();
             }
             Err(err) => tracing::warn!("lettura indice non riuscita: {err:#}"),
         }
@@ -227,10 +247,16 @@ impl UberPhotoApp {
         if self.state.exiftool.is_none() {
             return;
         }
+        let correnti: HashSet<&Path> = self
+            .state
+            .entries
+            .iter()
+            .map(|e| e.path.as_path())
+            .collect();
         self.state
             .meta
             .summarized
-            .retain(|path, _| self.state.entries.iter().any(|entry| &entry.path == path));
+            .retain(|path, _| correnti.contains(path.as_path()));
 
         let mut richieste = Vec::new();
         for entry in &self.state.entries {
@@ -257,29 +283,13 @@ impl UberPhotoApp {
         }
     }
 
-    /// Ricarica le righe indice della cartella corrente (dopo una scrittura).
-    fn reload_index_rows(&mut self) {
-        let (Some(index), Some(dir)) = (&self.index, self.state.current_dir.clone()) else {
-            return;
-        };
-        match index.load_dir(&dir) {
-            Ok(rows) => {
-                self.state.index_rows = rows
-                    .into_iter()
-                    .map(|row| (row.path.clone(), row))
-                    .collect();
-            }
-            Err(err) => tracing::warn!("lettura indice non riuscita: {err:#}"),
-        }
-    }
-
     /// Raccoglie gli esiti del motore metadati: aggiorna indice, documenti,
     /// form e barra di stato.
     fn pump_metadata_results(&mut self) {
+        let mut summary_batch: Vec<(PathBuf, Option<i64>, MetadataIndex)> = Vec::new();
         while let Some(outcome) = self.meta.try_recv() {
             match outcome {
                 MetadataOutcome::Summary { items } => {
-                    let mut index_updated = false;
                     for (path, summary) in items {
                         let mtime =
                             self.state.meta.pending_summary.remove(&path).or_else(|| {
@@ -288,7 +298,6 @@ impl UberPhotoApp {
                         if let Some(mtime) = mtime {
                             self.state.meta.summarized.insert(path.clone(), mtime);
                         }
-                        let Some(index) = &self.index else { continue };
                         let metadata = MetadataIndex {
                             has_gps: summary.has_gps,
                             rating: summary.rating,
@@ -304,14 +313,14 @@ impl UberPhotoApp {
                             gps_lat: summary.gps_lat,
                             gps_lon: summary.gps_lon,
                         };
-                        match index.upsert_metadata(&path, mtime, &metadata) {
-                            Ok(()) => index_updated = true,
-                            Err(err) => tracing::warn!("scrittura indice non riuscita: {err:#}"),
-                        }
+                        // Aggiorna subito la riga in memoria: l'ordinamento e
+                        // i filtri non devono rileggere tutta la tabella.
+                        self.state.apply_index_metadata(&path, mtime, &metadata);
+                        summary_batch.push((path, mtime, metadata));
                     }
-                    if index_updated {
-                        self.reload_index_rows();
-                        self.state.apply_sort();
+                    if !summary_batch.is_empty() {
+                        self.state.mark_index_changed();
+                        self.index_dirty = true;
                     }
                 }
                 MetadataOutcome::Full { items } => {
@@ -339,10 +348,11 @@ impl UberPhotoApp {
                             }
                         }
                     }
-                    if self.state.meta.form_paths == self.state.selected_paths() {
+                    let selected_paths = self.state.selected_paths();
+                    if self.state.meta.form_paths == selected_paths {
                         self.state.rebuild_meta_form();
                     }
-                    if self.state.gps.form_paths == self.state.selected_paths() {
+                    if self.state.gps.form_paths == selected_paths {
                         self.state.rebuild_gps_form();
                     }
                 }
@@ -358,10 +368,12 @@ impl UberPhotoApp {
                         continue;
                     }
                     let selected = self.state.selected_paths();
+                    let selected_set: HashSet<&Path> =
+                        selected.iter().map(PathBuf::as_path).collect();
                     let da_rileggere: Vec<PathBuf> = report
                         .updated
                         .iter()
-                        .filter(|path| selected.contains(path))
+                        .filter(|path| selected_set.contains(path.as_path()))
                         .cloned()
                         .collect();
                     for path in &report.updated {
@@ -382,6 +394,32 @@ impl UberPhotoApp {
                         });
                     }
                 }
+            }
+        }
+
+        if !summary_batch.is_empty() {
+            if let Some(index) = &self.index {
+                if let Err(err) = index.upsert_metadata_batch(&summary_batch) {
+                    tracing::warn!("scrittura indice non riuscita: {err:#}");
+                }
+            }
+        }
+
+        // Un solo riallineamento dell'ordine, e solo se la chiave dipende dai
+        // metadati. Durante l'arrivo dei riassunti il sort è calmierato.
+        if self.index_dirty {
+            let needs_sort = matches!(
+                self.state.sort_key,
+                SortKey::AcquisitionDate | SortKey::Rating
+            );
+            if !needs_sort {
+                self.index_dirty = false;
+            } else if self.state.meta.pending_summary.is_empty()
+                || self.last_index_sort.elapsed() >= Duration::from_millis(250)
+            {
+                self.state.apply_sort();
+                self.index_dirty = false;
+                self.last_index_sort = Instant::now();
             }
         }
     }
@@ -418,16 +456,17 @@ impl UberPhotoApp {
                                     LocationRole::Created,
                                     &suggestion.location_suggestion(),
                                 );
-                                self.state.gps.reverse_note = Some(format!(
-                                    "Località di scatto compilata da: {}",
-                                    suggestion.display_name
+                                self.state.gps.reverse_note = Some(t!(
+                                    "Località di scatto compilata da: {name}",
+                                    name = suggestion.display_name
                                 ));
                             }
                         }
                         Ok(None) => {
-                            self.state.gps.geo_error = Some(format!(
-                                "Nessuna località trovata per {:.6}, {:.6}",
-                                location.latitude, location.longitude
+                            self.state.gps.geo_error = Some(t!(
+                                "Nessuna località trovata per {lat}, {lng}",
+                                lat = format!("{:.6}", location.latitude),
+                                lng = format!("{:.6}", location.longitude)
                             ));
                         }
                         Err(error) => self.state.gps.geo_error = Some(error),
@@ -624,6 +663,14 @@ impl UberPhotoApp {
         self.state.edit.remember_draft();
     }
 
+    /// Ignora per un breve periodo gli eventi del watcher causati dalle
+    /// scritture dell'applicazione (rinomine, salvataggi, metadati).
+    fn suppress_watcher(&self) {
+        if let Some(watcher) = &self.watcher {
+            watcher.suppress_for(Duration::from_millis(800));
+        }
+    }
+
     /// Raccoglie gli eventi del servizio di esportazione.
     fn pump_export_results(&mut self) {
         for evento in self.export.drain() {
@@ -643,12 +690,16 @@ impl UberPhotoApp {
                     self.state.export.busy = false;
                     self.state.export.cancelled = cancelled;
                     let stato = if cancelled {
-                        "interrotta"
+                        t!("interrotta")
                     } else {
-                        "completata"
+                        t!("completata")
                     };
-                    self.state.export.summary = Some(format!(
-                        "Esportazione {stato}: {exported} riuscite, {failed} fallite su {total}."
+                    self.state.export.summary = Some(t!(
+                        "Esportazione {stato}: riuscite {exported}, fallite {failed} su {total}.",
+                        stato = stato,
+                        exported = exported,
+                        failed = failed,
+                        total = total
                     ));
                 }
             }
@@ -667,7 +718,8 @@ impl UberPhotoApp {
             .map(|asset| (asset.path.clone(), asset.format))
             .collect();
         if selezionati.is_empty() {
-            self.state.export.error = Some("Seleziona almeno una foto da esportare.".to_owned());
+            self.state.export.error =
+                Some(t!("Seleziona almeno una foto da esportare.").to_owned());
             return;
         }
         let items: Vec<ExportItem> = selezionati
@@ -685,7 +737,7 @@ impl UberPhotoApp {
         self.state.export.prepara(totale);
         if !self.export.start(job) {
             self.state.export.busy = false;
-            self.state.export.error = Some("Un'esportazione è già in corso.".to_owned());
+            self.state.export.error = Some(t!("Un'esportazione è già in corso.").to_owned());
         }
     }
 
@@ -695,16 +747,19 @@ impl UberPhotoApp {
             return;
         }
         if self.state.selection.is_empty() {
-            self.state.error = Some("Seleziona almeno una foto da salvare.".to_owned());
+            self.state.error = Some(t!("Seleziona almeno una foto da salvare.").to_owned());
             return;
         }
         if let Some(error) = &self.state.gps.manual_error {
-            self.state.error = Some(format!("Correggi la posizione prima di salvare: {error}"));
+            self.state.error = Some(t!(
+                "Correggi la posizione prima di salvare: {error}",
+                error = error
+            ));
             return;
         }
         if !self.state.has_pending_changes() {
             self.state.op_status = Some(OpStatus {
-                message: "Nessuna modifica da salvare.".to_owned(),
+                message: t!("Nessuna modifica da salvare.").to_owned(),
                 error: None,
                 undo: None,
             });
@@ -748,19 +803,21 @@ impl UberPhotoApp {
             dialog.targets.clone()
         };
         if targets.is_empty() {
-            dialog.error = Some("Nessuna modifica da salvare.".to_owned());
+            dialog.error = Some(t!("Nessuna modifica da salvare.").to_owned());
             dialog.targets.clear();
             self.state.save_dialog = Some(dialog);
             return;
         }
 
+        self.suppress_watcher();
         let mut requests = Vec::with_capacity(targets.len());
         let mut formati_non_supportati = Vec::new();
         for path in &targets {
-            let Some(asset) = self.state.entries.iter().find(|asset| &asset.path == path) else {
-                dialog.error = Some(format!(
-                    "{} non è più nella cartella corrente.",
-                    path.file_name()
+            let Some(asset) = self.state.entry(path) else {
+                dialog.error = Some(t!(
+                    "{name} non è più nella cartella corrente.",
+                    name = path
+                        .file_name()
                         .map(|name| name.to_string_lossy().into_owned())
                         .unwrap_or_else(|| path.display().to_string())
                 ));
@@ -791,14 +848,13 @@ impl UberPhotoApp {
         if !formati_non_supportati.is_empty() {
             let formati = formati_non_supportati.join(", ");
             dialog.error = Some(match mode {
-                SaveMode::NewCopy => format!(
-                    "La nuova copia è disponibile solo per JPEG, PNG, TIFF e WebP. \
-                     Formati non supportati: {formati}. Scegli “Sovrascrivi originale”."
+                SaveMode::NewCopy => t!(
+                    "La nuova copia è disponibile solo per JPEG, PNG, TIFF e WebP. Formati non supportati: {formats}. Scegli “Sovrascrivi originale”.",
+                    formats = formati
                 ),
-                SaveMode::Overwrite => format!(
-                    "Le modifiche non possono essere applicate a: {formati}. \
-                     Il colore richiede un formato modificabile; i metadati richiedono \
-                     scrittura embedded o sidecar XMP."
+                SaveMode::Overwrite => t!(
+                    "Le modifiche non possono essere applicate a: {formats}. Il colore richiede un formato modificabile; i metadati richiedono scrittura embedded o sidecar XMP.",
+                    formats = formati
                 ),
             });
             dialog.targets = targets;
@@ -815,7 +871,7 @@ impl UberPhotoApp {
         if !self.save.start(SaveJob { requests }) {
             if let Some(dialog) = self.state.save_dialog.as_mut() {
                 dialog.busy = false;
-                dialog.error = Some("Un salvataggio è già in corso.".to_owned());
+                dialog.error = Some(t!("Un salvataggio è già in corso.").to_owned());
             }
         }
     }
@@ -832,12 +888,13 @@ impl UberPhotoApp {
                 SaveEvent::Failed { source, error } => {
                     if let Some(dialog) = self.state.save_dialog.as_mut() {
                         if dialog.failure.is_none() {
-                            dialog.failure = Some(format!(
-                                "{}: {error}",
-                                source
+                            dialog.failure = Some(t!(
+                                "{name}: {error}",
+                                name = source
                                     .file_name()
                                     .map(|name| name.to_string_lossy().into_owned())
-                                    .unwrap_or_else(|| source.display().to_string())
+                                    .unwrap_or_else(|| source.display().to_string()),
+                                error = error
                             ));
                         }
                     }
@@ -910,11 +967,15 @@ impl UberPhotoApp {
             self.state.gps.coordinates_dirty = false;
             self.state.gps.draft_dirty = false;
             let messaggio = if nuove == saved {
-                format!("Salvate {saved} nuove foto.")
+                t!("Salvate {count} nuove foto.", count = saved)
             } else if nuove == 0 {
-                format!("Aggiornate {saved} foto.")
+                t!("Aggiornate {count} foto.", count = saved)
             } else {
-                format!("Salvate {saved} foto ({nuove} nuove copie).")
+                t!(
+                    "Foto salvate: {saved} ({new} nuove copie).",
+                    saved = saved,
+                    new = nuove
+                )
             };
             self.state.op_status = Some(OpStatus {
                 message: messaggio,
@@ -927,20 +988,30 @@ impl UberPhotoApp {
                 .clone()
                 .or_else(|| {
                     failures.first().map(|(path, error)| {
-                        format!(
-                            "{}: {error}",
-                            path.file_name()
+                        t!(
+                            "{name}: {error}",
+                            name = path
+                                .file_name()
                                 .map(|name| name.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| path.display().to_string())
+                                .unwrap_or_else(|| path.display().to_string()),
+                            error = error
                         )
                     })
                 })
                 .unwrap_or_default();
-            dialog.error = Some(format!(
-                "Salvate {saved} foto su {total}; {failed} non riuscite. {primo}"
+            dialog.error = Some(t!(
+                "Salvate: {saved} su {total}; non riuscite: {failed}. {first}",
+                saved = saved,
+                total = total,
+                failed = failed,
+                first = primo
             ));
             self.state.op_status = Some(OpStatus {
-                message: format!("Salvataggio incompleto: {saved} riuscite, {failed} fallite."),
+                message: t!(
+                    "Salvataggio incompleto: riuscite {saved}, fallite {failed}.",
+                    saved = saved,
+                    failed = failed
+                ),
                 error: Some(primo),
                 undo: None,
             });
@@ -953,6 +1024,7 @@ impl UberPhotoApp {
 
         if saved > 0 {
             if let Some(dir) = self.state.current_dir.clone() {
+                self.suppress_watcher();
                 self.start_scan(dir);
             }
         }
@@ -960,11 +1032,9 @@ impl UberPhotoApp {
 
     /// Scrittura rapida della valutazione dal menu contestuale della griglia.
     fn rate_metadata(&mut self, paths: Vec<PathBuf>, stars: u8) {
-        let items: Vec<WriteItem> = self
-            .state
-            .entries
+        let items: Vec<WriteItem> = paths
             .iter()
-            .filter(|entry| paths.contains(&entry.path))
+            .filter_map(|path| self.state.entry(path))
             .map(|entry| WriteItem {
                 path: entry.path.clone(),
                 format: entry.format,
@@ -975,62 +1045,100 @@ impl UberPhotoApp {
             })
             .collect();
         if !items.is_empty() {
+            self.suppress_watcher();
             self.meta.request(MetadataRequest::Write { items });
         }
     }
 
     fn pump_image_results(&mut self, ctx: &egui::Context) {
+        /// Quante texture caricare al massimo in un frame: l'upload in VRAM e
+        /// la conversione RGBA costano, e un batch di centinaia di miniature
+        /// congelava la UI.
+        const MAX_THUMB_UPLOADS_PER_FRAME: usize = 10;
+
+        // Le anteprime (una alla volta) hanno precedenza; le miniature
+        // restano in coda e vengono smaltite a poco a poco.
+        let mut previews = Vec::new();
         for result in self.images.drain() {
             match result.kind {
-                ImageKind::Thumbnail => {
-                    let path = result.path;
-                    self.thumbs
-                        .on_result(ctx, path.clone(), result.mtime, result.outcome);
-                    if let Some(index) = &self.index {
-                        if let Some((width, height)) = self.thumbs.dims(&path) {
-                            if let Err(err) = index.set_dimensions(&path, width, height) {
-                                tracing::warn!("scrittura indice non riuscita: {err:#}");
-                            }
-                        }
-                    }
-                }
-                ImageKind::Preview => {
-                    let path = result.path;
-                    let mtime = result.mtime;
-                    if self.preview.accepts(&path, mtime) {
-                        match &result.outcome {
-                            Ok(image) => self.preview.set_image(ctx, image),
-                            Err(error) => self.preview.set_error(error.clone()),
-                        }
-                    }
-                    if self.state.edit.path.as_deref() == Some(path.as_path())
-                        && self.state.edit.mtime == mtime
-                    {
-                        match result.outcome {
-                            Ok(image) => {
-                                self.state.edit.source =
-                                    Some(Arc::new(EditSource { path, mtime, image }));
-                                self.state.edit.source_requested = false;
-                                self.state.edit.source_error = None;
-                            }
-                            Err(error) => {
-                                self.state.edit.source_requested = false;
-                                self.state.edit.source_error = Some(error);
-                            }
-                        }
-                    } else if self.state.edit.source_requested {
-                        // Il worker "latest wins" ha servito una richiesta più
-                        // recente: la sorgente va chiesta di nuovo.
-                        self.state.edit.source_requested = false;
-                    }
+                ImageKind::Thumbnail => self.pending_images.push_back(result),
+                ImageKind::Preview => previews.push(result),
+            }
+        }
+
+        for result in previews {
+            let path = result.path;
+            let mtime = result.mtime;
+            if self.preview.accepts(&path, mtime) {
+                match &result.outcome {
+                    Ok(image) => self.preview.set_image(ctx, image),
+                    Err(error) => self.preview.set_error(error.clone()),
                 }
             }
+            if self.state.edit.path.as_deref() == Some(path.as_path())
+                && self.state.edit.mtime == mtime
+            {
+                match result.outcome {
+                    Ok(image) => {
+                        self.state.edit.source = Some(Arc::new(EditSource { path, mtime, image }));
+                        self.state.edit.source_requested = false;
+                        self.state.edit.source_error = None;
+                    }
+                    Err(error) => {
+                        self.state.edit.source_requested = false;
+                        self.state.edit.source_error = Some(error);
+                    }
+                }
+            } else if self.state.edit.source_requested {
+                // Il worker "latest wins" ha servito una richiesta più
+                // recente: la sorgente va chiesta di nuovo.
+                self.state.edit.source_requested = false;
+            }
+        }
+
+        let mut dimensions: Vec<(PathBuf, u32, u32)> = Vec::new();
+        let mut uploaded = 0usize;
+        while uploaded < MAX_THUMB_UPLOADS_PER_FRAME {
+            let Some(result) = self.pending_images.pop_front() else {
+                break;
+            };
+            // La cartella è cambiata: il risultato non serve più e non
+            // consuma il budget di upload di questo frame.
+            if result.epoch != self.thumbs.epoch() {
+                continue;
+            }
+            uploaded += 1;
+            let path = result.path;
+            self.thumbs.on_result(
+                ctx,
+                path.clone(),
+                result.mtime,
+                result.epoch,
+                result.outcome,
+            );
+            if let Some((width, height)) = self.thumbs.dims(&path) {
+                dimensions.push((path, width, height));
+            }
+        }
+
+        if !dimensions.is_empty() {
+            if let Some(index) = &self.index {
+                if let Err(err) = index.set_dimensions_batch(&dimensions) {
+                    tracing::warn!("scrittura indice non riuscita: {err:#}");
+                }
+            }
+        }
+        // Restano miniature da caricare: continua a ridisegnare finché la coda
+        // non si svuota, senza bloccare questo frame.
+        if !self.pending_images.is_empty() {
+            ctx.request_repaint();
         }
     }
 
     /// Raccoglie gli esiti delle operazioni su file: aggiorna l'indice,
     /// pubblica lo stato in barra e riallinea la vista alla cartella corrente.
     fn pump_ops_results(&mut self) {
+        let mut rescan = false;
         while let Some(outcome) = self.ops.try_recv() {
             let is_copy = outcome.description == "Copia";
             if !is_copy {
@@ -1044,17 +1152,45 @@ impl UberPhotoApp {
                     self.state.remap_photo_drafts(&pair.from, &pair.to);
                 }
             }
-            let undoable = outcome.description == "Spostamento"
-                && outcome.report.failed.is_empty()
-                && !outcome.report.moved.is_empty();
-            let message = outcome.report.summary(outcome.description);
+            let changed = !outcome.report.moved.is_empty();
+            let undoable =
+                outcome.description == "Spostamento" && outcome.report.failed.is_empty() && changed;
+            let verb = match outcome.description {
+                "Copia" => t!("Copia"),
+                "Spostamento" => t!("Spostamento"),
+                "Rinomina" => t!("Rinomina"),
+                _ => t!("Annullamento"),
+            };
+            let mut message = t!(
+                "{verb}: {count} file",
+                verb = verb,
+                count = outcome.report.moved.len()
+            );
+            if outcome.report.skipped_count() > 0 {
+                message.push_str(&t!(
+                    " · {count} saltati",
+                    count = outcome.report.skipped_count()
+                ));
+            }
+            if outcome.report.failed_count() > 0 {
+                message.push_str(&t!(
+                    " · {count} errori",
+                    count = outcome.report.failed_count()
+                ));
+            }
             let error = outcome.report.first_error();
+            if changed {
+                rescan = true;
+            }
             self.state.op_status = Some(OpStatus {
                 message,
                 error,
                 undo: if undoable { Some(outcome.report) } else { None },
             });
+        }
+        if rescan {
             if let Some(dir) = self.state.current_dir.clone() {
+                self.suppress_watcher();
                 self.start_scan(dir);
             }
         }
@@ -1063,7 +1199,7 @@ impl UberPhotoApp {
     fn handle_actions(&mut self, actions: UiActions) {
         let picked = if actions.pick_folder {
             rfd::FileDialog::new()
-                .set_title("Scegli la cartella da aprire")
+                .set_title(t!("Scegli la cartella da aprire"))
                 .pick_folder()
         } else {
             None
@@ -1072,12 +1208,15 @@ impl UberPhotoApp {
             if dir.is_dir() {
                 self.open_root(dir);
             } else {
-                self.state.error =
-                    Some(format!("La cartella \"{}\" non esiste più", dir.display()));
+                self.state.error = Some(t!(
+                    "La cartella \"{path}\" non esiste più",
+                    path = dir.display()
+                ));
             }
         }
         if let Some(dir) = actions.browse_dir {
             if self.state.current_dir.as_deref() != Some(dir.as_path()) {
+                self.reveal_tree_path(&dir);
                 self.start_scan(dir);
             }
         }
@@ -1097,9 +1236,9 @@ impl UberPhotoApp {
         if let Some(request) = actions.transfer {
             if let Some(target) = rfd::FileDialog::new()
                 .set_title(if request.copy {
-                    "Copia le foto in…"
+                    t!("Copia le foto in…")
                 } else {
-                    "Sposta le foto in…"
+                    t!("Sposta le foto in…")
                 })
                 .pick_folder()
             {
@@ -1126,7 +1265,7 @@ impl UberPhotoApp {
         if let Some(parent) = actions.create_folder {
             self.state.new_folder_prompt = Some(NewFolderPrompt {
                 parent,
-                name: "Nuova cartella".to_owned(),
+                name: t!("Nuova cartella").to_owned(),
                 first_frame: true,
             });
         }
@@ -1136,6 +1275,7 @@ impl UberPhotoApp {
         }
 
         if let Some((paths, target, copy, policy)) = actions.confirm_transfer {
+            self.suppress_watcher();
             self.ops.request(FileOpRequest::Transfer {
                 paths,
                 target,
@@ -1146,6 +1286,7 @@ impl UberPhotoApp {
         if let Some((target, new_name)) = actions.confirm_rename {
             match target {
                 RenameTarget::Photo(path) => {
+                    self.suppress_watcher();
                     self.ops.request(FileOpRequest::Rename {
                         path,
                         new_name,
@@ -1156,12 +1297,19 @@ impl UberPhotoApp {
             }
         }
         if let Some((parent, name)) = actions.confirm_new_folder {
+            self.suppress_watcher();
             match create_dir(&parent, &name) {
-                Ok(_) => self.refresh_tree_children(&parent),
+                Ok(_) => {
+                    self.refresh_tree_children(&parent);
+                    if self.state.current_dir.as_deref() == Some(parent.as_path()) {
+                        self.start_scan(parent);
+                    }
+                }
                 Err(message) => self.state.error = Some(message),
             }
         }
         if let Some(dir) = actions.confirm_delete_dir {
+            self.suppress_watcher();
             match delete_empty_dir(&dir) {
                 Ok(()) => {
                     if let Some(index) = &self.index {
@@ -1176,6 +1324,10 @@ impl UberPhotoApp {
                     if self.state.current_dir.as_deref() == Some(dir.as_path()) {
                         if let Some(parent) = dir.parent() {
                             self.start_scan(parent.to_path_buf());
+                        }
+                    } else if dir.parent() == self.state.current_dir.as_deref() {
+                        if let Some(current) = self.state.current_dir.clone() {
+                            self.start_scan(current);
                         }
                     }
                 }
@@ -1260,7 +1412,7 @@ impl UberPhotoApp {
 
         if actions.export_pick_destination {
             if let Some(cartella) = rfd::FileDialog::new()
-                .set_title("Cartella di destinazione dell'esportazione")
+                .set_title(t!("Cartella di destinazione dell'esportazione"))
                 .pick_folder()
             {
                 self.state.export.settings.destination = cartella;
@@ -1292,7 +1444,7 @@ impl UberPhotoApp {
         let recipe = self.state.edit.recipe;
         let Some(index) = &self.index else {
             self.state.edit.save_error =
-                Some("Preset non salvato: catalogo locale non disponibile".to_owned());
+                Some(t!("Preset non salvato: catalogo locale non disponibile").to_owned());
             return;
         };
         match index.save_preset(&nome, &recipe.to_json()) {
@@ -1317,7 +1469,10 @@ impl UberPhotoApp {
                 self.state.edit.save_error = None;
             }
             Err(err) => {
-                self.state.edit.save_error = Some(format!("Preset non salvato: {err:#}"));
+                self.state.edit.save_error = Some(t!(
+                    "Preset non salvato: {error}",
+                    error = format!("{err:#}")
+                ));
             }
         }
     }
@@ -1361,7 +1516,10 @@ impl UberPhotoApp {
                 self.state.edit.save_error = None;
             }
             Err(err) => {
-                self.state.edit.save_error = Some(format!("Preset non eliminato: {err:#}"));
+                self.state.edit.save_error = Some(t!(
+                    "Preset non eliminato: {error}",
+                    error = format!("{err:#}")
+                ));
             }
         }
     }
@@ -1371,7 +1529,7 @@ impl UberPhotoApp {
             return;
         }
         if self.state.current_dir.as_deref() == Some(target.as_path()) {
-            self.state.error = Some("Le foto si trovano già in questa cartella".to_owned());
+            self.state.error = Some(t!("Le foto si trovano già in questa cartella").to_owned());
             return;
         }
         self.state.conflict_prompt = Some(ConflictPrompt {
@@ -1384,6 +1542,7 @@ impl UberPhotoApp {
 
     /// Rinomina una cartella: aggiorna indice, albero, recenti e vista.
     fn apply_folder_rename(&mut self, dir: &Path, new_name: &str) {
+        self.suppress_watcher();
         let new_path = match rename_dir(dir, new_name) {
             Ok(path) => path,
             Err(message) => {
@@ -1419,7 +1578,26 @@ impl UberPhotoApp {
                 let mut updated = current;
                 update(&mut updated);
                 self.start_scan(updated);
+            } else if dir.starts_with(&current) {
+                self.start_scan(current);
             }
+        }
+    }
+
+    /// Espande il ramo dell'albero che contiene `path`, così la cartella
+    /// aperta dalla barra delle sottocartelle resta visibile a sinistra.
+    fn reveal_tree_path(&mut self, path: &Path) {
+        let mut error = None;
+        if let Some(root) = &mut self.state.root {
+            if let Some(node) = root.find_mut(path) {
+                node.expanded = true;
+                if let Some(message) = node.load_children() {
+                    error = Some(message);
+                }
+            }
+        }
+        if let Some(message) = error {
+            self.state.error = Some(message);
         }
     }
 
@@ -1467,7 +1645,7 @@ impl UberPhotoApp {
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.display().to_string()),
-            _ => format!("{total} fotografie"),
+            _ => t!("{count} fotografie", count = total),
         };
         let folder = targets
             .first()
@@ -1485,7 +1663,11 @@ impl UberPhotoApp {
             .collect();
         let altri = total.saturating_sub(nomi.len());
         let elenco = if altri > 0 {
-            format!("{} e altre {altri}", nomi.join(", "))
+            t!(
+                "{names} e {others} in più",
+                names = nomi.join(", "),
+                others = altri
+            )
         } else {
             nomi.join(", ")
         };
@@ -1570,7 +1752,7 @@ impl UberPhotoApp {
                             });
                     }
                     ui.vertical(|ui| {
-                        ui.heading("Salva le modifiche");
+                        ui.heading(t!("Salva le modifiche"));
                         ui.add_space(2.0);
                         ui.label(egui::RichText::new(file_label.clone()).strong());
                         ui.weak(elide(&folder, 64));
@@ -1579,21 +1761,21 @@ impl UberPhotoApp {
                             if modifiche_colore > 0 {
                                 riepilogo_badge(
                                     ui,
-                                    &format!("Colore · {modifiche_colore}"),
+                                    &t!("Colore · {count}", count = modifiche_colore),
                                     egui::Color32::from_rgb(110, 155, 209),
                                 );
                             }
                             if campi_meta > 0 {
                                 riepilogo_badge(
                                     ui,
-                                    &format!("Metadati · {campi_meta}"),
+                                    &t!("Metadati · {count}", count = campi_meta),
                                     egui::Color32::from_rgb(147, 190, 140),
                                 );
                             }
                             if campi_posizione > 0 {
                                 riepilogo_badge(
                                     ui,
-                                    &format!("Posizione · {campi_posizione}"),
+                                    &t!("Posizione · {count}", count = campi_posizione),
                                     egui::Color32::from_rgb(209, 173, 110),
                                 );
                             }
@@ -1604,18 +1786,18 @@ impl UberPhotoApp {
                 ui.add_space(12.0);
                 ui.separator();
                 ui.add_space(10.0);
-                ui.label(egui::RichText::new("Cosa vuoi fare?").strong());
-                ui.weak(format!("Interessa: {elenco}"));
+                ui.label(egui::RichText::new(t!("Cosa vuoi fare?")).strong());
+                ui.weak(t!("Interessa: {list}", list = elenco));
                 ui.add_space(8.0);
 
                 let nuova = dialog.mode == SaveMode::NewCopy;
                 let nuova_abilitata = formati_non_copiabili.is_empty() && !busy && assets_ready;
                 let nuova_hint = match &copia_esempio {
-                    Some(nome) => format!(
-                        "Crea “{nome}” accanto all'originale. Il file di partenza non \
-                         viene toccato."
+                    Some(nome) => t!(
+                        "Crea “{name}” accanto all'originale. Il file di partenza non viene toccato.",
+                        name = nome
                     ),
-                    None => "Crea una copia accanto all'originale.".to_owned(),
+                    None => t!("Crea una copia accanto all'originale.").to_owned(),
                 };
                 let nuova_response = mode_card(
                     ui,
@@ -1625,12 +1807,12 @@ impl UberPhotoApp {
                         enabled: nuova_abilitata,
                         accent: egui::Color32::from_rgb(110, 155, 209),
                         titolo: if total == 1 {
-                            "Nuova foto"
+                            t!("Nuova foto")
                         } else {
-                            "Nuove foto"
+                            t!("Nuove foto")
                         },
                         sottotitolo: &nuova_hint,
-                        badge: Some("Consigliato"),
+                        badge: Some(t!("Consigliato")),
                     },
                 );
                 if nuova_response.clicked() && nuova_abilitata {
@@ -1641,10 +1823,9 @@ impl UberPhotoApp {
 
                 if !nuova_abilitata {
                     ui.add_space(4.0);
-                    ui.weak(format!(
-                        "Non disponibile per {}: per questi formati scegli la \
-                         sovrascrittura (i metadati finiscono nel sidecar XMP).",
-                        formati_non_copiabili.join(", ")
+                    ui.weak(t!(
+                        "Non disponibile per {formats}: per questi formati scegli la sovrascrittura (i metadati finiscono nel sidecar XMP).",
+                        formats = formati_non_copiabili.join(", ")
                     ));
                 }
 
@@ -1657,11 +1838,11 @@ impl UberPhotoApp {
                         selected: sovrascrivi,
                         enabled: !busy && assets_ready,
                         accent: ERROR_COLOR,
-                        titolo: "Sovrascrivi originale",
+                        titolo: t!("Sovrascrivi originale"),
                         sottotitolo: if total == 1 {
-                            "Riscrive questa foto con colore e metadati. Non è annullabile."
+                            t!("Riscrive questa foto con colore e metadati. Non è annullabile.")
                         } else {
-                            "Riscrive le foto selezionate con colore e metadati. Non è annullabile."
+                            t!("Riscrive le foto selezionate con colore e metadati. Non è annullabile.")
                         },
                         badge: None,
                     },
@@ -1680,18 +1861,17 @@ impl UberPhotoApp {
                         .corner_radius(egui::CornerRadius::same(8))
                         .inner_margin(egui::Margin::symmetric(10, 8))
                         .show(ui, |ui| {
-                            ui.colored_label(ERROR_COLOR, "Attenzione");
-                            ui.weak(
-                                "L'originale verrà riscritto sul disco. Non esiste un \
-                                 annullamento: per sicurezza usa “Nuova foto”.",
-                            );
+                            ui.colored_label(ERROR_COLOR, t!("Attenzione"));
+                            ui.weak(t!(
+                                "L'originale verrà riscritto sul disco. Non esiste un annullamento: per sicurezza usa “Nuova foto”."
+                            ));
                             ui.add_space(4.0);
                             ui.checkbox(
                                 &mut dialog.overwrite_confirmed,
                                 if total == 1 {
-                                    "Confermo di voler sovrascrivere l'originale"
+                                    t!("Confermo di voler sovrascrivere l'originale")
                                 } else {
-                                    "Confermo di voler sovrascrivere gli originali"
+                                    t!("Confermo di voler sovrascrivere gli originali")
                                 },
                             );
                         });
@@ -1708,22 +1888,22 @@ impl UberPhotoApp {
                 ui.horizontal(|ui| {
                     if busy {
                         ui.spinner();
-                        ui.weak("Scrittura dei file…");
+                        ui.weak(t!("Scrittura dei file…"));
                     } else if !assets_ready {
                         ui.spinner();
-                        ui.weak("Aggiornamento della cartella…");
+                        ui.weak(t!("Aggiornamento della cartella…"));
                     } else {
                         ui.weak(if dialog.mode == SaveMode::NewCopy {
-                            "Viene creato un nuovo file; l'originale resta intatto."
+                            t!("Viene creato un nuovo file; l'originale resta intatto.")
                         } else {
-                            "Il salvataggio viene confermato solo dopo la verifica del file."
+                            t!("Il salvataggio viene confermato solo dopo la verifica del file.")
                         });
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let etichetta = match dialog.mode {
-                            SaveMode::NewCopy if total == 1 => "Salva nuova foto",
-                            SaveMode::NewCopy => "Salva nuove foto",
-                            SaveMode::Overwrite => "Sovrascrivi",
+                            SaveMode::NewCopy if total == 1 => t!("Salva nuova foto"),
+                            SaveMode::NewCopy => t!("Salva nuove foto"),
+                            SaveMode::Overwrite => t!("Sovrascrivi"),
                         };
                         let confermabile = pending
                             && !busy
@@ -1749,7 +1929,7 @@ impl UberPhotoApp {
                             confirm = Some(dialog.mode);
                         }
                         if ui
-                            .add_enabled(!busy, egui::Button::new("Annulla"))
+                            .add_enabled(!busy, egui::Button::new(t!("Annulla")))
                             .clicked()
                         {
                             close = true;
@@ -1788,25 +1968,24 @@ impl UberPhotoApp {
             )
             .show(ctx, |ui| {
                 ui.set_width(430.0);
-                ui.heading("Modifiche non salvate");
+                ui.heading(t!("Modifiche non salvate"));
                 ui.add_space(6.0);
-                ui.label(
-                    "Le modifiche a colore, metadati o posizione non sono state \
-                     salvate su file. Se chiudi ora andranno perse.",
-                );
+                ui.label(t!(
+                    "Le modifiche a colore, metadati o posizione non sono state salvate su file. Se chiudi ora andranno perse."
+                ));
                 ui.add_space(14.0);
                 ui.separator();
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    ui.weak("Puoi tornare indietro e usare Salva (Ctrl+S).");
+                    ui.weak(t!("Puoi tornare indietro e usare Salva (Ctrl+S)."));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let chiudi = egui::Button::new(
-                            egui::RichText::new("Chiudi senza salvare").color(ERROR_COLOR),
+                            egui::RichText::new(t!("Chiudi senza salvare")).color(ERROR_COLOR),
                         );
                         if ui.add(chiudi).clicked() {
                             close = true;
                         }
-                        if ui.button("Continua a lavorare").clicked() {
+                        if ui.button(t!("Continua a lavorare")).clicked() {
                             stay = true;
                         }
                     });
@@ -1832,45 +2011,49 @@ impl UberPhotoApp {
         let mut cancelled = false;
         if let Some(prompt) = self.state.conflict_prompt.as_mut() {
             let title = if prompt.copy {
-                "Copia le foto"
+                t!("Copia le foto")
             } else {
-                "Sposta le foto"
+                t!("Sposta le foto")
             };
             egui::Window::new(title)
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| {
-                    ui.label(format!(
-                        "{} file verso {}",
-                        prompt.paths.len(),
-                        elide(&prompt.target.display().to_string(), 48)
+                    ui.label(t!(
+                        "{count} file verso {target}",
+                        count = prompt.paths.len(),
+                        target = elide(&prompt.target.display().to_string(), 48)
                     ));
                     ui.add_space(8.0);
-                    ui.checkbox(&mut prompt.copy, "Copia invece di spostare");
+                    ui.checkbox(&mut prompt.copy, t!("Copia invece di spostare"));
                     ui.add_space(8.0);
-                    ui.label("Se il nome esiste già nella destinazione:");
+                    ui.label(t!("Se il nome esiste già nella destinazione:"));
                     ui.radio_value(
                         &mut prompt.policy,
                         ConflictPolicy::RenameAuto,
-                        "Rinomina automaticamente (foto (1).jpg)",
+                        t!("Rinomina automaticamente (foto (1).jpg)"),
                     );
                     ui.radio_value(
                         &mut prompt.policy,
                         ConflictPolicy::Replace,
-                        "Sostituisci il file esistente",
+                        t!("Sostituisci il file esistente"),
                     );
                     ui.radio_value(
                         &mut prompt.policy,
                         ConflictPolicy::Skip,
-                        "Salta i file già presenti",
+                        t!("Salta i file già presenti"),
                     );
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        if ui.button("Annulla").clicked() {
+                        if ui.button(t!("Annulla")).clicked() {
                             cancelled = true;
                         }
-                        let label = if prompt.copy { "Copia" } else { "Sposta" };
+                        let label = if prompt.copy {
+                            t!("Copia")
+                        } else {
+                            t!("Sposta")
+                        };
                         if ui.button(label).clicked() {
                             confirmed = true;
                         }
@@ -1892,8 +2075,8 @@ impl UberPhotoApp {
         let mut cancelled = false;
         if let Some(prompt) = self.state.rename_prompt.as_mut() {
             let title = match &prompt.target {
-                RenameTarget::Photo(_) => "Rinomina foto",
-                RenameTarget::Folder(_) => "Rinomina cartella",
+                RenameTarget::Photo(_) => t!("Rinomina foto"),
+                RenameTarget::Folder(_) => t!("Rinomina cartella"),
             };
             egui::Window::new(title)
                 .collapsible(false)
@@ -1912,10 +2095,10 @@ impl UberPhotoApp {
                         && ui.input(|input| input.key_pressed(egui::Key::Enter));
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        if ui.button("Annulla").clicked() {
+                        if ui.button(t!("Annulla")).clicked() {
                             cancelled = true;
                         }
-                        if ui.button("Rinomina").clicked() || enter {
+                        if ui.button(t!("Rinomina")).clicked() || enter {
                             confirmed = true;
                         }
                     });
@@ -1937,14 +2120,14 @@ impl UberPhotoApp {
         let mut confirmed = false;
         let mut cancelled = false;
         if let Some(prompt) = self.state.new_folder_prompt.as_mut() {
-            egui::Window::new("Nuova cartella")
+            egui::Window::new(t!("Nuova cartella"))
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| {
-                    ui.label(format!(
-                        "Dentro {}",
-                        elide(&prompt.parent.display().to_string(), 48)
+                    ui.label(t!(
+                        "Dentro {path}",
+                        path = elide(&prompt.parent.display().to_string(), 48)
                     ));
                     ui.add_space(6.0);
                     let response =
@@ -1957,10 +2140,10 @@ impl UberPhotoApp {
                         && ui.input(|input| input.key_pressed(egui::Key::Enter));
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        if ui.button("Annulla").clicked() {
+                        if ui.button(t!("Annulla")).clicked() {
                             cancelled = true;
                         }
-                        if ui.button("Crea").clicked() || enter {
+                        if ui.button(t!("Crea")).clicked() || enter {
                             confirmed = true;
                         }
                     });
@@ -1982,39 +2165,37 @@ impl UberPhotoApp {
         let mut confirmed = false;
         let mut cancelled = false;
         if let Some(prompt) = self.state.delete_dir_prompt.as_mut() {
-            egui::Window::new("Elimina cartella")
+            egui::Window::new(t!("Elimina cartella"))
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| {
-                    ui.label(format!(
-                        "Eliminare \"{}\"?",
-                        elide(&prompt.dir.display().to_string(), 48)
+                    ui.label(t!(
+                        "Eliminare \"{name}\"?",
+                        name = elide(&prompt.dir.display().to_string(), 48)
                     ));
                     ui.add_space(6.0);
                     if prompt.items == 0 {
-                        ui.weak(
-                            "La cartella è vuota e verrà rimossa dal disco. \
-                             L'operazione non è annullabile.",
-                        );
+                        ui.weak(t!(
+                            "La cartella è vuota e verrà rimossa dal disco. L'operazione non è annullabile."
+                        ));
                     } else {
                         ui.colored_label(
                             ERROR_COLOR,
-                            format!(
-                                "La cartella contiene {} elementi: UberPhoto elimina \
-                                 solo cartelle vuote.",
-                                prompt.items
+                            t!(
+                                "La cartella contiene {count} elementi: UberPhoto elimina solo cartelle vuote.",
+                                count = prompt.items
                             ),
                         );
                     }
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        if ui.button("Annulla").clicked() {
+                        if ui.button(t!("Annulla")).clicked() {
                             cancelled = true;
                         }
                         let enabled = prompt.items == 0;
                         if ui
-                            .add_enabled(enabled, egui::Button::new("Elimina"))
+                            .add_enabled(enabled, egui::Button::new(t!("Elimina")))
                             .clicked()
                         {
                             confirmed = true;
@@ -2036,14 +2217,20 @@ impl UberPhotoApp {
         let ctrl_s = ui
             .ctx()
             .input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::S));
-        let pending = self.state.has_pending_changes();
-        let count = self.state.save_targets().len();
-        let altrove = self
-            .state
-            .pending_paths()
-            .into_iter()
-            .filter(|path| !self.state.selection.contains(path))
-            .count();
+        let dirty = self.state.has_unsaved_changes();
+        let count = if dirty {
+            self.state.save_target_count()
+        } else {
+            0
+        };
+        let pending = count > 0;
+        // Il conteggio delle bozze fuori selezione evita di clonare tutti i
+        // percorsi: si calcola solo se esistono davvero modifiche non salvate.
+        let altrove = if dirty {
+            self.state.pending_outside_selection_count()
+        } else {
+            0
+        };
         let gps_error = self.state.gps.manual_error.is_some();
         let busy = self.save.busy()
             || self
@@ -2061,41 +2248,44 @@ impl UberPhotoApp {
 
             if busy {
                 ui.spinner();
-                ui.weak("Salvataggio in corso…");
+                ui.weak(t!("Salvataggio in corso…"));
             } else if gps_error {
                 ui.colored_label(
                     ERROR_COLOR,
-                    "● Coordinate non valide: correggi prima di salvare",
+                    t!("• Coordinate non valide: correggi prima di salvare"),
                 );
             } else if pending {
                 ui.colored_label(
                     egui::Color32::from_rgb(110, 155, 209),
                     if count == 1 {
-                        "● 1 foto con modifiche non salvate".to_owned()
+                        t!("• 1 foto con modifiche non salvate").to_owned()
                     } else {
-                        format!("● {count} foto con modifiche non salvate")
+                        t!("• {count} foto con modifiche non salvate", count = count)
                     },
                 );
                 if altrove > 0 {
-                    ui.weak(format!("· {altrove} fuori selezione"));
+                    ui.weak(t!("· {count} fuori selezione", count = altrove));
                 }
             } else if altrove > 0 {
                 ui.colored_label(
                     egui::Color32::from_rgb(110, 155, 209),
                     if altrove == 1 {
-                        "● 1 bozza non salvata fuori selezione".to_owned()
+                        t!("• 1 bozza non salvata fuori selezione").to_owned()
                     } else {
-                        format!("● {altrove} bozze non salvate fuori selezione")
+                        t!(
+                            "• {count} bozze non salvate fuori selezione",
+                            count = altrove
+                        )
                     },
                 )
-                .on_hover_text("Seleziona quelle foto per salvarle con Salva");
+                .on_hover_text(t!("Seleziona quelle foto per salvarle con Salva"));
             } else {
-                ui.weak("Tutto salvato");
+                ui.weak(t!("Tutto salvato"));
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let salva = egui::Button::new(
-                    egui::RichText::new("Salva")
+                    egui::RichText::new(t!("Salva"))
                         .strong()
                         .color(egui::Color32::from_rgb(14, 18, 24)),
                 )
@@ -2103,7 +2293,7 @@ impl UberPhotoApp {
                 .min_size(egui::vec2(96.0, 28.0));
                 if ui
                     .add_enabled(pending && !busy && !gps_error, salva)
-                    .on_hover_text("Salva colore, metadati e posizione (Ctrl+S)")
+                    .on_hover_text(t!("Salva colore, metadati e posizione (Ctrl+S)"))
                     .clicked()
                 {
                     actions.save_open = true;
@@ -2112,6 +2302,21 @@ impl UberPhotoApp {
                     actions.save_open = true;
                 }
                 ui.weak("Ctrl+S");
+                ui.separator();
+                ui.menu_button(format!("🌐 {}", self.state.language.native_name()), |ui| {
+                    for language in Language::ALL {
+                        let selected = language == self.state.language;
+                        if ui
+                            .selectable_label(selected, language.native_name())
+                            .clicked()
+                        {
+                            self.state.set_language(language);
+                            ui.close();
+                        }
+                    }
+                })
+                .response
+                .on_hover_text(t!("Lingua dell'interfaccia"));
             });
         });
     }
@@ -2122,31 +2327,35 @@ impl UberPhotoApp {
         ui.horizontal(|ui| {
             if self.state.loading_dir.is_some() {
                 ui.spinner();
-                ui.label("Scansione in corso…");
+                ui.label(t!("Scansione in corso…"));
             } else if let Some(dir) = &self.state.current_dir {
-                ui.label(format!(
-                    "{} — {} fotografie",
-                    elide(&dir.display().to_string(), 70),
-                    self.state.entries.len()
+                ui.label(t!(
+                    "{folder} — {count} fotografie",
+                    folder = elide(&dir.display().to_string(), 70),
+                    count = self.state.entries.len()
                 ));
             } else {
-                ui.label("Nessuna cartella aperta");
+                ui.label(t!("Nessuna cartella aperta"));
             }
 
             ui.separator();
             match self.state.selection.len() {
                 0 => {}
                 1 => {
-                    ui.label("1 selezionata");
+                    ui.label(t!("1 selezionata"));
                 }
                 count => {
-                    ui.label(format!("{count} selezionate"));
+                    ui.label(t!("{count} selezionate", count = count));
                 }
             }
 
             let (cached, inflight) = self.thumbs.stats();
             ui.separator();
-            ui.weak(format!("Miniature: {cached} in cache · {inflight} in coda"));
+            ui.weak(t!(
+                "Miniature: {cached} in cache · {inflight} in coda",
+                cached = cached,
+                inflight = inflight
+            ));
 
             if let Some(status) = &self.state.op_status {
                 ui.separator();
@@ -2154,7 +2363,7 @@ impl UberPhotoApp {
                 if let Some(error) = &status.error {
                     ui.colored_label(ERROR_COLOR, elide(error, 70));
                 }
-                if status.undo.is_some() && ui.small_button("↩ Annulla").clicked() {
+                if status.undo.is_some() && ui.small_button(t!("↩ Annulla")).clicked() {
                     undo_requested = true;
                 }
                 if ui.small_button("✕").clicked() {
@@ -2177,6 +2386,7 @@ impl UberPhotoApp {
         if undo_requested {
             if let Some(status) = self.state.op_status.take() {
                 if let Some(report) = status.undo {
+                    self.suppress_watcher();
                     self.ops.request(FileOpRequest::Undo { report });
                 }
             }
@@ -2366,22 +2576,23 @@ fn nome_copia_libera(path: &Path) -> String {
     let stem = path
         .file_stem()
         .map(|value| value.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "foto".to_owned());
+        .unwrap_or_else(|| t!("foto").to_owned());
     let estensione = path
         .extension()
         .map(|value| value.to_string_lossy().into_owned())
         .unwrap_or_else(|| "jpg".to_owned());
     for indice in 1..10_000 {
+        let suffisso = t!("modificata");
         let nome = if indice == 1 {
-            format!("{stem}-modificata.{estensione}")
+            format!("{stem}-{suffisso}.{estensione}")
         } else {
-            format!("{stem}-modificata-{indice}.{estensione}")
+            format!("{stem}-{suffisso}-{indice}.{estensione}")
         };
         if !path.with_file_name(&nome).exists() {
             return nome;
         }
     }
-    format!("{stem}-modificata-9999.{estensione}")
+    format!("{stem}-{}-9999.{estensione}", t!("modificata"))
 }
 
 fn setup_visuals(ctx: &egui::Context) {
@@ -2465,6 +2676,14 @@ impl eframe::App for UberPhotoApp {
         self.sync_metadata();
         self.sync_edit(&ctx);
 
+        // Le scritture dell'app (metadati, salvataggi, spostamenti) non
+        // devono far scattare una seconda scansione: il watcher le ignora
+        // finché il servizio corrispondente è al lavoro, più un margine.
+        let writing = self.ops.busy() || self.meta.busy() || self.save.busy();
+        if let Some(watcher) = &self.watcher {
+            watcher.set_suppressed(writing);
+        }
+
         // Modifiche esterne alla cartella corrente: riscansione calmierata.
         let settled = self
             .watcher
@@ -2529,9 +2748,9 @@ impl eframe::App for UberPhotoApp {
             if self.state.save_dialog.is_some() || self.save.busy() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 let message = if self.save.busy() {
-                    "Salvataggio in corso: attendi la fine prima di chiudere."
+                    t!("Salvataggio in corso: attendi la fine prima di chiudere.")
                 } else {
-                    "Completa o annulla il salvataggio prima di chiudere."
+                    t!("Completa o annulla il salvataggio prima di chiudere.")
                 };
                 self.state.op_status = Some(OpStatus {
                     message: message.to_owned(),

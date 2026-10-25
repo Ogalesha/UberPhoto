@@ -9,11 +9,22 @@ e il progetto aderisce a [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
+- Disinstallazione completa su tutti i sistemi: `uberphoto --uninstall` elimina indice, impostazioni, preset, cartelle recenti e cache delle mappe dalla cartella dati utente; l'uninstaller Windows rimuove anche `%APPDATA%\UberPhoto`, e la guida documenta la rimozione totale del programma su Linux, macOS e Windows.
+
+## [0.4.0] - 2026-10-24
+
+### Added
+
+- Vista cartella aggregata: aprendo una cartella si vedono le foto della cartella e di tutte le sue sottocartelle, con una barra delle sottocartelle dirette sopra la griglia per restringere la vista a un ramo.
 - Salvataggio manuale unificato con `Salva` nella barra superiore e `Ctrl+S`: dialogo con scelta tra nuova copia (`nome-modificata.ext`, collisioni progressive) e sovrascrittura dell'originale con conferma esplicita.
 - Nuovo servizio di salvataggio in `uberphoto-export`: rendering su file temporaneo nella stessa cartella, applicazione metadati verificata, sostituzione atomica, rollback sui fallimenti e gestione dei lotti con errori parziali.
 - Bozze in memoria per colore, metadati e posizione, conservate per foto anche cambiando selezione; il salvataggio include solo le foto selezionate che hanno bozze.
 - Test del salvataggio: nome automatico, sovrascrittura con pixel e metadati, copia con metadati, rollback su errore e collisioni.
 - Conferma alla chiusura quando restano bozze non salvate e blocco della chiusura durante un salvataggio in corso.
+- Interfaccia localizzata in italiano, inglese, tedesco, francese, spagnolo, polacco, turco, russo e albanese, con selettore nella barra superiore, persistenza della scelta e rilevamento della lingua di sistema (variabili d'ambiente con fallback `sys-locale`).
+- Forme plurali per i messaggi con conteggio, con regole dedicate a russo e polacco (`una|poche|molte`) e test automatici; i messaggi di riepilogo senza conteggio usano etichette neutre rispetto al numero.
+- Font emoji monocromatici inclusi nel binario, così le icone dell'interfaccia sono identiche su tutte le piattaforme; un test verifica la copertura di tutti i caratteri del catalogo e dei nomi delle lingue.
+- Test di persistenza della lingua scelta e test di copertura dei segnaposto per tutte le varianti.
 
 ### Changed
 
@@ -22,6 +33,9 @@ e il progetto aderisce a [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - L'esportazione usa le bozze correnti delle ricette, così colore e file esportato restano coerenti.
 - Gli errori di coordinate manuali bloccano il salvataggio finché non vengono corretti.
 - Le bozze di colore, metadati e posizione seguono rinomina e spostamento di file e cartelle.
+- L'osservazione delle modifiche esterne è ricorsiva: la vista aggregata si aggiorna anche quando cambia una sottocartella.
+- Le stringhe dell'interfaccia passano da un catalogo di traduzioni con fallback italiano; i messaggi dinamici usano segnaposto e il catalogo è coperto da test di completezza e ordinamento.
+- I messaggi di esito di salvataggio ed esportazione non concordano più il participio con un numero variabile: usano etichette come «riuscite: N» e «fallite: N».
 
 ### Fixed
 
@@ -30,10 +44,12 @@ e il progetto aderisce a [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - I form metadati e GPS si ricostruiscono quando i documenti tornano disponibili, senza restare vuoti dopo un salvataggio o una rilettura.
 - Le bozze metadati e GPS non vengono più perse cambiando selezione: restano associate alla singola foto.
 - Dopo un salvataggio o una rilettura la cache metadati viene invalidata anche per i file con sidecar XMP, così i valori verificati compaiono subito nei form.
+- Corrette alcune traduzioni: «Posizione» in polacco non è più «Stanowisko» (posto di lavoro), la maiuscola dopo il punto e virgola in turco e spagnolo, e le forme singolari/plurali di foto e file in tutte le lingue.
 
 ### Documentation
 
-- README aggiornato con il flusso di salvataggio manuale, le garanzie di rollback e il nuovo significato delle ricette in bozza.
+- README aggiornato con il flusso di salvataggio manuale, le garanzie di rollback, il nuovo significato delle ricette in bozza e le lingue dell'interfaccia.
+- Esempio di tag di release aggiornato a `v0.4.0`.
 
 ## [0.3.0] - 2026-10-19
 
@@ -105,7 +121,8 @@ e il progetto aderisce a [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - CI GitHub Actions su Ubuntu, macOS e Windows (formato, clippy, test) e workflow di release con binari scaricabili per i tag `v*`.
 - Smoke test GUI headless (Xvfb) nella CI Linux.
 
-[Unreleased]: https://github.com/Ogalesha/UberPhoto/compare/v0.3.0...main
+[Unreleased]: https://github.com/Ogalesha/UberPhoto/compare/v0.4.0...main
+[0.4.0]: https://github.com/Ogalesha/UberPhoto/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Ogalesha/UberPhoto/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/Ogalesha/UberPhoto/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Ogalesha/UberPhoto/compare/v0.1.0...v0.2.0

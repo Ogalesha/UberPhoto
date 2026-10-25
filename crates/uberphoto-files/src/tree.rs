@@ -70,13 +70,22 @@ impl DirNode {
 /// Sotto-cartelle dirette di `path`, ordinate naturalmente, nascoste escluse.
 /// I symlink verso directory sono seguiti in lettura.
 pub fn load_subdirs(path: &Path) -> std::io::Result<Vec<DirNode>> {
+    load_subdirs_filtered(path, false)
+}
+
+/// Come [`load_subdirs`], ma permette di includere le cartelle nascoste.
+/// Usato dalla scansione ricorsiva per rispettare `include_hidden`.
+pub(crate) fn load_subdirs_filtered(
+    path: &Path,
+    include_hidden: bool,
+) -> std::io::Result<Vec<DirNode>> {
     let mut dirs = Vec::new();
 
     for entry in fs::read_dir(path)? {
         let Ok(entry) = entry else { continue };
 
         let name = entry.file_name().to_string_lossy().into_owned();
-        if is_hidden_name(&name) {
+        if !include_hidden && is_hidden_name(&name) {
             continue;
         }
 

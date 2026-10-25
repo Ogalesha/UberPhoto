@@ -16,7 +16,11 @@ use eframe::egui;
 use uberphoto_core::GpsLocation;
 use uberphoto_metadata::{LocationField, LocationRole};
 
+use crate::i18n::{
+    location_field_hint, location_field_label, location_role_hint, location_role_label,
+};
 use crate::state::{AppState, GpsState, SuggestionTarget, UiActions};
+use crate::t;
 use crate::util::elide;
 
 const MAP_HEIGHT: f32 = 250.0;
@@ -26,13 +30,10 @@ const LARGE_MAP_HEIGHT: f32 = 420.0;
 pub fn ui(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
     if state.exiftool.is_none() {
         ui.add_space(10.0);
-        ui.strong("Posizione GPS non disponibile");
+        ui.strong(t!("Posizione GPS non disponibile"));
         ui.add_space(6.0);
         ui.weak(
-            "ExifTool non è stato trovato. Installa exiftool (pacchetto \
-             libimage-exiftool-perl su Ubuntu) oppure imposta la variabile \
-             UBERPHOTO_EXIFTOOL con il percorso dell'eseguibile, poi riavvia \
-             UberPhoto.",
+            t!("ExifTool non è stato trovato. Installa exiftool (pacchetto libimage-exiftool-perl su Ubuntu) oppure imposta la variabile UBERPHOTO_EXIFTOOL con il percorso dell'eseguibile, poi riavvia UberPhoto."),
         );
         return;
     }
@@ -40,12 +41,11 @@ pub fn ui(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
     let selected = state.selected_paths();
     if selected.is_empty() {
         ui.add_space(8.0);
-        ui.weak("Nessuna foto selezionata.");
+        ui.weak(t!("Nessuna foto selezionata."));
         ui.add_space(6.0);
-        ui.weak(
-            "Seleziona una o più foto per leggerne la posizione e salvarla \
-             nei metadati.",
-        );
+        ui.weak(t!(
+            "Seleziona una o più foto per leggerne la posizione e salvarla nei metadati."
+        ));
         return;
     }
 
@@ -59,7 +59,7 @@ pub fn ui(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
                 let nome = path
                     .file_name()
                     .and_then(|name| name.to_str())
-                    .unwrap_or("file")
+                    .unwrap_or(t!("file"))
                     .to_owned();
                 state
                     .meta
@@ -69,17 +69,20 @@ pub fn ui(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
             })
             .collect();
         for (nome, errore) in &errori {
-            ui.colored_label(ui.visuals().error_fg_color, format!("{nome}: {errore}"));
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                t!("{name}: {error}", name = nome, error = errore),
+            );
         }
         if errori.is_empty() {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.weak("Lettura dei metadati…");
+                ui.weak(t!("Lettura dei metadati…"));
             });
         }
         ui.add_space(6.0);
-        if ui.button("Ricarica").clicked() {
+        if ui.button(t!("Ricarica")).clicked() {
             actions.metadata_reload = true;
         }
         return;
@@ -87,11 +90,11 @@ pub fn ui(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
 
     ui.horizontal(|ui| {
         ui.strong(if selected.len() == 1 {
-            "1 foto selezionata".to_owned()
+            t!("1 foto selezionata").to_owned()
         } else {
-            format!("{} foto selezionate", selected.len())
+            t!("{count} foto selezionate", count = selected.len())
         });
-        if ui.small_button("Ricarica").clicked() {
+        if ui.small_button(t!("Ricarica")).clicked() {
             actions.metadata_reload = true;
         }
     });
@@ -107,10 +110,9 @@ pub fn ui(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
     if let Some(asset) = state.selected_assets().first() {
         if !asset.format.capabilities().embedded_metadata {
             ui.add_space(6.0);
-            ui.weak(format!(
-                "{} non supporta metadati incorporati: coordinate e località \
-                 saranno scritte nel sidecar accanto al file.",
-                asset.format.label()
+            ui.weak(t!(
+                "{format} non supporta metadati incorporati: coordinate e località saranno scritte nel sidecar accanto al file.",
+                format = asset.format.label()
             ));
         }
     }
@@ -188,17 +190,17 @@ fn mappa(ui: &mut egui::Ui, state: &mut AppState, height: f32) {
 
     ui.horizontal(|ui| {
         if ui
-            .add_enabled(marker.is_some(), egui::Button::new("Centra").small())
+            .add_enabled(marker.is_some(), egui::Button::new(t!("Centra")).small())
             .clicked()
         {
             state.center_gps_map(marker);
             state.gps.centered_for = marker;
         }
-        if ui.small_button("Mappa grande").clicked() {
+        if ui.small_button(t!("Mappa grande")).clicked() {
             state.gps.large_map = true;
         }
         ui.weak(format!("© {}", attribution.text));
-        ui.hyperlink_to("Licenza", attribution.url);
+        ui.hyperlink_to(t!("Licenza"), attribution.url);
     });
 }
 
@@ -216,11 +218,10 @@ fn disegna_marker(painter: &egui::Painter, pos: egui::Pos2, dragging: bool) {
 /// Coordinate manuali e azioni sulla selezione.
 fn coordinate(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions, count: usize) {
     ui.add_space(8.0);
-    ui.strong("Coordinate");
+    ui.strong(t!("Coordinate"));
     if state.gps.marker_mixed {
         ui.weak(
-            "Le foto selezionate hanno coordinate diverse (o alcune ne sono \
-             prive): le coordinate applicate valgono per tutte.",
+            t!("Le foto selezionate hanno coordinate diverse (o alcune ne sono prive): le coordinate applicate valgono per tutte."),
         );
     }
 
@@ -229,7 +230,7 @@ fn coordinate(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions, 
         .num_columns(2)
         .spacing([10.0, 6.0])
         .show(ui, |ui| {
-            ui.label("Latitudine");
+            ui.label(t!("Latitudine"));
             cambiato |= ui
                 .add(
                     egui::TextEdit::singleline(&mut state.gps.manual_lat)
@@ -239,7 +240,7 @@ fn coordinate(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions, 
                 .changed();
             ui.end_row();
 
-            ui.label("Longitudine");
+            ui.label(t!("Longitudine"));
             cambiato |= ui
                 .add(
                     egui::TextEdit::singleline(&mut state.gps.manual_lon)
@@ -249,11 +250,11 @@ fn coordinate(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions, 
                 .changed();
             ui.end_row();
 
-            ui.label("Altitudine");
+            ui.label(t!("Altitudine"));
             cambiato |= ui
                 .add(
                     egui::TextEdit::singleline(&mut state.gps.manual_alt)
-                        .hint_text("metri (facoltativa)")
+                        .hint_text(t!("metri (facoltativa)"))
                         .desired_width(130.0),
                 )
                 .changed();
@@ -268,26 +269,29 @@ fn coordinate(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions, 
     }
     match state.gps.marker {
         Some(marker) => {
-            ui.weak(format!(
-                "Marker: {}{}",
-                marker.format_decimal(),
-                marker
-                    .altitude
-                    .map(|altitude| format!(" · {altitude:.0} m"))
-                    .unwrap_or_default()
+            let altitude = marker
+                .altitude
+                .map(|altitude| format!(" · {altitude:.0} m"))
+                .unwrap_or_default();
+            ui.weak(t!(
+                "Marker: {position}{altitude}",
+                position = marker.format_decimal(),
+                altitude = altitude
             ));
         }
         None => {
-            ui.weak("Nessun marker: clicca sulla mappa o inserisci le coordinate.");
+            ui.weak(t!(
+                "Nessun marker: clicca sulla mappa o inserisci le coordinate."
+            ));
         }
     }
 
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         let rimuovi = if count == 1 {
-            "Rimuovi posizione".to_owned()
+            t!("Rimuovi posizione").to_owned()
         } else {
-            format!("Rimuovi posizione da {count}")
+            t!("Rimuovi posizione da {count}", count = count)
         };
         if ui
             .add_enabled(state.gps.marker.is_some(), egui::Button::new(rimuovi))
@@ -297,34 +301,33 @@ fn coordinate(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions, 
         }
     });
     ui.weak(
-        "Coordinate e località restano in bozza: verranno scritte in EXIF GPS e XMP \
-         quando premi Salva.",
+        t!("Coordinate e località restano in bozza: verranno scritte in EXIF GPS e XMP quando premi Salva."),
     );
 }
 
 /// Campi delle località (IPTC Extension) per ruolo.
 fn localita(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
     for role in LocationRole::ALL {
-        egui::CollapsingHeader::new(role.label())
+        egui::CollapsingHeader::new(location_role_label(role))
             .default_open(matches!(role, LocationRole::Created))
             .show(ui, |ui| {
-                ui.weak(role.hint());
+                ui.weak(location_role_hint(role));
                 egui::Grid::new(format!("gps_location_{role:?}"))
                     .num_columns(2)
                     .spacing([10.0, 6.0])
                     .show(ui, |ui| {
                         for field in LocationField::ALL {
                             ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new(field.label()).strong());
+                                ui.label(egui::RichText::new(location_field_label(field)).strong());
                                 if state.gps.location_dirty.contains(&(role, field)) {
                                     ui.colored_label(ui.visuals().selection.stroke.color, "•");
                                 }
                             });
                             let mut testo = state.gps.location_value(role, field).to_owned();
                             let hint = if state.gps.location_is_mixed(role, field) {
-                                "valori diversi".to_owned()
+                                t!("valori diversi").to_owned()
                             } else {
-                                field.hint().to_owned()
+                                location_field_hint(field).to_owned()
                             };
                             let response = ui.add(
                                 egui::TextEdit::singleline(&mut testo)
@@ -342,29 +345,27 @@ fn localita(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
 
     ui.add_space(6.0);
     ui.horizontal(|ui| {
-        if ui.button("Annulla modifiche").clicked() {
+        if ui.button(t!("Annulla modifiche")).clicked() {
             actions.gps_reset = true;
         }
     });
     ui.weak(
-        "I campi svuotati vengono rimossi dai metadati; il codice paese \
-         richiede due lettere (es. IT). Le località si salvano con Salva.",
+        t!("I campi svuotati vengono rimossi dai metadati; il codice paese richiede due lettere (es. IT). Le località si salvano con Salva."),
     );
 }
 
 /// Ricerca geografica su Nominatim, senza suggerimenti automatici.
 fn ricerca(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
-    egui::CollapsingHeader::new("Cerca località (OpenStreetMap)")
+    egui::CollapsingHeader::new(t!("Cerca località (OpenStreetMap)"))
         .default_open(false)
         .show(ui, |ui| {
             ui.weak(
-                "Ricerca su richiesta tramite Nominatim, fino a 5 risultati. \
-                 La ricerca non parte mentre si digita.",
+                t!("Ricerca su richiesta tramite Nominatim, fino a 5 risultati. La ricerca non parte mentre si digita."),
             );
             let busy = state.gps.searching || state.gps.reverse_pending;
             let response = ui.add(
                 egui::TextEdit::singleline(&mut state.gps.search_query)
-                    .hint_text("es. Duomo di Milano")
+                    .hint_text(t!("es. Duomo di Milano"))
                     .desired_width(f32::INFINITY),
             );
             let enter =
@@ -374,13 +375,13 @@ fn ricerca(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
             ui.horizontal(|ui| {
                 let query = state.gps.search_query.trim().to_owned();
                 if ui
-                    .add_enabled(!busy && !query.is_empty(), egui::Button::new("Cerca"))
+                    .add_enabled(!busy && !query.is_empty(), egui::Button::new(t!("Cerca")))
                     .clicked()
                     || (enter && !busy && !query.is_empty())
                 {
                     avvia = Some(query);
                 }
-                let reverse = egui::Button::new("Rileva dal marker");
+                let reverse = egui::Button::new(t!("Rileva dal marker"));
                 if ui
                     .add_enabled(!busy && state.gps.marker.is_some(), reverse)
                     .clicked()
@@ -411,22 +412,22 @@ fn ricerca(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
                 return;
             }
             ui.add_space(4.0);
-            ui.weak("Risultati:");
+            ui.weak(t!("Risultati:"));
             let risultati = state.gps.search_results.clone();
             for (index, result) in risultati.iter().enumerate() {
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new(elide(&result.display_name, 54)).small())
                     .on_hover_text(&result.display_name);
                 ui.horizontal(|ui| {
-                    if ui.small_button("Marker").clicked() {
+                    if ui.small_button(t!("Marker")).clicked() {
                         actions.gps_use_suggestion =
                             Some((result.clone(), SuggestionTarget::Marker));
                     }
-                    if ui.small_button("Su scatto").clicked() {
+                    if ui.small_button(t!("Su scatto")).clicked() {
                         actions.gps_use_suggestion =
                             Some((result.clone(), SuggestionTarget::Created));
                     }
-                    if ui.small_button("Su raffigurata").clicked() {
+                    if ui.small_button(t!("Su raffigurata")).clicked() {
                         actions.gps_use_suggestion =
                             Some((result.clone(), SuggestionTarget::Shown));
                     }
@@ -445,7 +446,7 @@ fn finestra_mappa_grande(ui: &mut egui::Ui, state: &mut AppState) {
     }
     let ctx = ui.ctx().clone();
     let mut open = true;
-    egui::Window::new("Posizione GPS — mappa")
+    egui::Window::new(t!("Posizione GPS — mappa"))
         .open(&mut open)
         .collapsible(false)
         .default_size(egui::vec2(720.0, 520.0))

@@ -5,6 +5,7 @@
 //! tornano alla UI attraverso un canale, come per la scansione cartelle.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 
@@ -37,33 +38,46 @@ pub struct FileOpOutcome {
 pub struct FileOpsService {
     tx: Sender<FileOpRequest>,
     rx: Receiver<FileOpOutcome>,
+    /// True mentre il worker sta eseguendo (o ha in coda) un'operazione.
+    busy: Arc<AtomicBool>,
 }
 
 impl FileOpsService {
     pub fn new(repaint: Arc<dyn Fn() + Send + Sync>) -> Self {
         let (tx, requests) = channel::<FileOpRequest>();
         let (outcomes_tx, rx) = channel::<FileOpOutcome>();
+        let busy = Arc::new(AtomicBool::new(false));
+        let worker_busy = Arc::clone(&busy);
 
         std::thread::Builder::new()
             .name("file-ops".to_owned())
             .spawn(move || {
                 while let Ok(request) = requests.recv() {
+                    worker_busy.store(true, Ordering::Relaxed);
                     let outcome = execute(request);
                     if outcomes_tx.send(outcome).is_err() {
+                        worker_busy.store(false, Ordering::Relaxed);
                         break;
                     }
+                    worker_busy.store(false, Ordering::Relaxed);
                     repaint();
                 }
             })
             .expect("avvio del thread file-ops");
 
-        Self { tx, rx }
+        Self { tx, rx, busy }
     }
 
     pub fn request(&self, request: FileOpRequest) {
         if self.tx.send(request).is_err() {
             tracing::error!("servizio operazioni non disponibile");
         }
+    }
+
+    /// True se c'è un'operazione in corso: la UI la usa per sopprimere gli
+    /// eventi del watcher causati dalle proprie scritture.
+    pub fn busy(&self) -> bool {
+        self.busy.load(Ordering::Relaxed)
     }
 
     pub fn try_recv(&self) -> Option<FileOpOutcome> {

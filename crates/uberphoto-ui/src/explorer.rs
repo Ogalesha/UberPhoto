@@ -14,13 +14,16 @@ use eframe::egui;
 use uberphoto_files::DirNode;
 
 use crate::state::{AppState, DragPhotos, DropRequest, UiActions};
+use crate::t;
 use crate::util::elide;
 
 pub fn ui(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
     ui.horizontal(|ui| {
         if ui
-            .button("📂 Apri cartella")
-            .on_hover_text("Scegli una cartella del filesystem da aprire come radice")
+            .button(t!("📂 Apri cartella"))
+            .on_hover_text(t!(
+                "Scegli una cartella del filesystem da aprire come radice"
+            ))
             .clicked()
         {
             actions.pick_folder = true;
@@ -28,11 +31,11 @@ pub fn ui(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
     });
 
     ui.add_space(4.0);
-    egui::CollapsingHeader::new("Recenti")
+    egui::CollapsingHeader::new(t!("Recenti"))
         .default_open(true)
         .show(ui, |ui| {
             if state.recent_folders.is_empty() {
-                ui.weak("Nessuna cartella recente");
+                ui.weak(t!("Nessuna cartella recente"));
             } else {
                 for dir in &state.recent_folders {
                     let label = elide(&dir.display().to_string(), 34);
@@ -61,7 +64,7 @@ pub fn ui(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
     ui.horizontal(|ui| {
         ui.add(
             egui::TextEdit::singleline(&mut state.tree_filter)
-                .hint_text("Filtra cartelle…")
+                .hint_text(t!("Filtra cartelle…"))
                 .desired_width(150.0),
         );
         if !state.tree_filter.is_empty() && ui.small_button("✕").clicked() {
@@ -87,7 +90,7 @@ pub fn ui(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
                 );
             } else {
                 ui.add_space(8.0);
-                ui.weak("Apri una cartella per iniziare la navigazione.");
+                ui.weak(t!("Apri una cartella per iniziare la navigazione."));
             }
         });
 }
@@ -167,20 +170,20 @@ fn tree_node(
         }
 
         response.context_menu(|ui| {
-            if ui.button("📂 Apri come radice").clicked() {
+            if ui.button(t!("📂 Apri come radice")).clicked() {
                 actions.open_folder = Some(node_path.clone());
                 ui.close();
             }
             ui.separator();
-            if ui.button("➕ Nuova sottocartella…").clicked() {
+            if ui.button(t!("➕ Nuova sottocartella…")).clicked() {
                 actions.create_folder = Some(node_path.clone());
                 ui.close();
             }
-            if ui.button("✏ Rinomina…").clicked() {
+            if ui.button(t!("✏ Rinomina…")).clicked() {
                 actions.rename_folder = Some(node_path.clone());
                 ui.close();
             }
-            if ui.button("🗑 Elimina (solo se vuota)").clicked() {
+            if ui.button(t!("🗑 Elimina (solo se vuota)")).clicked() {
                 actions.delete_folder = Some(node_path.clone());
                 ui.close();
             }

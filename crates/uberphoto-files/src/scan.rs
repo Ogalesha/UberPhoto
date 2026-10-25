@@ -1,9 +1,12 @@
 //! Scansione delle cartelle.
 //!
-//! La scansione sincrona [`scan_directory`] è usata sia dai test sia dal
-//! thread di background gestito da [`DirectoryScanner`], così che l'interfaccia
-//! non venga mai bloccata anche con migliaia di file.
+//! La scansione sincrona [`scan_directory`] legge una sola cartella;
+//! [`scan_tree`] aggrega ricorsivamente una cartella e tutti i suoi
+//! discendenti. Il thread di background gestito da [`DirectoryScanner`] usa
+//! la seconda, così la griglia mostra l'intero sottoalbero senza bloccare
+//! l'interfaccia.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -12,11 +15,15 @@ use std::sync::Arc;
 use uberphoto_core::{FormatKind, PhotoAsset};
 
 use crate::naming::{is_hidden_name, natural_cmp};
+use crate::tree::{load_subdirs_filtered, DirNode};
 
 /// Esito di una scansione richiesta a [`DirectoryScanner`].
 pub struct ScanResult {
     pub dir: PathBuf,
     pub entries: Vec<PhotoAsset>,
+    /// Sotto-cartelle dirette della cartella scansionata, per la barra di
+    /// navigazione rapida mostrata sopra la griglia.
+    pub subdirs: Vec<DirNode>,
     pub error: Option<String>,
 }
 
@@ -28,8 +35,49 @@ pub struct ScanResult {
 /// - i link simbolici verso file regolari sono seguiti;
 /// - un file illeggibile viene saltato senza interrompere la scansione.
 pub fn scan_directory(dir: &Path, include_hidden: bool) -> Result<Vec<PhotoAsset>, std::io::Error> {
-    let mut named: Vec<(String, PhotoAsset)> = Vec::new();
+    let mut named = Vec::new();
+    collect_files(dir, include_hidden, &mut named)?;
+    Ok(ordina(named))
+}
 
+/// Legge `dir` e tutti i suoi discendenti, restituendo le foto in un'unica
+/// lista ordinata. Le cartelle non leggibili vengono saltate; gli errori di
+/// lettura sulla radice interrompono la scansione. I link simbolici verso
+/// directory sono seguiti una sola volta, evitando cicli.
+pub fn scan_tree(dir: &Path, include_hidden: bool) -> Result<Vec<PhotoAsset>, std::io::Error> {
+    let mut named = Vec::new();
+    let mut visited = HashSet::new();
+    let mut stack = vec![dir.to_path_buf()];
+
+    while let Some(current) = stack.pop() {
+        let canonical = fs::canonicalize(&current).unwrap_or_else(|_| current.clone());
+        if !visited.insert(canonical) {
+            continue;
+        }
+
+        let is_root = current.as_path() == dir;
+        if let Err(err) = collect_files(&current, include_hidden, &mut named) {
+            if is_root {
+                return Err(err);
+            }
+            tracing::warn!(dir = %current.display(), "sottocartella non leggibile: {err}");
+        }
+
+        match load_subdirs_filtered(&current, include_hidden) {
+            Ok(children) => stack.extend(children.into_iter().map(|child| child.path)),
+            Err(err) if is_root => return Err(err),
+            Err(err) => tracing::warn!(dir = %current.display(), "listing non riuscito: {err}"),
+        }
+    }
+
+    Ok(ordina(named))
+}
+
+fn collect_files(
+    dir: &Path,
+    include_hidden: bool,
+    named: &mut Vec<(String, PhotoAsset)>,
+) -> Result<(), std::io::Error> {
     for entry in fs::read_dir(dir)? {
         let Ok(entry) = entry else { continue };
 
@@ -72,9 +120,12 @@ pub fn scan_directory(dir: &Path, include_hidden: bool) -> Result<Vec<PhotoAsset
             },
         ));
     }
+    Ok(())
+}
 
-    named.sort_by(|a, b| natural_cmp(&a.0, &b.0));
-    Ok(named.into_iter().map(|(_, asset)| asset).collect())
+fn ordina(mut named: Vec<(String, PhotoAsset)>) -> Vec<PhotoAsset> {
+    named.sort_by(|a, b| natural_cmp(&a.0, &b.0).then_with(|| a.1.path.cmp(&b.1.path)));
+    named.into_iter().map(|(_, asset)| asset).collect()
 }
 
 /// Scansiona cartelle su un thread dedicato e recapita i risultati alla UI.
@@ -103,15 +154,18 @@ impl DirectoryScanner {
                         dir = newer;
                     }
 
-                    let result = match scan_directory(&dir, false) {
+                    let subdirs = load_subdirs_filtered(&dir, false).unwrap_or_default();
+                    let result = match scan_tree(&dir, false) {
                         Ok(entries) => ScanResult {
                             dir,
                             entries,
+                            subdirs,
                             error: None,
                         },
                         Err(err) => ScanResult {
                             dir,
                             entries: Vec::new(),
+                            subdirs,
                             error: Some(err.to_string()),
                         },
                     };
@@ -172,6 +226,50 @@ mod tests {
     fn cartella_inesistente_restituisce_errore() {
         let risultato = scan_directory(Path::new("/questa/cartella/non/esiste"), false);
         assert!(risultato.is_err());
+        let albero = scan_tree(Path::new("/questa/cartella/non/esiste"), false);
+        assert!(albero.is_err());
+    }
+
+    #[test]
+    fn la_scansione_ricorsiva_aggrega_tutte_le_sottocartelle() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+
+        fs::write(root.join("in-radice.jpg"), b"x").unwrap();
+        fs::create_dir(root.join("vacanze")).unwrap();
+        fs::write(root.join("vacanze").join("mare.jpg"), b"x").unwrap();
+        fs::create_dir(root.join("vacanze").join("2024")).unwrap();
+        fs::write(root.join("vacanze").join("2024").join("tramonto.jpg"), b"x").unwrap();
+        fs::create_dir(root.join(".nascosta")).unwrap();
+        fs::write(root.join(".nascosta").join("segreta.jpg"), b"x").unwrap();
+        fs::write(root.join("vacanze").join("nota.txt"), b"x").unwrap();
+
+        let entries = scan_tree(root, false).expect("scansione ricorsiva");
+        let names: Vec<String> = entries.iter().map(|entry| entry.file_name()).collect();
+        assert_eq!(names, vec!["in-radice.jpg", "mare.jpg", "tramonto.jpg"]);
+
+        let with_hidden = scan_tree(root, true).expect("scansione ricorsiva con nascosti");
+        let names: Vec<String> = with_hidden.iter().map(|entry| entry.file_name()).collect();
+        assert_eq!(
+            names,
+            vec!["in-radice.jpg", "mare.jpg", "segreta.jpg", "tramonto.jpg"]
+        );
+    }
+
+    #[test]
+    fn i_symlink_di_cartella_non_creano_cicli() {
+        #[cfg(unix)]
+        {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let root = temp.path();
+            fs::create_dir(root.join("reale")).unwrap();
+            fs::write(root.join("reale").join("foto.jpg"), b"x").unwrap();
+            std::os::unix::fs::symlink(root, root.join("reale").join("loop")).unwrap();
+
+            let entries = scan_tree(root, false).expect("scansione ricorsiva");
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].file_name(), "foto.jpg");
+        }
     }
 
     /// Benchmark manuale (criterio di accettazione #1: cartelle grandi).
