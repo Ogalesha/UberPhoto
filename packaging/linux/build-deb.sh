@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Crea un pacchetto Debian (.deb) per UberPhoto.
-# Uso: packaging/linux/build-deb.sh [versione] [percorso-binario]
+# Build a Debian package (.deb) for UberPhoto.
+# Usage: packaging/linux/build-deb.sh [version] [binary-path]
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -12,16 +12,16 @@ EXIFTOOL_SHA256="${EXIFTOOL_SHA256:-668ea3acececb7235fbd0f4900e72d5f12c9b07e5c77
 STAGE="$ROOT/target/deb/uberphoto_${VERSION}_${ARCH}"
 
 if [[ ! -x "$BIN" ]]; then
-    echo "binario non trovato: $BIN (esegui prima cargo build --release -p uberphoto-app)" >&2
+    echo "binary not found: $BIN (run cargo build --release -p uberphoto-app first)" >&2
     exit 1
 fi
 
-# ExifTool incluso nel pacchetto: nessuna dipendenza esterna da installare.
+# ExifTool bundled in the package: no external dependency to install.
 CACHE="$ROOT/target/exiftool-cache"
 SRC="$CACHE/Image-ExifTool-$EXIFTOOL_VERSION"
 ARCHIVE="$CACHE/Image-ExifTool-$EXIFTOOL_VERSION.tar.gz"
 
-verifica_sha256() {
+verify_sha256() {
     local file="$1" expected="$2" actual
     if command -v sha256sum >/dev/null 2>&1; then
         actual="$(sha256sum "$file" | awk '{print $1}')"
@@ -29,7 +29,7 @@ verifica_sha256() {
         actual="$(shasum -a 256 "$file" | awk '{print $1}')"
     fi
     if [[ "$actual" != "$expected" ]]; then
-        echo "checksum ExifTool non valido per $file: $actual" >&2
+        echo "invalid ExifTool checksum for $file: $actual" >&2
         return 1
     fi
 }
@@ -40,10 +40,10 @@ if [[ ! -f "$SRC/exiftool" ]]; then
         curl -fsSL --retry 3 -o "$ARCHIVE" \
             "https://sourceforge.net/projects/exiftool/files/Image-ExifTool-$EXIFTOOL_VERSION.tar.gz/download"
     fi
-    verifica_sha256 "$ARCHIVE" "$EXIFTOOL_SHA256"
+    verify_sha256 "$ARCHIVE" "$EXIFTOOL_SHA256"
     tar -xzf "$ARCHIVE" -C "$CACHE"
 elif [[ -f "$ARCHIVE" ]]; then
-    verifica_sha256 "$ARCHIVE" "$EXIFTOOL_SHA256"
+    verify_sha256 "$ARCHIVE" "$EXIFTOOL_SHA256"
 fi
 
 rm -rf "$STAGE"

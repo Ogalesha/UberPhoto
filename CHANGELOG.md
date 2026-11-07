@@ -1,125 +1,124 @@
 # Changelog
 
-Tutte le modifiche rilevanti di questo progetto sono documentate in questo file.
+All notable changes to this project are documented in this file.
 
-Il formato segue [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
-e il progetto aderisce a [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Added
-
-- Disinstallazione completa su tutti i sistemi: `uberphoto --uninstall` elimina indice, impostazioni, preset, cartelle recenti e cache delle mappe dalla cartella dati utente; l'uninstaller Windows rimuove anche `%APPDATA%\UberPhoto`, e la guida documenta la rimozione totale del programma su Linux, macOS e Windows.
-
-## [0.4.0] - 2026-10-24
+## [0.4.0] - 2026-11-07
 
 ### Added
 
-- Vista cartella aggregata: aprendo una cartella si vedono le foto della cartella e di tutte le sue sottocartelle, con una barra delle sottocartelle dirette sopra la griglia per restringere la vista a un ramo.
-- Salvataggio manuale unificato con `Salva` nella barra superiore e `Ctrl+S`: dialogo con scelta tra nuova copia (`nome-modificata.ext`, collisioni progressive) e sovrascrittura dell'originale con conferma esplicita.
-- Nuovo servizio di salvataggio in `uberphoto-export`: rendering su file temporaneo nella stessa cartella, applicazione metadati verificata, sostituzione atomica, rollback sui fallimenti e gestione dei lotti con errori parziali.
-- Bozze in memoria per colore, metadati e posizione, conservate per foto anche cambiando selezione; il salvataggio include solo le foto selezionate che hanno bozze.
-- Test del salvataggio: nome automatico, sovrascrittura con pixel e metadati, copia con metadati, rollback su errore e collisioni.
-- Conferma alla chiusura quando restano bozze non salvate e blocco della chiusura durante un salvataggio in corso.
-- Interfaccia localizzata in italiano, inglese, tedesco, francese, spagnolo, polacco, turco, russo e albanese, con selettore nella barra superiore, persistenza della scelta e rilevamento della lingua di sistema (variabili d'ambiente con fallback `sys-locale`).
-- Forme plurali per i messaggi con conteggio, con regole dedicate a russo e polacco (`una|poche|molte`) e test automatici; i messaggi di riepilogo senza conteggio usano etichette neutre rispetto al numero.
-- Font emoji monocromatici inclusi nel binario, così le icone dell'interfaccia sono identiche su tutte le piattaforme; un test verifica la copertura di tutti i caratteri del catalogo e dei nomi delle lingue.
-- Test di persistenza della lingua scelta e test di copertura dei segnaposto per tutte le varianti.
+- Complete uninstall on all platforms: `uberphoto --uninstall` deletes the index, settings, presets, recent folders and map cache from the user data directory; on Windows it removes the whole `%APPDATA%\UberPhoto` root, and the Windows uninstaller removes `%APPDATA%\UberPhoto` and `%LOCALAPPDATA%\UberPhoto`. The guide documents full removal on Linux, macOS and Windows.
+- Aggregate folder view: opening a folder shows photos from that folder and all its subfolders, with a bar of direct subfolders above the grid to narrow the view to a branch.
+- Unified manual save with **Save** in the top bar and `Ctrl+S`: a dialog lets you choose between a new copy (`name-edited.ext`, progressive collision handling) and overwriting the original with explicit confirmation.
+- New save service in `uberphoto-export`: rendering to a temporary file in the same folder, verified metadata application, atomic replacement, rollback on failure and batch handling with partial errors.
+- In-memory drafts for color, metadata and location, kept per photo even when the selection changes; saving includes only selected photos that have drafts.
+- Save tests: automatic naming, overwrite with pixels and metadata, copy with metadata, rollback on error and collisions.
+- Confirmation on close when unsaved drafts remain, and close blocked while a save is in progress.
+- UI localized in Italian, English, German, French, Spanish, Polish, Turkish, Russian and Albanian, with a selector in the top bar, persisted choice and system language detection (environment variables with `sys-locale` fallback).
+- Plural forms for count messages, with dedicated rules for Russian and Polish (`one|few|many`) and automated tests; summary messages without a count use number-neutral labels.
+- Monochrome emoji fonts bundled into the binary so interface icons look identical on every platform; a test verifies coverage of every catalog and language-name character.
+- Tests for the persisted language choice and placeholder coverage across all variants.
 
 ### Changed
 
-- Il colore non viene più salvato automaticamente nel catalogo quando si cambia foto o si applica un preset: resta una bozza finché l'utente non preme `Salva`.
-- I campi metadati e GPS non vengono più scritti immediatamente: restano in bozza e vengono applicati insieme dal salvataggio manuale, con verifica post-scrittura.
-- L'esportazione usa le bozze correnti delle ricette, così colore e file esportato restano coerenti.
-- Gli errori di coordinate manuali bloccano il salvataggio finché non vengono corretti.
-- Le bozze di colore, metadati e posizione seguono rinomina e spostamento di file e cartelle.
-- L'osservazione delle modifiche esterne è ricorsiva: la vista aggregata si aggiorna anche quando cambia una sottocartella.
-- Le stringhe dell'interfaccia passano da un catalogo di traduzioni con fallback italiano; i messaggi dinamici usano segnaposto e il catalogo è coperto da test di completezza e ordinamento.
-- I messaggi di esito di salvataggio ed esportazione non concordano più il participio con un numero variabile: usano etichette come «riuscite: N» e «fallite: N».
+- Color is no longer automatically saved to the catalog when changing photo or applying a preset: it stays a draft until the user presses **Save**.
+- Metadata and GPS fields are no longer written immediately: they stay as drafts and are applied together by the manual save, with post-write verification.
+- Export uses the current recipe drafts, so the color and the exported file stay consistent.
+- Manual coordinate errors block saving until they are corrected.
+- Color, metadata and location drafts follow file and folder renames and moves.
+- Watching for external changes is recursive: the aggregate view also refreshes when a subfolder changes.
+- UI strings now come from a translation catalog with Italian fallback; dynamic messages use placeholders and the catalog is covered by completeness and ordering tests.
+- Save and export outcome messages no longer inflect the participle for a variable count: they use labels such as "succeeded: N" and "failed: N".
 
 ### Fixed
 
-- La valutazione rapida non cancella più i campi metadati o GPS in bozza dopo la rilettura.
-- La sostituzione su Windows non rimuove più l'originale prima del rename atomico.
-- I form metadati e GPS si ricostruiscono quando i documenti tornano disponibili, senza restare vuoti dopo un salvataggio o una rilettura.
-- Le bozze metadati e GPS non vengono più perse cambiando selezione: restano associate alla singola foto.
-- Dopo un salvataggio o una rilettura la cache metadati viene invalidata anche per i file con sidecar XMP, così i valori verificati compaiono subito nei form.
-- Corrette alcune traduzioni: «Posizione» in polacco non è più «Stanowisko» (posto di lavoro), la maiuscola dopo il punto e virgola in turco e spagnolo, e le forme singolari/plurali di foto e file in tutte le lingue.
+- Quick rating no longer clears metadata or GPS drafts after a re-read.
+- Replacement on Windows no longer removes the original before the atomic rename.
+- Metadata and GPS forms rebuild when documents become available again, instead of staying empty after a save or re-read.
+- Metadata and GPS drafts are no longer lost when changing selection: they stay associated with the individual photo.
+- After a save or re-read, the metadata cache is invalidated for files with XMP sidecars too, so verified values appear in the forms immediately.
+- Fixed some translations: Polish "Location" is no longer "Stanowisko" (workplace), capitalization after semicolons in Turkish and Spanish, and singular/plural forms of photo and file across all languages.
 
 ### Documentation
 
-- README aggiornato con il flusso di salvataggio manuale, le garanzie di rollback, il nuovo significato delle ricette in bozza e le lingue dell'interfaccia.
-- Esempio di tag di release aggiornato a `v0.4.0`.
+- Repository documentation, CI workflows, packaging scripts and uninstall CLI messages are in English; the interface translation catalog remains localized.
+- README updated with the manual save flow, rollback guarantees, the new meaning of draft recipes and the interface languages.
+- README links to the latest release from the top of the page and documents the correct per-user data paths on macOS and Windows.
+- Release tag example updated to `v0.4.0`.
 
 ## [0.3.0] - 2026-10-19
 
 ### Added
 
-- Fase 4 — selettore GPS su mappa OpenStreetMap con marker trascinabile, clic per posizionare, coordinate manuali e centratura; ricerca facoltativa dei luoghi su Nominatim solo su azione esplicita, con User-Agent e attribuzione.
-- Fase 5 — editing non distruttivo: ricetta colore salvata nel catalogo (esposizione, luminosità, contrasto, alte luci, ombre, bianchi, neri, saturazione, vibrance, temperatura, tinta, gamma, nitidezza), ritaglio e rotazione a passi di 90°.
-- Fase 5 — anteprima in tempo reale su copia ridotta con worker "latest wins", confronto "Prima", annulla/ripeti e ripristino per singolo campo.
-- Fase 5 — preset colore salvati nel catalogo, applicabili alla foto corrente o all'intera selezione multipla.
-- Fase 6 — nuovo crate `uberphoto-export`: profili Full metadata, Web optimized e Privacy, formati JPEG/PNG/WebP/TIFF, conversione ICC a sRGB con profilo incorporato, ridimensionamento Lanczos3 senza ingrandimento, denominazione con prefisso/suffisso/slug e conflitti senza sovrascrittura.
-- Fase 6 — verifica dell'esportazione: i tag di sorgente e uscita vengono riletti insieme e classificati come preservati, adeguati, non supportati o persi, con avvisi espliciti (per esempio IPTC non memorizzabile in WebP).
-- Fase 6 — scheda Esportazione con profilo, formato, qualità, ridimensionamento, destinazione, avanzamento, annullamento e report per foto; i file parziali vengono rimossi in caso di errore.
-- Fase 7 — pacchetti installabili e autosufficienti: `.deb` Debian/Ubuntu con desktop entry, bundle `.app` macOS, installer Windows (Inno Setup) e ZIP portabile, tutti con ExifTool incluso; archivio portabile Linux con ExifTool.
-- Fase 7 — smoke test di integrazione GPS (Fase 4): scrittura e rilettura del marker con altitudine, rimozione senza toccare i tag estranei, rifiuto delle coordinate fuori intervallo.
-- Fase 7 — ExifTool viene cercato prima accanto all'eseguibile (copia inclusa nel pacchetto), poi in `UBERPHOTO_EXIFTOOL` e infine nel `PATH`.
-- Fase 7 — benchmark manuali per la pipeline colore su 24 MP e per la scansione di 2.000 file; verifica dei pacchetti nella CI.
-- Fase 7 — README aggiornato alle Fasi 1–7 con funzionalità, limiti noti e istruzioni di packaging.
+- Phase 4 — GPS picker on an OpenStreetMap map with draggable marker, click to place, manual coordinates and centering; optional place search on Nominatim only on explicit action, with User-Agent and attribution.
+- Phase 5 — non-destructive editing: color recipe saved in the catalog (exposure, brightness, contrast, highlights, shadows, whites, blacks, saturation, vibrance, temperature, tint, gamma, sharpness), crop and rotation in 90° steps.
+- Phase 5 — live preview on a reduced copy with a "latest wins" worker, "Before" comparison, undo/redo and per-field reset.
+- Phase 5 — color presets saved in the catalog, applicable to the current photo or the whole multi-selection.
+- Phase 6 — new `uberphoto-export` crate: Full metadata, Web optimized and Privacy profiles, JPEG/PNG/WebP/TIFF formats, ICC to sRGB conversion with embedded profile, Lanczos3 resizing without upscaling, naming with prefix/suffix/slug and conflict handling without overwriting.
+- Phase 6 — export verification: source and output tags are read back together and classified as preserved, adjusted, unsupported or lost, with explicit warnings (for example IPTC cannot be stored in WebP).
+- Phase 6 — Export tab with profile, format, quality, resizing, destination, progress, cancellation and per-photo report; partial files are removed on error.
+- Phase 7 — installable, self-contained packages: Debian/Ubuntu `.deb` with desktop entry, macOS `.app` bundle, Windows installer (Inno Setup) and portable ZIP, all with ExifTool included; portable Linux archive with ExifTool.
+- Phase 7 — GPS integration smoke test (Phase 4): write and read back the marker with altitude, removal without touching unrelated tags, rejection of out-of-range coordinates.
+- Phase 7 — ExifTool is looked up first next to the executable (copy bundled in the package), then in `UBERPHOTO_EXIFTOOL`, and finally in `PATH`.
+- Phase 7 — manual benchmarks for the color pipeline on 24 MP and for scanning 2,000 files; package verification in CI.
+- Phase 7 — README updated for Phases 1–7 with features, known limitations and packaging instructions.
 
 ### Fixed
 
-- La scheda Colori applica i preset alla selezione multipla invece di limitarsi a dichiararla non supportata.
-- `.gitignore` esclude segreti (`.env`, chiavi), fotografie, database locali, log e la specifica privata del prodotto; nel repository restano solo sorgenti, documentazione pubblica e l'icona necessaria alla compilazione.
+- The Colors tab applies presets to a multi-selection instead of merely declaring it unsupported.
+- `.gitignore` excludes secrets (`.env`, keys), photographs, local databases, logs and the private product spec; only sources, public documentation and the icon required for the build remain in the repository.
 
 ## [0.2.1] - 2026-10-18
 
 ### Fixed
 
-- Su Windows le operazioni su cartelle dell'indice (`load_dir`, `move_dir`, `remove_dir`) non trovavano le righe quando i percorsi mescolavano separatori `/` e `\`: il pattern LIKE ora è un prefisso indipendente dal separatore, con filtro esatto in Rust.
-- La CI non pubblicava i log dei test falliti (ora il log finisce in un check run dedicato visibile senza autenticazione).
-- Lo smoke test GUI Linux si interrompeva sotto Xvfb per il mancato caricamento di `libxkbcommon-x11` (pacchetto ora installato) e per lo schermo Xvfb a 8 bit (ora 24 bit).
+- On Windows, index folder operations (`load_dir`, `move_dir`, `remove_dir`) did not find rows when paths mixed `/` and `\` separators: the LIKE pattern is now a separator-independent prefix, with exact filtering in Rust.
+- CI did not publish logs of failed tests (the log now goes to a dedicated check run visible without authentication).
+- The Linux GUI smoke test stopped under Xvfb because `libxkbcommon-x11` failed to load (package now installed) and because the Xvfb screen was 8-bit (now 24-bit).
 
 ## [0.2.0] - 2026-10-18
 
 ### Added
 
-- Fase 2 — operazioni filesystem: spostamento, copia e rinomina con tre politiche sui conflitti (rinomina automatica, sostituzione, salto), annullamento dell'ultimo spostamento e fallback copia+elimina tra dispositivi diversi.
-- Fase 2 — drag & drop delle foto dalla griglia alle cartelle dell'esploratore, con pastiglia di conteggio e prompt di conferma.
-- Fase 2 — gestione dei sidecar XMP nelle operazioni di file: il sidecar segue la foto spostata o rinominata.
-- Fase 2 — creazione e eliminazione di sottocartelle vuote e rinomina delle cartelle dall'esploratore.
-- Fase 2 — indice SQLite locale (`index.db`) in modalità WAL: file, dimensioni immagine, valutazione, data di scatto, keyword, dati fotocamera e GPS; aggiornamenti incrementali e ricostruzione automatica.
-- Fase 2 — rilevamento delle modifiche esterne con `notify` e riscansione calmierata; gli eventi di sola lettura non innescano più riscansioni.
-- Fase 2 — ordinamento per data di acquisizione e per valutazione tramite l'indice.
-- Fase 3 — nuovo crate `uberphoto-metadata`: adapter al processo ExifTool con argomenti strutturati, individuazione da `PATH` o `UBERPHOTO_EXIFTOOL`, lettura batch e scrittura con verifica post-scrittura.
-- Fase 3 — modello canonico con 26 campi editabili (descrittivi, autore/diritti, data e orientamento), validazione di valutazione, orientamento, data e fuso orario.
-- Fase 3 — scrittura embedded per JPEG, PNG, TIFF e WebP; IPTC nativo solo su JPEG/TIFF; sidecar XMP per RAW, HEIC e AVIF senza mai riscrivere l'originale.
-- Fase 3 — editor metadati nell'inspector con multi-selezione, valori misti, indicatore dei campi modificati, salvataggio e ricarica.
-- Fase 3 — vista di sola lettura dei dati tecnici della fotocamera e dei tag grezzi ExifTool con filtro e indicazione di scrivibilità.
-- Fase 3 — badge GPS e stelle nella griglia, filtri per valutazione minima, GPS e keyword, valutazione rapida dal menu contestuale.
-- Test di integrazione delle Fasi 2 e 3 (`phase2_smoke`, `phase3_smoke`) e smoke test E2E con indice e metadati popolati.
-- CI: installazione di ExifTool su Linux e macOS (best effort su Windows), smoke test GUI sperimentali su macOS e Windows.
+- Phase 2 — filesystem operations: move, copy and rename with three conflict policies (automatic rename, replace, skip), undo of the last move and copy+delete fallback across different devices.
+- Phase 2 — drag & drop of photos from the grid to explorer folders, with a count pill and confirmation prompt.
+- Phase 2 — XMP sidecar handling in file operations: the sidecar follows the moved or renamed photo.
+- Phase 2 — creation and deletion of empty subfolders and folder rename from the explorer.
+- Phase 2 — local SQLite index (`index.db`) in WAL mode: files, image dimensions, rating, capture date, keywords, camera data and GPS; incremental updates and automatic rebuild.
+- Phase 2 — external change detection with `notify` and throttled rescanning; read-only events no longer trigger rescans.
+- Phase 2 — sorting by acquisition date and rating through the index.
+- Phase 3 — new `uberphoto-metadata` crate: adapter for the ExifTool process with structured arguments, discovery from `PATH` or `UBERPHOTO_EXIFTOOL`, batch reading and writing with post-write verification.
+- Phase 3 — canonical model with 26 editable fields (descriptive, author/copyright, date and orientation), validation of rating, orientation, date and time zone.
+- Phase 3 — embedded writing for JPEG, PNG, TIFF and WebP; native IPTC only on JPEG/TIFF; XMP sidecars for RAW, HEIC and AVIF without ever rewriting the original.
+- Phase 3 — metadata editor in the inspector with multi-selection, mixed values, modified-field indicator, saving and reloading.
+- Phase 3 — read-only view of technical camera data and raw ExifTool tags with filter and writability indicator.
+- Phase 3 — GPS badge and stars in the grid, filters by minimum rating, GPS and keywords, quick rating from the context menu.
+- Integration tests for Phases 2 and 3 (`phase2_smoke`, `phase3_smoke`) and E2E smoke tests with a populated index and metadata.
+- CI: ExifTool installation on Linux and macOS (best effort on Windows), experimental GUI smoke tests on macOS and Windows.
 
 ### Fixed
 
-- Il watcher innescava un ciclo di riscansioni perché gli eventi di apertura/lettura dei file venivano trattati come modifiche.
-- L'aggiornamento dell'indice applicava `move_path` anche alle copie, corrompendo il percorso della foto sorgente.
+- The watcher triggered a rescan loop because file open/read events were treated as modifications.
+- Index updates applied `move_path` to copies as well, corrupting the source photo path.
 
 ## [0.1.0] - 2026-10-18
 
 ### Added
 
-- Fase 1 — fondazioni: workspace Cargo con i crate `uberphoto-{core,files,image,ui,app,metadata,geo,db,tests}`.
-- Pannello sinistro: esploratore ad albero con caricamento lazy dei rami, cartelle recenti e apertura di una nuova radice tramite finestra di dialogo nativa.
-- Pannello centrale: griglia di miniature virtualizzata con selezione singola e multipla (Ctrl/Cmd e Shift), filtro per nome, ordinamento e dimensione delle miniature regolabile.
-- Pannello destro: anteprima grande con zoom, pan e adattamento alla finestra; schede predisposte, con dati reali nella scheda "Informazioni".
-- Miniature e anteprime generate su thread di background con cache LRU, rilevamento modifiche su mtime e orientamento EXIF.
-- Tema scuro professionale fotografico e schermata iniziale con logo.
-- Persistenza di cartelle recenti, ultima cartella aperta e dimensione delle miniature.
-- Icona dell'applicazione (finestra e schermata iniziale).
-- CI GitHub Actions su Ubuntu, macOS e Windows (formato, clippy, test) e workflow di release con binari scaricabili per i tag `v*`.
-- Smoke test GUI headless (Xvfb) nella CI Linux.
+- Phase 1 — foundations: Cargo workspace with the `uberphoto-{core,files,image,ui,app,metadata,geo,db,tests}` crates.
+- Left panel: tree explorer with lazy branch loading, recent folders and opening a new root through the native dialog.
+- Center panel: virtualized thumbnail grid with single and multiple selection (Ctrl/Cmd and Shift), name filter, sorting and adjustable thumbnail size.
+- Right panel: large preview with zoom, pan and fit-to-window; placeholder tabs, with real data in the "Information" tab.
+- Thumbnails and previews generated on background threads with LRU cache, mtime change detection and EXIF orientation.
+- Professional dark photography theme and welcome screen with logo.
+- Persistence of recent folders, last opened folder and thumbnail size.
+- Application icon (window and welcome screen).
+- GitHub Actions CI on Ubuntu, macOS and Windows (format, clippy, tests) and release workflow with downloadable binaries for `v*` tags.
+- Headless GUI smoke test (Xvfb) in Linux CI.
 
 [Unreleased]: https://github.com/Ogalesha/UberPhoto/compare/v0.4.0...main
 [0.4.0]: https://github.com/Ogalesha/UberPhoto/compare/v0.3.0...v0.4.0

@@ -4,6 +4,8 @@ UberPhoto is a **local-first desktop photo manager** for real folders, built in 
 
 **Your photographs never leave your disk.** There is no account, no server and no upload. The network is used only for OpenStreetMap tiles and, on explicit request, Nominatim place search.
 
+[**Download the latest release**](https://github.com/Ogalesha/UberPhoto/releases/latest) — Linux `.deb` and portable archive, macOS `.app`, Windows installer and portable ZIP, all with ExifTool bundled.
+
 ## Why UberPhoto
 
 - **Your folders, your files.** No library import and no hidden copy of your originals: the filesystem stays the source of truth and the SQLite index can be rebuilt at any time.
@@ -26,21 +28,21 @@ UberPhoto is a **local-first desktop photo manager** for real folders, built in 
 - Virtualized thumbnail grid: only the visible rows are drawn (`ScrollArea::show_rows`), so scrolling remains smooth with thousands of photos.
 - Adjustable thumbnail size (96–320 px), sort by name / modified date / size / capture date / rating, live name filter.
 - Single click to select, `Ctrl`/`Cmd`+click to toggle, `Shift`+click for a range; double-click opens the large preview.
-- Thumbnails are decoded on a background rayon pool, cached in an LRU (2,000 entries) with mtime-based freshness; decode failures are cached and shown as "n/d".
+- Thumbnails are decoded on a background rayon pool, cached in an LRU (2,000 entries) with mtime-based freshness; decode failures are cached and shown as "n/a".
 - EXIF orientation is applied consistently to thumbnails and previews.
 - Grid overlays for GPS presence and star rating; toolbar filters by minimum rating, GPS and keyword.
 - Quick rating (0–5 stars) from the photo context menu.
 
 ### Preview window
-- Opens on double-click; zoom with the mouse wheel or the `−` / `+` buttons (2 %–3200 %), drag to pan, `Adatta` to fit, `1:1` for one image pixel per physical screen pixel, double-click to re-fit, `Esc` to close.
+- Opens on double-click; zoom with the mouse wheel or the `−` / `+` buttons (2 %–3200 %), drag to pan, `Fit` to fit, `1:1` for one image pixel per physical screen pixel, double-click to re-fit, `Esc` to close.
 - Decoded by a single dedicated background worker with a latest-wins policy; the oversize buffer is capped at 2560 px on the long edge.
 
 ### Color editor — non-destructive by default
-- Adjustments are kept as an in-memory **recipe draft**, so changing photo or tab never rewrites the original. A color draft can still be saved explicitly to disk with **Salva**.
+- Adjustments are kept as an in-memory **recipe draft**, so changing photo or tab never rewrites the original. A color draft can still be saved explicitly to disk with **Save**.
 - Exposure (−5…+5 EV), brightness, contrast, highlights, shadows, whites, blacks, saturation, vibrance, temperature, tint, gamma, sharpness.
 - Straighten-free geometry: crop with adjustable region and 90° rotation steps.
 - Live preview computed on a reduced copy in a background worker; dragging a slider updates it in real time, undo is recorded on release rather than on every frame.
-- Undo/redo (`Ctrl+Z`, `Ctrl+Shift+Z` / `Ctrl+Y`), "Prima" press-and-hold comparison, per-field reset and full reset.
+- Undo/redo (`Ctrl+Z`, `Ctrl+Shift+Z` / `Ctrl+Y`), "Before" press-and-hold comparison, per-field reset and full reset.
 - Named presets stored in the catalog; a preset can be applied to the current photo or to the whole multi-selection.
 - Full-resolution pixels are produced only by export or by the explicit save flow; the editor is single-photo by design, while presets can be batch-applied.
 
@@ -52,20 +54,20 @@ UberPhoto is a **local-first desktop photo manager** for real folders, built in 
 - Multi-selection editing: common values are shown, fields with different values are marked as mixed and are left untouched unless edited; clearing a field removes the tag.
 - Embedded metadata for JPEG, PNG, TIFF and WebP; native IPTC only where the format supports it (JPEG/TIFF), with matching XMP tags everywhere else.
 - RAW, HEIC and AVIF files are never rewritten: their XMP fields go to a `<file>.xmp` sidecar, created from the image's existing XMP or updated in place.
-- Edited fields stay in a per-photo draft that survives selection changes until **Salva** is pressed. Post-write verification rereads every file and reports values that could not be confirmed; tags not managed by the editor are preserved.
+- Edited fields stay in a per-photo draft that survives selection changes until **Save** is pressed. Post-write verification rereads every file and reports values that could not be confirmed; tags not managed by the editor are preserved.
 - Advanced read-only view of all ExifTool tags with group, name, value, writability and a live filter.
 
 ### GPS picker
 - OpenStreetMap map with a draggable marker; click to place, drag to refine.
-- Manual latitude/longitude/altitude entry, decimal or DMS formatting, and "Centra" to recenter the map on the photo's coordinates.
-- Multi-selection aware: mixed coordinates are flagged; the marker and place fields are kept as per-photo drafts and written to every selected photo by **Salva**.
+- Manual latitude/longitude/altitude entry, decimal or DMS formatting, and "Center" to recenter the map on the photo's coordinates.
+- Multi-selection aware: mixed coordinates are flagged; the marker and place fields are kept as per-photo drafts and written to every selected photo by **Save**.
 - Optional place search through Nominatim, only on explicit user action, with the required User-Agent and attribution.
 - Tiles are created lazily on first map open; no network access otherwise.
 
 ### Manual save
-- **Salva** in the top bar (or `Ctrl+S`) opens a confirmation dialog for the selected photos that have drafts. The save bar also reports pending photos outside the selection, so they are never lost silently.
-- **Nuova foto** creates `nome-modificata.ext` next to the original, with automatic `-2`, `-3`, … collision handling. The source file is never touched.
-- **Sovrascrivi originale** rewrites color and metadata in place and is irreversible; it requires an explicit confirmation checkbox. For batches, the dialog reports partial failures and keeps only the failed photos for retry.
+- **Save** in the top bar (or `Ctrl+S`) opens a confirmation dialog for the selected photos that have drafts. The save bar also reports pending photos outside the selection, so they are never lost silently.
+- **New photo** creates `name-edited.ext` next to the original, with automatic `-2`, `-3`, … collision handling. The source file is never touched.
+- **Overwrite original** rewrites color and metadata in place and is irreversible; it requires an explicit confirmation checkbox. For batches, the dialog reports partial failures and keeps only the failed photos for retry.
 - Color changes are rendered to a temporary file in the same folder and atomically renamed over the original only after metadata application succeeds. Metadata-only overwrites are written by ExifTool and verified by reading the file back.
 - JPEG, PNG, TIFF and WebP support new copies. RAW, HEIC and AVIF are never rewritten: their XMP metadata goes to the sidecar, and color edits cannot be applied.
 - Metadata and GPS fields are verified after writing; the save is reported as successful only when the read-back matches.
@@ -274,8 +276,8 @@ uberphoto/
 
 ## Architecture & design decisions
 
-- **The filesystem is the source of truth.** The SQLite index mirrors it for speed (sorting by capture date or rating, keyword/GPS filters) but never replaces it: deleting `index.db` simply rebuilds it on the next scan. Presets remain catalog data; color, metadata and GPS edits stay as drafts in memory until **Salva** writes them to disk.
-- **Non-destructive by default.** Color edits are recipes and the recommended save mode always creates a new copy. The original is rewritten only after the user explicitly chooses **Sovrascrivi originale** and confirms it. RAW, HEIC and AVIF files are never rewritten; their metadata uses sidecar XMP.
+- **The filesystem is the source of truth.** The SQLite index mirrors it for speed (sorting by capture date or rating, keyword/GPS filters) but never replaces it: deleting `index.db` simply rebuilds it on the next scan. Presets remain catalog data; color, metadata and GPS edits stay as drafts in memory until **Save** writes them to disk.
+- **Non-destructive by default.** Color edits are recipes and the recommended save mode always creates a new copy. The original is rewritten only after the user explicitly chooses **Overwrite original** and confirms it. RAW, HEIC and AVIF files are never rewritten; their metadata uses sidecar XMP.
 - **Immediate-mode UI, background pipelines.** egui renders on the main thread; directory scans, thumbnail decoding (rayon pool sized to the machine), preview decoding, editing previews, metadata operations and export all run off-thread and deliver results through channels with **latest-wins** semantics, so stale work is discarded instead of blocking.
 - **Only visible work is done.** Thumbnails are requested for cells currently on screen; the LRU cache (2,000 textures, quantized size buckets) keeps memory bounded.
 - **Metadata reliability first.** All metadata read/write and export verification go through ExifTool as an external process with structured arguments (never a shell), so the same tag semantics apply on every platform.
@@ -308,8 +310,8 @@ uberphoto/
 
 - UI preferences (recent folders, last folder, thumbnail size) are stored by eframe in RON format, typically at:
   - Linux: `~/.local/share/uberphoto/app.ron`
-  - macOS: `~/Library/Application Support/uberphoto/app.ron`
-  - Windows: `%APPDATA%\uberphoto\app.ron`
+  - macOS: `~/Library/Application Support/UberPhoto/app.ron`
+  - Windows: `%APPDATA%\UberPhoto\data\app.ron`
 - The SQLite catalog (`index.db`, WAL mode) lives in the same data directory and holds the folder index plus edit recipes and presets. It is disposable: photos and their embedded metadata remain authoritative.
 - Log verbosity follows `RUST_LOG` (default `info`).
 

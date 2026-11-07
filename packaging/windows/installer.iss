@@ -1,6 +1,6 @@
-; Installer Windows di UberPhoto (Inno Setup 6).
-; Compilazione: iscc /DMyAppVersion=0.3.0 packaging\windows\installer.iss
-; Richiede che packaging\windows\package.ps1 sia già stato eseguito.
+; Windows installer for UberPhoto (Inno Setup 6).
+; Build: iscc /DMyAppVersion=0.3.0 packaging\windows\installer.iss
+; Requires packaging\windows\package.ps1 to have been run first.
 
 #define MyAppName "UberPhoto"
 #ifndef MyAppVersion
@@ -49,8 +49,8 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
 
-; La disinstallazione rimuove anche i dati utente (indice, impostazioni,
-; preset, cronologia e cache), così non restano residui nel profilo.
+; Uninstallation also removes user data (index, settings, presets,
+; history and cache), so no residues are left in the profile.
 [UninstallDelete]
 Type: filesandordirs; Name: "{userappdata}\{#MyAppName}"
 Type: filesandordirs; Name: "{localappdata}\{#MyAppName}"

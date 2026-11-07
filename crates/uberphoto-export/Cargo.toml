@@ -1,6 +1,6 @@
 [package]
 name = "uberphoto-export"
-description = "Export for Web: ridimensionamento, profilo ICC, metadati e report di verifica"
+description = "Export for Web: resizing, ICC profile, metadata and verification report"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

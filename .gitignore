@@ -1,21 +1,21 @@
-# File compilati da Cargo
+# Cargo build output
 /target
 
-# Backup e artefatti
+# Backups and artifacts
 **/*.rs.bk
 *.pdb
 
-# Sistema operativo
+# Operating system
 .DS_Store
 Thumbs.db
 
-# Segreti e configurazione locale
+# Secrets and local configuration
 .env
 .env.*
 *.pem
 *.key
 
-# Fotografie e dati di prova: mai nel repository
+# Photographs and test data: never in the repository
 *.jpg
 *.jpeg
 *.tif
@@ -37,9 +37,9 @@ index.db
 index.db-*
 !assets/UberPhoto.png
 
-# Cartelle di lavoro locali
+# Local working folders
 /testdata/
 /screenshot/
 
-# Specifica privata del prodotto, non pubblicata
+# Private product specification, not published
 /PRODUCT.md

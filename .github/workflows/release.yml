@@ -16,25 +16,25 @@ env:
 
 jobs:
   linux:
-    name: Pacchetto Linux
+    name: Linux package
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout del sorgente
+      - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Toolchain Rust
+      - name: Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache Cargo
+      - name: Cargo cache
         uses: Swatinem/rust-cache@v2
 
       - name: Build release
         run: cargo build --release --locked -p uberphoto-app
 
-      - name: Pacchetto Debian (.deb) con ExifTool incluso
+      - name: Debian package (.deb) with bundled ExifTool
         run: bash packaging/linux/build-deb.sh
 
-      - name: Archivio portabile con ExifTool incluso
+      - name: Portable archive with bundled ExifTool
         run: |
           VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
           STAGE=target/linux-portable
@@ -46,7 +46,7 @@ jobs:
           cp README.md CHANGELOG.md "$STAGE/"
           tar -czf uberphoto-linux-x86_64.tar.gz -C "$STAGE" .
 
-      - name: Carica artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: uberphoto-linux
@@ -54,7 +54,7 @@ jobs:
             target/uberphoto_*_amd64.deb
             uberphoto-linux-x86_64.tar.gz
 
-      - name: Allega i pacchetti alla Release
+      - name: Attach packages to the release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
@@ -64,31 +64,31 @@ jobs:
           generate_release_notes: true
 
   macos-aarch64:
-    name: Pacchetto macOS (Apple Silicon)
+    name: macOS package (Apple Silicon)
     runs-on: macos-latest
     steps:
-      - name: Checkout del sorgente
+      - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Toolchain Rust
+      - name: Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache Cargo
+      - name: Cargo cache
         uses: Swatinem/rust-cache@v2
 
       - name: Build release
         run: cargo build --release --locked -p uberphoto-app
 
-      - name: Bundle .app con ExifTool incluso
+      - name: .app bundle with bundled ExifTool
         run: MACOS_ARCH=aarch64 bash packaging/macos/bundle.sh
 
-      - name: Carica artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: uberphoto-macos-aarch64
           path: target/uberphoto-macos-aarch64.app.tar.gz
 
-      - name: Allega il pacchetto alla Release
+      - name: Attach package to the release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
@@ -96,36 +96,36 @@ jobs:
           generate_release_notes: true
 
   macos-x86_64:
-    name: Pacchetto macOS (Intel, sperimentale)
+    name: macOS package (Intel, experimental)
     continue-on-error: true
     runs-on: macos-latest
     steps:
-      - name: Checkout del sorgente
+      - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Toolchain Rust con target Intel
+      - name: Rust toolchain with Intel target
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-apple-darwin
 
-      - name: Cache Cargo
+      - name: Cargo cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Build release (cross-compilazione Intel)
+      - name: Release build (Intel cross-compilation)
         run: cargo build --release --locked -p uberphoto-app --target x86_64-apple-darwin
 
-      - name: Bundle .app con ExifTool incluso
+      - name: .app bundle with bundled ExifTool
         run: |
           BIN=target/x86_64-apple-darwin/release/uberphoto-app \
             MACOS_ARCH=x86_64 bash packaging/macos/bundle.sh
 
-      - name: Carica artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: uberphoto-macos-x86_64
           path: target/uberphoto-macos-x86_64.app.tar.gz
 
-      - name: Allega il pacchetto alla Release
+      - name: Attach package to the release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
@@ -137,12 +137,12 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Scarica gli artifact
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: Genera SHA256SUMS
+      - name: Generate SHA256SUMS
         run: |
           mkdir -p dist
           find artifacts -type f -exec cp {} dist/ \;
@@ -150,19 +150,19 @@ jobs:
           sha256sum * > ../SHA256SUMS
           cat ../SHA256SUMS
 
-      - name: Carica artifact checksums
+      - name: Upload artifact checksums
         uses: actions/upload-artifact@v4
         with:
           name: checksums
           path: SHA256SUMS
 
-      - name: Allega SHA256SUMS alla Release
+      - name: Attach SHA256SUMS to the release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: SHA256SUMS
 
-      - name: Imposta questa release come Latest
+      - name: Mark this release as Latest
         if: startsWith(github.ref, 'refs/tags/')
         uses: actions/github-script@v7
         with:
@@ -171,43 +171,43 @@ jobs:
             const { owner, repo } = context.repo;
             const { data: release } = await github.rest.repos.getReleaseByTag({ owner, repo, tag });
             await github.rest.repos.updateRelease({ owner, repo, release_id: release.id, make_latest: 'true' });
-            core.info(`Release ${tag} impostata come latest`);
+            core.info(`Release ${tag} marked as latest`);
 
   windows:
-    name: Pacchetto Windows
+    name: Windows package
     runs-on: windows-latest
     steps:
-      - name: Checkout del sorgente
+      - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Toolchain Rust
+      - name: Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache Cargo
+      - name: Cargo cache
         uses: Swatinem/rust-cache@v2
 
       - name: Build release
         run: cargo build --release --locked -p uberphoto-app
 
-      - name: ZIP portabile con ExifTool incluso
+      - name: Portable ZIP with bundled ExifTool
         shell: pwsh
         run: ./packaging/windows/package.ps1 -ExifToolVersion $env:EXIFTOOL_VERSION -ExifToolSha256 $env:EXIFTOOL_WIN_SHA256 2>&1 | Tee-Object -FilePath target\package-log.txt
 
-      - name: Installa Inno Setup
+      - name: Install Inno Setup
         shell: pwsh
         run: |
           choco install innosetup -y --no-progress
           $iscc = (Get-ChildItem "C:\Program Files (x86)\Inno Setup*\ISCC.exe" | Select-Object -First 1).FullName
           Split-Path $iscc | Out-File -FilePath $env:GITHUB_PATH -Append
 
-      - name: Installer Windows (.exe) con ExifTool incluso
+      - name: Windows installer (.exe) with bundled ExifTool
         shell: pwsh
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"$').Matches[0].Groups[1].Value
           iscc "/DMyAppVersion=$version" packaging\windows\installer.iss 2>&1 | Tee-Object -FilePath target\installer-log.txt
-          if ($LASTEXITCODE -ne 0) { throw "iscc uscito con codice $LASTEXITCODE" }
+          if ($LASTEXITCODE -ne 0) { throw "iscc exited with code $LASTEXITCODE" }
 
-      - name: Pubblica il log del packaging (diagnostica)
+      - name: Publish packaging log (diagnostics)
         if: failure()
         uses: actions/github-script@v7
         with:
@@ -217,7 +217,7 @@ jobs:
             for (const file of ['target/package-log.txt', 'target/installer-log.txt']) {
               try { log += `\n--- ${file} ---\n` + fs.readFileSync(file, 'utf8'); } catch (e) {}
             }
-            if (!log) log = 'nessun log disponibile';
+            if (!log) log = 'no log available';
             await github.rest.checks.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -225,10 +225,10 @@ jobs:
               head_sha: context.sha,
               status: 'completed',
               conclusion: 'neutral',
-              output: { title: 'Log packaging (coda)', summary: '```\n' + log.slice(-60000) + '\n```' },
+              output: { title: 'Packaging log (tail)', summary: '```\n' + log.slice(-60000) + '\n```' },
             });
 
-      - name: Carica artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: uberphoto-windows
@@ -236,7 +236,7 @@ jobs:
             target/uberphoto-windows-x86_64.zip
             target/uberphoto-windows-x86_64-setup.exe
 
-      - name: Allega i pacchetti alla Release
+      - name: Attach packages to the release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:

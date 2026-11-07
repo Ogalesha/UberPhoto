@@ -6,16 +6,16 @@ use std::sync::Arc;
 use eframe::egui;
 use tracing_subscriber::EnvFilter;
 
-/// Cartella in cui UberPhoto conserva indice, impostazioni, preset e cache.
+/// Directory where UberPhoto stores the index, settings, presets and cache.
 ///
-/// Deve restare allineata all'`app_id` passato a `eframe::run_native` e usato
-/// da `UberPhotoApp`: la disinstallazione rimuove proprio questa cartella.
+/// It must stay aligned with the `app_id` passed to `eframe::run_native` and
+/// used by `UberPhotoApp`: uninstallation removes exactly this directory.
 const APP_ID: &str = "UberPhoto";
 
 fn main() -> eframe::Result {
     if std::env::args().skip(1).any(|arg| arg == "--uninstall") {
         if let Err(err) = purge_user_data() {
-            eprintln!("Disinstallazione non riuscita: {err}");
+            eprintln!("Uninstall failed: {err}");
             std::process::exit(1);
         }
         return Ok(());
@@ -35,7 +35,7 @@ fn main() -> eframe::Result {
     if let Some(icon) = uberphoto_ui::app_icon() {
         viewport = viewport.with_icon(Arc::new(icon));
     } else {
-        tracing::warn!("icona dell'applicazione non decodificabile");
+        tracing::warn!("application icon could not be decoded");
     }
 
     let options = eframe::NativeOptions {
@@ -50,25 +50,38 @@ fn main() -> eframe::Result {
     )
 }
 
-/// Rimuove tutti i dati utente creati dall'applicazione: indice SQLite,
-/// impostazioni, preset, cronologia e cache delle mappe.
+/// Removes all user data created by the application: SQLite index,
+/// settings, presets, history and map cache.
 ///
-/// I file del programma vengono rimossi dal disinstallatore del sistema
-/// (`apt remove`, l'uninstaller di Windows, eliminazione del bundle macOS).
+/// Program files are removed by the system uninstaller (`apt remove`, the
+/// Windows uninstaller, deleting the macOS bundle).
 fn purge_user_data() -> std::io::Result<()> {
     let Some(dir) = user_data_dir() else {
-        println!("Nessuna cartella dati utente da rimuovere.");
+        println!("No user data directory to remove.");
         return Ok(());
     };
     if !dir.exists() {
-        println!("Nessun dato utente da rimuovere in {}", dir.display());
+        println!("No user data to remove in {}", dir.display());
         return Ok(());
     }
     std::fs::remove_dir_all(&dir)?;
-    println!("Dati utente rimossi: {}", dir.display());
+    println!("User data removed: {}", dir.display());
     Ok(())
 }
 
 fn user_data_dir() -> Option<PathBuf> {
-    eframe::storage_dir(APP_ID)
+    let dir = eframe::storage_dir(APP_ID)?;
+
+    // On Windows `eframe` appends a `data` subdirectory to the app directory.
+    // Remove the app root as well so the portable build leaves nothing behind.
+    #[cfg(windows)]
+    if dir.file_name().is_some_and(|name| name == "data") {
+        if let Some(parent) = dir.parent() {
+            if parent.file_name().is_some_and(|name| name == APP_ID) {
+                return Some(parent.to_path_buf());
+            }
+        }
+    }
+
+    Some(dir)
 }

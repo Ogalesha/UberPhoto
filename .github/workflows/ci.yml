@@ -17,23 +17,23 @@ permissions:
   checks: write
 
 jobs:
-  verifica:
-    name: Build, lint e test (${{ matrix.os }})
+  checks:
+    name: Build, lint and test (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - name: Checkout del sorgente
+      - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Toolchain Rust
+      - name: Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
-      - name: Cache Cargo
+      - name: Cargo cache
         uses: Swatinem/rust-cache@v2
 
       - name: ExifTool (Linux)
@@ -49,7 +49,7 @@ jobs:
         continue-on-error: true
         run: choco install exiftool -y --no-progress
 
-      - name: Formato (rustfmt)
+      - name: Formatting (rustfmt)
         run: cargo fmt --all --check
 
       - name: Lint (clippy)
@@ -61,29 +61,29 @@ jobs:
           set -o pipefail
           cargo test --workspace --no-fail-fast 2>&1 | tee test-output.txt
 
-      - name: Pubblica il log dei test (diagnostica)
+      - name: Publish test log (diagnostics)
         if: failure()
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            let log = 'nessun log disponibile (passo precedente senza output)';
+            let log = 'no log available (previous step produced no output)';
             try { log = fs.readFileSync('test-output.txt', 'utf8'); } catch (e) {}
             const tail = log.slice(-60000);
             await github.rest.checks.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              name: `Log test - ${context.job} (${process.env.RUNNER_OS})`,
+              name: `Test log - ${context.job} (${process.env.RUNNER_OS})`,
               head_sha: context.sha,
               status: 'completed',
               conclusion: 'neutral',
-              output: { title: 'Log dei test (coda)', summary: '```\n' + tail + '\n```' },
+              output: { title: 'Test log (tail)', summary: '```\n' + tail + '\n```' },
             });
 
       - name: Build release
         run: cargo build --release --locked -p uberphoto-app
 
-      - name: Verifica pacchetto Linux (.deb con ExifTool incluso)
+      - name: Verify Linux package (.deb with bundled ExifTool)
         if: runner.os == 'Linux'
         run: |
           bash packaging/linux/build-deb.sh
@@ -92,13 +92,13 @@ jobs:
           dpkg-deb --info "target/uberphoto_${VERSION}_amd64.deb"
           "$STAGE/usr/lib/uberphoto/exiftool/exiftool" -ver
 
-      - name: Verifica bundle macOS (.app con ExifTool incluso)
+      - name: Verify macOS bundle (.app with bundled ExifTool)
         if: runner.os == 'macOS'
         run: |
           MACOS_ARCH=aarch64 bash packaging/macos/bundle.sh
           ./target/UberPhoto.app/Contents/Resources/exiftool/exiftool -ver
 
-      - name: Verifica pacchetto Windows (ZIP e installer con ExifTool incluso)
+      - name: Verify Windows package (ZIP and installer with bundled ExifTool)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -108,9 +108,9 @@ jobs:
           $iscc = (Get-ChildItem "C:\Program Files (x86)\Inno Setup*\ISCC.exe" | Select-Object -First 1).FullName
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"$').Matches[0].Groups[1].Value
           & $iscc "/DMyAppVersion=$version" packaging\windows\installer.iss 2>&1 | Tee-Object -FilePath target\installer-log.txt -Append
-          if ($LASTEXITCODE -ne 0) { throw "iscc uscito con codice $LASTEXITCODE" }
+          if ($LASTEXITCODE -ne 0) { throw "iscc exited with code $LASTEXITCODE" }
 
-      - name: Pubblica il log del packaging Windows (diagnostica)
+      - name: Publish Windows packaging log (diagnostics)
         if: failure() && runner.os == 'Windows'
         uses: actions/github-script@v7
         with:
@@ -120,7 +120,7 @@ jobs:
             for (const file of ['target/package-log.txt', 'target/installer-log.txt', 'target/install-test-log.txt']) {
               try { log += `\n--- ${file} ---\n` + fs.readFileSync(file, 'utf8'); } catch (e) {}
             }
-            if (!log) log = 'nessun log disponibile';
+            if (!log) log = 'no log available';
             await github.rest.checks.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -128,10 +128,10 @@ jobs:
               head_sha: context.sha,
               status: 'completed',
               conclusion: 'neutral',
-              output: { title: 'Log packaging (coda)', summary: '```\n' + log.slice(-60000) + '\n```' },
+              output: { title: 'Packaging log (tail)', summary: '```\n' + log.slice(-60000) + '\n```' },
             });
 
-      - name: Smoke test GUI headless (Linux, Xvfb)
+      - name: Headless GUI smoke test (Linux, Xvfb)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get install -y xvfb libxkbcommon-x11-0 mesa-vulkan-drivers libvulkan1
@@ -139,26 +139,26 @@ jobs:
           LIBGL_ALWAYS_SOFTWARE=1 RUST_LOG=info,wgpu_core=info,wgpu_hal=info UBERPHOTO_SMOKE_EXIT_SECS=6 \
             xvfb-run -a -s "-screen 0 1280x800x24" ./target/release/uberphoto-app 2>&1 | tee smoke-output.txt
 
-      - name: Pubblica il log dello smoke test (diagnostica)
+      - name: Publish smoke test log (diagnostics)
         if: failure() && runner.os == 'Linux'
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            let log = 'nessun log disponibile (passo precedente senza output)';
+            let log = 'no log available (previous step produced no output)';
             try { log = fs.readFileSync('smoke-output.txt', 'utf8'); } catch (e) {}
             const tail = log.slice(-60000);
             await github.rest.checks.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              name: `Log smoke - ${context.job} (${process.env.RUNNER_OS})`,
+              name: `Smoke log - ${context.job} (${process.env.RUNNER_OS})`,
               head_sha: context.sha,
               status: 'completed',
               conclusion: 'neutral',
-              output: { title: 'Log dello smoke test (coda)', summary: '```\n' + tail + '\n```' },
+              output: { title: 'Smoke test log (tail)', summary: '```\n' + tail + '\n```' },
             });
 
-      - name: Test installazione Linux (.deb, avvio, rimozione)
+      - name: Linux install test (.deb, launch, removal)
         if: runner.os == 'Linux'
         run: |
           VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
@@ -171,25 +171,25 @@ jobs:
           sudo dpkg -P uberphoto
           test ! -e /usr/bin/uberphoto
 
-      - name: Smoke test GUI (macOS, sperimentale)
+      - name: GUI smoke test (macOS, experimental)
         if: runner.os == 'macOS'
         continue-on-error: true
         run: UBERPHOTO_SMOKE_EXIT_SECS=6 ./target/release/uberphoto-app
 
-      - name: Avvio del bundle macOS (.app)
+      - name: Launch macOS bundle (.app)
         if: runner.os == 'macOS'
         run: PATH=/usr/bin:/bin UBERPHOTO_SMOKE_EXIT_SECS=6 ./target/UberPhoto.app/Contents/MacOS/uberphoto
 
-      - name: Smoke test GUI (Windows, sperimentale)
+      - name: GUI smoke test (Windows, experimental)
         if: runner.os == 'Windows'
         continue-on-error: true
         shell: pwsh
         run: |
           $env:UBERPHOTO_SMOKE_EXIT_SECS = "6"
           & .\target\release\uberphoto-app.exe
-          if ($LASTEXITCODE -ne 0) { throw "uscita con codice $LASTEXITCODE" }
+          if ($LASTEXITCODE -ne 0) { throw "exited with code $LASTEXITCODE" }
 
-      - name: Test installazione Windows (installer, avvio, disinstallazione)
+      - name: Windows install test (installer, launch, uninstall)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -202,29 +202,29 @@ jobs:
             $dir = Join-Path $env:RUNNER_TEMP "UberPhotoInstall"
             if (Test-Path $dir) { Remove-Item -Recurse -Force $dir }
             $setup = (Resolve-Path "target\uberphoto-windows-x86_64-setup.exe").Path
-            Write-TestLog "Installazione in $dir"
+            Write-TestLog "Installing to $dir"
             $install = Start-Process -FilePath $setup -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/DIR=$dir" -Wait -PassThru
-            Write-TestLog "Exit code installer: $($install.ExitCode)"
-            if ($install.ExitCode -ne 0) { throw "installer uscito con codice $($install.ExitCode)" }
+            Write-TestLog "Installer exit code: $($install.ExitCode)"
+            if ($install.ExitCode -ne 0) { throw "installer exited with code $($install.ExitCode)" }
             foreach ($file in @("uberphoto.exe", "exiftool.exe", "exiftool_files\exiftool.pl")) {
-              if (-not (Test-Path (Join-Path $dir $file))) { throw "file mancante dopo l'installazione: $file" }
+              if (-not (Test-Path (Join-Path $dir $file))) { throw "missing file after installation: $file" }
             }
             $env:UBERPHOTO_SMOKE_EXIT_SECS = "6"
             $app = Start-Process -FilePath (Join-Path $dir "uberphoto.exe") -Wait -PassThru
-            Write-TestLog "Exit code applicazione: $($app.ExitCode)"
-            if ($app.ExitCode -ne 0) { throw "avvio uscito con codice $($app.ExitCode)" }
+            Write-TestLog "Application exit code: $($app.ExitCode)"
+            if ($app.ExitCode -ne 0) { throw "application exited with code $($app.ExitCode)" }
             $uninstaller = Get-ChildItem $dir -Filter "unins*.exe" | Select-Object -First 1
-            if (-not $uninstaller) { throw "disinstaller non trovato in $dir" }
-            Write-TestLog "Disinstallazione con $($uninstaller.FullName)"
+            if (-not $uninstaller) { throw "uninstaller not found in $dir" }
+            Write-TestLog "Uninstalling with $($uninstaller.FullName)"
             $uninstall = Start-Process -FilePath $uninstaller.FullName -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" -Wait -PassThru
-            Write-TestLog "Exit code disinstaller: $($uninstall.ExitCode)"
-            if ($uninstall.ExitCode -ne 0) { throw "disinstaller uscito con codice $($uninstall.ExitCode)" }
+            Write-TestLog "Uninstaller exit code: $($uninstall.ExitCode)"
+            if ($uninstall.ExitCode -ne 0) { throw "uninstaller exited with code $($uninstall.ExitCode)" }
             for ($i = 0; $i -lt 30 -and (Test-Path (Join-Path $dir "uberphoto.exe")); $i++) {
               Start-Sleep -Seconds 1
             }
-            if (Test-Path (Join-Path $dir "uberphoto.exe")) { throw "binario ancora presente dopo la disinstallazione" }
-            Write-TestLog "Test di installazione completato"
+            if (Test-Path (Join-Path $dir "uberphoto.exe")) { throw "binary still present after uninstallation" }
+            Write-TestLog "Install test completed"
           } catch {
-            Write-TestLog "ERRORE: $($_.Exception.Message)"
+            Write-TestLog "ERROR: $($_.Exception.Message)"
             throw
           }

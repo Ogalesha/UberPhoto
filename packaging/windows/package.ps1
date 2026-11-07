@@ -1,5 +1,5 @@
-# Crea lo ZIP portabile di UberPhoto per Windows con ExifTool incluso.
-# Uso: pwsh -File packaging/windows/package.ps1 [-Version 0.3.0]
+# Build the portable UberPhoto ZIP for Windows with bundled ExifTool.
+# Usage: pwsh -File packaging/windows/package.ps1 [-Version 0.3.0]
 param(
     [string]$Version = "",
     [string]$ExifToolVersion = "13.59",
@@ -11,7 +11,7 @@ $ProgressPreference = "SilentlyContinue"
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 $Bin = Join-Path $Root "target\release\uberphoto-app.exe"
 if (-not (Test-Path $Bin)) {
-    throw "binario non trovato: $Bin (esegui prima cargo build --release -p uberphoto-app)"
+    throw "binary not found: $Bin (run cargo build --release -p uberphoto-app first)"
 }
 
 if (-not $Version) {
@@ -24,25 +24,25 @@ $Extract = Join-Path $Cache "exiftool-$ExifToolVersion`_64"
 if (-not (Test-Path $Zip)) {
     New-Item -ItemType Directory -Force -Path $Cache | Out-Null
     $url = "https://sourceforge.net/projects/exiftool/files/exiftool-$ExifToolVersion`_64.zip/download"
-    Write-Host "Scarico ExifTool $ExifToolVersion da $url"
+    Write-Host "Downloading ExifTool $ExifToolVersion from $url"
     & curl.exe -fL --retry 5 --retry-all-errors --connect-timeout 30 -o $Zip $url
     if ($LASTEXITCODE -ne 0) {
-        throw "download di ExifTool fallito (curl codice $LASTEXITCODE)"
+        throw "ExifTool download failed (curl exit code $LASTEXITCODE)"
     }
 }
 if (-not (Test-Path $Zip) -or (Get-Item $Zip).Length -lt 1000000) {
-    throw "archivio ExifTool non valido: $Zip"
+    throw "invalid ExifTool archive: $Zip"
 }
 $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $Zip).Hash.ToLower()
 if ($hash -ne $ExifToolSha256.ToLower()) {
-    throw "checksum ExifTool non valido per $Zip`: $hash"
+    throw "invalid ExifTool checksum for $Zip`: $hash"
 }
 if (-not (Test-Path (Join-Path $Extract "exiftool(-k).exe"))) {
-    Write-Host "Estraggo $Zip in $Cache"
+    Write-Host "Extracting $Zip to $Cache"
     Expand-Archive -Path $Zip -DestinationPath $Cache -Force
 }
 if (-not (Test-Path (Join-Path $Extract "exiftool(-k).exe"))) {
-    throw "contenuto di ExifTool inatteso in $Extract"
+    throw "unexpected ExifTool content in $Extract"
 }
 
 $Stage = Join-Path $Root "target\windows-package"
