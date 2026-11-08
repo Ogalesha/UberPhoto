@@ -182,30 +182,99 @@ impl std::fmt::Debug for SaveService {
 
 fn esegui_lavoro(job: SaveJob, eventi: &Sender<SaveEvent>, repaint: &Arc<dyn Fn() + Send + Sync>) {
     let total = job.requests.len();
-    let mut saved = 0usize;
-    let mut failed = 0usize;
-    for request in job.requests {
-        match salva_foto(&request) {
-            Ok(outcome) => {
-                saved += 1;
+    let (saved, failed) = match save_batch(&job.requests) {
+        Ok(outcomes) => {
+            for outcome in outcomes {
                 let _ = eventi.send(SaveEvent::Saved(outcome));
             }
-            Err(error) => {
-                failed += 1;
+            (total, 0)
+        }
+        Err(error) => {
+            for request in &job.requests {
                 let _ = eventi.send(SaveEvent::Failed {
-                    source: request.path,
-                    error: format!("{error:#}"),
+                    source: request.path.clone(),
+                    error: error.to_string(),
                 });
             }
+            (0, total)
         }
-        repaint();
-    }
+    };
     let _ = eventi.send(SaveEvent::Finished {
         saved,
         failed,
         total,
     });
     repaint();
+}
+
+/// Prepares all photos privately before committing any user file.
+fn save_batch(requests: &[SaveRequest]) -> Result<Vec<SaveOutcome>, ExportError> {
+    let Some(first) = requests.first() else {
+        return Ok(Vec::new());
+    };
+    if requests.iter().any(|request| request.mode != first.mode) {
+        return Err(ExportError::Invalid(
+            "un lotto deve usare una sola modalità di salvataggio".to_owned(),
+        ));
+    }
+    let mut work = Vec::new();
+    let mut pairs = Vec::new();
+    let mut outcomes = Vec::new();
+    for request in requests {
+        if let Some(expected) = request.expected {
+            expected.verify(&request.path)?;
+        }
+        let staged = StagedFile::copy(&request.path, &request.path)?;
+        let mut actual_sidecar = uberphoto_metadata::sidecar_path(&request.path);
+        for (original, target) in [
+            (
+                request.path.with_extension("xmp"),
+                staged.path().with_extension("xmp"),
+            ),
+            (
+                uberphoto_metadata::sidecar_path(&request.path),
+                uberphoto_metadata::sidecar_path(staged.path()),
+            ),
+        ] {
+            if original.try_exists()? {
+                uberphoto_files::writable_regular_file(&original)?;
+                StagedFile::copy(&original, &target)?.publish(&target)?;
+                actual_sidecar = original;
+            }
+        }
+        let mut private_request = request.clone();
+        private_request.path = staged.path().to_owned();
+        private_request.expected = None;
+        let result = salva_foto(&private_request)?;
+        let sidecar =
+            !request.kind.capabilities().embedded_metadata && request.mode == SaveMode::Overwrite;
+        let (prepared, target, output) = if sidecar {
+            let appended = uberphoto_metadata::sidecar_path(staged.path());
+            let legacy = staged.path().with_extension("xmp");
+            let prepared = if appended.is_file() { appended } else { legacy };
+            (prepared, actual_sidecar, request.path.clone())
+        } else if request.mode == SaveMode::NewCopy {
+            let target = suggested_copy_path(&request.path)?;
+            (result.output, target.clone(), target)
+        } else {
+            (result.output, request.path.clone(), request.path.clone())
+        };
+        pairs.push((prepared, target));
+        outcomes.push(SaveOutcome {
+            source: request.path.clone(),
+            output,
+            created: request.mode == SaveMode::NewCopy,
+            warnings: result.warnings,
+        });
+        work.push(staged);
+    }
+    for request in requests {
+        if let Some(expected) = request.expected {
+            expected.verify(&request.path)?;
+        }
+    }
+    uberphoto_files::publish_file_batch(&pairs, first.mode == SaveMode::Overwrite)?;
+    Ok(outcomes)
 }
 
 /// Applica una richiesta di salvataggio con garanzia di rollback.
@@ -499,6 +568,108 @@ mod tests {
         assert!(error.contains("cambiata"), "{error}");
         assert_eq!(fs::read(&source).unwrap(), b"new external version");
         assert!(!dir.path().join(".uberphoto-backups").exists());
+    }
+
+    #[test]
+    fn a_bad_second_save_never_commits_the_first_photo() {
+        if exiftool().is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.jpg");
+        let second = dir.path().join("second.jpg");
+        crea_foto(&first, 20, 20);
+        crea_foto(&second, 20, 20);
+        let original = fs::read(&first).unwrap();
+        let requests: Vec<_> = [(&first, "5"), (&second, "99")]
+            .into_iter()
+            .map(|(path, rating)| SaveRequest {
+                path: path.clone(),
+                kind: FormatKind::Jpeg,
+                recipe: EditRecipe::default(),
+                edits: vec![MetadataEdit::Field(
+                    uberphoto_metadata::MetadataField::Rating,
+                    Some(rating.to_owned()),
+                )],
+                mode: SaveMode::Overwrite,
+                expected: None,
+            })
+            .collect();
+        assert!(save_batch(&requests).is_err());
+        assert_eq!(fs::read(&first).unwrap(), original);
+        assert_eq!(fs::read(&second).unwrap(), original);
+    }
+
+    #[test]
+    fn prepared_batches_commit_embedded_and_sidecar_metadata() {
+        let Some(tool) = exiftool() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let jpeg = dir.path().join("photo.jpg");
+        let raw = dir.path().join("photo.dng");
+        crea_foto(&jpeg, 20, 20);
+        fs::copy(&jpeg, &raw).unwrap();
+        let original_raw = fs::read(&raw).unwrap();
+        let requests: Vec<_> = [(&jpeg, FormatKind::Jpeg), (&raw, FormatKind::Dng)]
+            .into_iter()
+            .map(|(path, kind)| SaveRequest {
+                path: path.clone(),
+                kind,
+                recipe: EditRecipe::default(),
+                edits: vec![MetadataEdit::Field(
+                    uberphoto_metadata::MetadataField::Rating,
+                    Some("5".to_owned()),
+                )],
+                mode: SaveMode::Overwrite,
+                expected: None,
+            })
+            .collect();
+        let outcomes = save_batch(&requests).unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(fs::read(&raw).unwrap(), original_raw);
+        for path in [&jpeg, &uberphoto_metadata::sidecar_path(&raw)] {
+            let maps = tool.read(std::slice::from_ref(path), &[]).unwrap();
+            assert_eq!(
+                uberphoto_metadata::document_from_tags(&maps[0]).rating(),
+                Some(5)
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_new_copy_batch_keeps_every_original_unchanged() {
+        let Some(tool) = exiftool() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut requests = Vec::new();
+        for name in ["first.jpg", "second.jpg"] {
+            let path = dir.path().join(name);
+            crea_foto(&path, 20, 20);
+            requests.push(SaveRequest {
+                path,
+                kind: FormatKind::Jpeg,
+                recipe: EditRecipe::default(),
+                edits: vec![MetadataEdit::Field(
+                    uberphoto_metadata::MetadataField::Rating,
+                    Some("4".to_owned()),
+                )],
+                mode: SaveMode::NewCopy,
+                expected: None,
+            });
+        }
+        let original = fs::read(&requests[0].path).unwrap();
+        for outcome in save_batch(&requests).unwrap() {
+            assert_eq!(fs::read(&outcome.source).unwrap(), original);
+            let maps = tool
+                .read(std::slice::from_ref(&outcome.output), &[])
+                .unwrap();
+            assert_eq!(
+                uberphoto_metadata::document_from_tags(&maps[0]).rating(),
+                Some(4)
+            );
+        }
     }
 
     #[test]

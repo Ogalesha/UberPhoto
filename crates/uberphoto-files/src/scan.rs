@@ -57,6 +57,8 @@ pub fn scan_tree(dir: &Path, include_hidden: bool) -> Result<Vec<PhotoAsset>, st
             continue;
         }
 
+        crate::transaction::recover_directory(&current)?;
+
         let is_root = current.as_path() == dir;
         if let Err(err) = collect_files(&current, include_hidden, &mut named) {
             if is_root {

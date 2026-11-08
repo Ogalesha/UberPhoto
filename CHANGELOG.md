@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-08
+
+### Safety and recovery
+
+- Prepare complete photo/sidecar transfers and saves before changing any user file. Durable intent records allow interrupted batches to roll back when their folder is reopened. Outputs and displaced originals are retained rather than deleted.
+- Add **Backup** in the top bar to choose a separate backup volume. Each destructive operation requires a verified second copy when configured; an unavailable disk blocks the operation, including after restart.
+- Keep verified recovery copies for replacements, refuse self-copy and unsafe symbolic links, and verify metadata on private work files before publication.
+- Read and merge existing XMP sidecars, preserve unknown tags, and retain drafts until explicit save. Block export with unsaved metadata/GPS and fix author privacy fields.
+- Make scan, preview, geographic lookup, save, export, recovery and close transitions explicit; discard stale asynchronous results and retain filesystem changes received during writes.
+- Update TLS dependencies and add dependency auditing to CI. Require successful package builds before publishing a release.
+
+### Usability
+
+- Add recovery copies to the Information tab, improve narrow save dialogs and filters, and simplify the GitHub README.
+- Document recovery behavior and the difference between recoverable batches and instantaneous filesystem atomicity.
+
 ## [0.4.0] - 2026-11-07
 
 ### Added

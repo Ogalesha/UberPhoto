@@ -38,6 +38,8 @@ Thumbs.db
 *.bak
 *.pending
 **/.uberphoto-backups/
+**/.uberphoto-transactions/
+**/UberPhoto-backups/
 **/.uberphoto-work-*/
 app.ron
 geo-cache.json
@@ -48,6 +50,9 @@ index.db-*
 # Local working folders
 /testdata/
 /screenshot/
+
+# Internal documentation stays local
+/docs/
 
 # Private product specification, not published
 /PRODUCT.md

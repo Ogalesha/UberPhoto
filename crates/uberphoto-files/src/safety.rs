@@ -92,6 +92,7 @@ pub fn backup_file(source: &Path) -> io::Result<PathBuf> {
         .map_err(|error| error.error)?;
     sync_directory(&directory)?;
     sync_directory(parent)?;
+    crate::backup::mirror_backup(source, &path)?;
     Ok(path)
 }
 
@@ -216,11 +217,16 @@ impl StagedFile {
 
 /// Reserves a random backup name without leaving a file that could be mistaken
 /// for a completed backup after a crash.
-fn capture_path(target: &Path) -> io::Result<PathBuf> {
+pub(crate) fn capture_path(target: &Path) -> io::Result<PathBuf> {
     let directory = target
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(".uberphoto-backups");
+    match fs::create_dir(&directory) {
+        Ok(()) => sync_directory(target.parent().unwrap_or_else(|| Path::new(".")))?,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
     if !fs::symlink_metadata(&directory)?.file_type().is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,

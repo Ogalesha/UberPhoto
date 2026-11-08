@@ -32,32 +32,39 @@ pub struct BackupEntry {
 /// # Errors
 /// Rejects a symbolic-link backup directory and propagates directory errors.
 pub fn list_backups(original: &Path) -> io::Result<Vec<BackupEntry>> {
-    let directory = backup_directory(original)?;
-    match fs::symlink_metadata(&directory) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error),
-        Ok(metadata) if metadata.file_type().is_dir() => {}
-        Ok(_) => return Err(unsafe_backup_path()),
+    let mut directories = vec![backup_directory(original)?];
+    match crate::backup::external_directory(original) {
+        Ok(Some(directory)) => directories.push(directory),
+        Ok(None) => {}
+        Err(error) => tracing::warn!("backup esterno non disponibile: {error}"),
     }
     let mut backups = Vec::new();
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        let path = entry.path();
-        if !matches_original(&path, original) {
-            continue;
-        }
-        let metadata = match fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.file_type().is_file() => metadata,
-            Ok(_) => continue,
+    for directory in directories {
+        match fs::symlink_metadata(&directory) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
-        };
-        backups.push(BackupEntry {
-            path,
-            original: original.to_path_buf(),
-            modified: metadata.modified().ok(),
-            byte_size: metadata.len(),
-        });
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => return Err(unsafe_backup_path()),
+        }
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !matches_original(&path, original) {
+                continue;
+            }
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_file() => metadata,
+                Ok(_) => continue,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            backups.push(BackupEntry {
+                path,
+                original: original.to_path_buf(),
+                modified: metadata.modified().ok(),
+                byte_size: metadata.len(),
+            });
+        }
     }
     backups.sort_by(|a, b| {
         b.modified
@@ -128,7 +135,7 @@ fn original_parent(original: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
-fn matches_original(backup: &Path, original: &Path) -> bool {
+pub(crate) fn matches_original(backup: &Path, original: &Path) -> bool {
     let (Some(name), Some(original_name)) = (backup.file_name(), original.file_name()) else {
         return false;
     };
@@ -146,16 +153,16 @@ fn matches_original(backup: &Path, original: &Path) -> bool {
     !nonce.is_empty() && nonce.iter().all(u8::is_ascii_alphanumeric)
 }
 
-fn validate_backup(backup: &Path, original: &Path) -> io::Result<()> {
-    let directory = backup_directory(original)?;
-    if !fs::symlink_metadata(&directory)?.file_type().is_dir()
+pub(crate) fn validate_backup(backup: &Path, original: &Path) -> io::Result<()> {
+    let local = backup_directory(original)?;
+    let parent = backup.parent().ok_or_else(unsafe_backup_path)?;
+    let is_local = fs::canonicalize(parent).ok() == fs::canonicalize(&local).ok()
+        && fs::canonicalize(parent).is_ok();
+    if (!is_local && !crate::backup::is_external_backup(backup, original)?)
+        || !fs::symlink_metadata(parent)?.file_type().is_dir()
         || !fs::symlink_metadata(backup)?.file_type().is_file()
         || !matches_original(backup, original)
     {
-        return Err(unsafe_backup_path());
-    }
-    let parent = backup.parent().ok_or_else(unsafe_backup_path)?;
-    if fs::canonicalize(parent)? != fs::canonicalize(directory)? {
         return Err(unsafe_backup_path());
     }
     Ok(())

@@ -4,7 +4,7 @@
 
 Browse, edit metadata, geotag and export photos directly from your folders. No library import, no account, no photo uploads.
 
-**Safety fixes on `main` are not yet included in the published v0.4.0 packages.** Build from source for the protections described below.
+**Use v0.4.1 or newer for the recovery protections described below.**
 
 [Build the current version](#build-from-source) · [Published packages](https://github.com/Ogalesha/UberPhoto/releases/latest)
 
@@ -21,7 +21,7 @@ Linux · macOS · Windows. Release packages include ExifTool.
 
 **Save as a new photo is the default.** Replacing an existing photo requires confirmation and keeps a verified recovery copy in `.uberphoto-backups`. Metadata writes are checked before the original is replaced; new exports do not overwrite existing files.
 
-Recovery copies use additional space on the same disk. Keep an independent backup of important photographs.
+Transfers and saves prepare the whole batch first. Interrupted batches recover from a persistent journal when the folder is reopened. In **Backup**, choose a physically separate disk for a second verified copy; a configured disk must be connected before files can be changed. [Recovery details](docs/RECOVERY.md).
 
 ## Know the limits
 

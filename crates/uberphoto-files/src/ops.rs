@@ -14,7 +14,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::safety::{backup_file, files_equal, writable_regular_file, StagedFile};
+use std::collections::HashSet;
 
 /// Politica di risoluzione quando il nome esiste già nella destinazione.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,6 +132,8 @@ pub fn rename_asset(path: &Path, new_name: &str, policy: ConflictPolicy) -> File
 /// I sidecar non vengono processati singolarmente: seguono la loro foto.
 pub fn undo(report: &FileOpReport) -> FileOpReport {
     let mut out = FileOpReport::default();
+    let mut pairs = Vec::new();
+    let mut reserved = HashSet::new();
     let photos: Vec<&PathMove> = report
         .moved
         .iter()
@@ -139,14 +141,33 @@ pub fn undo(report: &FileOpReport) -> FileOpReport {
         .collect();
     for pair in photos.into_iter().rev() {
         let assets = AssetSet::collect(&pair.to);
-        transfer_asset(
-            &assets,
-            &pair.from,
-            ConflictPolicy::RenameAuto,
-            false,
-            false,
-            &mut out,
-        );
+        if assets.shared_legacy.is_some() {
+            out.failed.push((
+                pair.to.clone(),
+                "sidecar condiviso; annullamento interrotto".to_owned(),
+            ));
+            return out;
+        }
+        match plan_destinations(&assets, &pair.from, ConflictPolicy::RenameAuto, &reserved) {
+            Ok(Some(plan)) => {
+                reserved.insert(plan.photo_dest.clone());
+                reserved.extend(plan.sidecar_dests.iter().map(|(_, to)| to.clone()));
+                pairs.push((pair.to.clone(), plan.photo_dest));
+                pairs.extend(plan.sidecar_dests);
+            }
+            Ok(None) => unreachable!(),
+            Err(error) => {
+                out.failed.push((pair.to.clone(), error));
+                return out;
+            }
+        }
+    }
+    match transfer_set(&pairs, ConflictPolicy::RenameAuto, false, false) {
+        Ok(()) => out
+            .moved
+            .extend(pairs.into_iter().map(|(from, to)| PathMove { from, to })),
+        Err(error) if !pairs.is_empty() => out.failed.push((pairs[0].0.clone(), error.to_string())),
+        Err(_) => {}
     }
     out
 }
@@ -183,16 +204,57 @@ fn transfer(
         return report;
     }
 
+    let mut pairs = Vec::new();
+    let mut reserved = HashSet::new();
     for path in paths {
         let assets = AssetSet::collect(path);
         let Some(file_name) = path.file_name() else {
             report
                 .failed
                 .push((path.clone(), "percorso senza nome file".to_owned()));
-            continue;
+            return report;
         };
         let photo_dest = target_dir.join(file_name);
-        transfer_asset(&assets, &photo_dest, policy, copy, false, &mut report);
+        if !copy && assets.shared_legacy.is_some() {
+            report.failed.push((
+                path.clone(),
+                "sidecar condiviso tra più immagini; usa Copia".to_owned(),
+            ));
+            return report;
+        }
+        if !copy && photo_dest == *path {
+            report.skipped.push((
+                path.clone(),
+                "il file è già nella cartella di destinazione".to_owned(),
+            ));
+            continue;
+        }
+        match plan_destinations(&assets, &photo_dest, policy, &reserved) {
+            Ok(Some(plan)) => {
+                reserved.insert(plan.photo_dest.clone());
+                reserved.extend(plan.sidecar_dests.iter().map(|(_, to)| to.clone()));
+                pairs.push((path.clone(), plan.photo_dest));
+                pairs.extend(plan.sidecar_dests);
+            }
+            Ok(None) => report.skipped.push((
+                path.clone(),
+                "esiste già un file con questo nome".to_owned(),
+            )),
+            Err(error) => {
+                report.failed.push((path.clone(), error));
+                return report;
+            }
+        }
+    }
+    match transfer_set(&pairs, policy, copy, false) {
+        Ok(()) => report
+            .moved
+            .extend(pairs.into_iter().map(|(from, to)| PathMove { from, to })),
+        Err(error) => {
+            for path in paths {
+                report.failed.push((path.clone(), error.to_string()));
+            }
+        }
     }
     report
 }
@@ -277,7 +339,7 @@ fn transfer_asset(
         return;
     }
 
-    let plan = match plan_destinations(assets, photo_dest, policy) {
+    let plan = match plan_destinations(assets, photo_dest, policy, &HashSet::new()) {
         Ok(Some(plan)) => plan,
         Ok(None) => {
             report.skipped.push((
@@ -317,6 +379,7 @@ fn plan_destinations(
     assets: &AssetSet,
     photo_dest: &Path,
     policy: ConflictPolicy,
+    reserved: &HashSet<PathBuf>,
 ) -> Result<Option<DestinationPlan>, String> {
     let build = |dest: &Path| -> Result<Option<DestinationPlan>, String> {
         let sidecar_dests = map_sidecars(assets, dest)?;
@@ -331,12 +394,24 @@ fn plan_destinations(
         all.extend(map_sidecars(assets, dest)?.into_iter().map(|(_, to)| to));
         Ok(all
             .into_iter()
-            .filter(|path| fs::symlink_metadata(path).is_ok())
+            .filter(|path| reserved.contains(path) || fs::symlink_metadata(path).is_ok())
             .collect())
     };
 
     match policy {
-        ConflictPolicy::Replace => build(photo_dest),
+        ConflictPolicy::Replace => {
+            if conflicts(photo_dest)?
+                .iter()
+                .any(|path| reserved.contains(path))
+            {
+                Err(
+                    "più sorgenti hanno la stessa destinazione; scegli la rinomina automatica"
+                        .to_owned(),
+                )
+            } else {
+                build(photo_dest)
+            }
+        }
         ConflictPolicy::Skip => {
             if conflicts(photo_dest)?.is_empty() {
                 build(photo_dest)
@@ -409,80 +484,14 @@ fn split_name(file_name: &str) -> (&str, &str) {
     }
 }
 
-/// Stages every member before publishing, and removes no source until all
-/// destinations have been published and verified. A partial destination set
-/// may remain on failure; recovery copies and the sources are retained.
+/// Executes the entire selected photo/sidecar batch through a durable journal.
 fn transfer_set(
     pairs: &[(PathBuf, PathBuf)],
     policy: ConflictPolicy,
     copy: bool,
     _force_copy: bool,
 ) -> io::Result<()> {
-    for (_, target) in pairs {
-        if pairs
-            .iter()
-            .any(|(source, _)| same_file::is_same_file(source, target).unwrap_or(false))
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "la destinazione coincide con una sorgente",
-            ));
-        }
-    }
-    let mut stages = Vec::new();
-    let mut source_backups = Vec::new();
-    let mut destination_backups = Vec::new();
-    for (from, to) in pairs {
-        if same_file::is_same_file(from, to).unwrap_or(false) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "sorgente e destinazione sono lo stesso file",
-            ));
-        }
-        if !copy {
-            writable_regular_file(from)?;
-            source_backups.push(backup_file(from)?);
-        }
-        let backup = if policy == ConflictPolicy::Replace && fs::symlink_metadata(to).is_ok() {
-            Some(backup_file(to)?)
-        } else {
-            None
-        };
-        destination_backups.push(backup);
-        stages.push(StagedFile::copy(from, to)?);
-    }
-    for ((stage, (_, to)), backup) in stages.into_iter().zip(pairs).zip(&destination_backups) {
-        if let Some(backup) = backup {
-            stage.replace(to, backup)?;
-        } else {
-            stage.publish(to)?;
-        }
-    }
-    for (from, to) in pairs {
-        if !files_equal(from, to)? {
-            return Err(io::Error::other(
-                "destinazione non verificata; sorgenti conservate",
-            ));
-        }
-    }
-    if !copy {
-        // Validate the entire set again before removing any source.
-        for ((from, _), backup) in pairs.iter().zip(&source_backups) {
-            if !files_equal(from, backup)? {
-                return Err(io::Error::other(
-                    "sorgente modificata da un altro programma; rimozione annullata",
-                ));
-            }
-        }
-        for ((from, _), backup) in pairs.iter().zip(&source_backups) {
-            writable_regular_file(from)?;
-            // Keep the actual source as the recovery copy, rather than unlinking it.
-            fs::rename(from, backup)?;
-            crate::safety::sync_directory(backup.parent().unwrap_or_else(|| Path::new(".")))?;
-            crate::safety::sync_directory(from.parent().unwrap_or_else(|| Path::new(".")))?;
-        }
-    }
-    Ok(())
+    crate::transaction::execute(pairs, policy == ConflictPolicy::Replace, copy)
 }
 
 #[cfg(test)]

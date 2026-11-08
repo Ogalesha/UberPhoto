@@ -133,6 +133,11 @@ impl UberPhotoApp {
             next_scan_generation: 0,
         };
         app.state.logo = load_logo(&cc.egui_ctx);
+        if let Err(error) =
+            uberphoto_files::set_external_backup_directory(app.state.external_backup.clone())
+        {
+            app.state.error = Some(error.to_string());
+        }
         app.state.exiftool = exiftool_versione();
         if app.state.exiftool.is_none() {
             tracing::warn!("ExifTool non trovato: l'editor metadati resterà disabilitato");
@@ -1279,6 +1284,33 @@ impl UberPhotoApp {
     }
 
     fn handle_actions(&mut self, actions: UiActions) {
+        if actions.backup_pick {
+            if let Some(path) = rfd::FileDialog::new()
+                .set_title(t!("Scegli un disco di backup esterno"))
+                .pick_folder()
+            {
+                let validation = self.state.current_dir.as_ref().map_or(Ok(()), |source| {
+                    uberphoto_files::validate_external_backup_directory(&path, source)
+                });
+                match validation.and_then(|()| {
+                    uberphoto_files::set_external_backup_directory(Some(path.clone()))
+                }) {
+                    Ok(()) => {
+                        self.state.external_backup = Some(path);
+                        self.state.recovery = RecoveryState::Unloaded;
+                    }
+                    Err(error) => self.state.error = Some(error.to_string()),
+                }
+            }
+        }
+        if actions.backup_local {
+            if let Err(error) = uberphoto_files::set_external_backup_directory(None) {
+                self.state.error = Some(error.to_string());
+            } else {
+                self.state.external_backup = None;
+                self.state.recovery = RecoveryState::Unloaded;
+            }
+        }
         if let Some(path) = actions.load_backups {
             let mut sources = vec![
                 path.clone(),
@@ -2445,6 +2477,28 @@ impl UberPhotoApp {
                 }
                 ui.weak("Ctrl+S");
                 ui.separator();
+                ui.add_enabled_ui(!busy, |ui| {
+                    ui.menu_button(t!("Backup"), |ui| {
+                        if let Some(path) = &self.state.external_backup {
+                            ui.label(path.display().to_string());
+                            ui.weak(t!("Le scritture richiedono il disco di backup collegato."));
+                        } else {
+                            ui.weak(t!(
+                                "Solo copie locali: scegli un disco esterno per una seconda copia."
+                            ));
+                        }
+                        if ui.button(t!("Scegli un disco di backup esterno")).clicked() {
+                            actions.backup_pick = true;
+                            ui.close();
+                        }
+                        if self.state.external_backup.is_some()
+                            && ui.button(t!("Usa solo copie locali")).clicked()
+                        {
+                            actions.backup_local = true;
+                            ui.close();
+                        }
+                    });
+                });
                 ui.menu_button(format!("🌐 {}", self.state.language.native_name()), |ui| {
                     for language in Language::ALL {
                         let selected = language == self.state.language;

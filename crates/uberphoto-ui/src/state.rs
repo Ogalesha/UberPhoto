@@ -95,6 +95,7 @@ impl FormatFilter {
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PersistedState {
+    pub external_backup: Option<PathBuf>,
     pub recent_folders: Vec<PathBuf>,
     pub last_dir: Option<PathBuf>,
     pub thumb_size: Option<f32>,
@@ -805,6 +806,7 @@ impl ScanState {
 
 /// UI state; files and sidecars remain authoritative on disk.
 pub struct AppState {
+    pub external_backup: Option<PathBuf>,
     /// Lingua attiva dell'interfaccia.
     pub language: Language,
     pub root: Option<DirNode>,
@@ -882,6 +884,7 @@ impl AppState {
             let _ = gps.memory.set_zoom(zoom.clamp(2.0, 19.0));
         }
         Self {
+            external_backup: persisted.external_backup,
             language,
             root: None,
             current_dir: None,
@@ -936,6 +939,7 @@ impl AppState {
             .map(|position| (position.x(), position.y()))
             .unwrap_or((self.gps.my_position.x(), self.gps.my_position.y()));
         PersistedState {
+            external_backup: self.external_backup.clone(),
             recent_folders: self.recent_folders.clone(),
             last_dir: self.current_dir.clone(),
             thumb_size: Some(self.thumb_size),
@@ -1779,6 +1783,8 @@ impl ExportState {
 /// Evita di mutare lo stato nel mezzo del rendering.
 #[derive(Default)]
 pub struct UiActions {
+    pub backup_pick: bool,
+    pub backup_local: bool,
     /// Apri `dir` come nuova radice dell'esploratore.
     pub open_folder: Option<PathBuf>,
     /// Naviga nel browser su `dir` senza cambiare la radice.
