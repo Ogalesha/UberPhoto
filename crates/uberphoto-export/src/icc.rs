@@ -15,7 +15,7 @@ pub fn profilo_srgb() -> Vec<u8> {
 /// Ritorna `true` se è avvenuta una conversione reale. I profili non RGB
 /// (es. CMYK) non sono convertibili qui e vengono ignorati con un avviso.
 pub fn converti_in_srgb(profilo: &[u8], rgba: &mut [u8]) -> Result<bool, ExportError> {
-    if profilo.is_empty() || rgba.len() % 4 != 0 {
+    if profilo.is_empty() || !rgba.len().is_multiple_of(4) {
         return Ok(false);
     }
     let origine = Profile::new_icc(profilo)
@@ -43,13 +43,13 @@ pub fn converti_in_srgb(profilo: &[u8], rgba: &mut [u8]) -> Result<bool, ExportE
 
     let pixel = rgba.len() / 4;
     let mut rgb = Vec::with_capacity(pixel * 3);
-    for chunk in rgba.chunks_exact(4) {
+    for chunk in rgba.as_chunks::<4>().0 {
         rgb.extend_from_slice(&chunk[..3]);
     }
     let mut convertito = vec![0u8; pixel * 3];
     trasformazione.transform_pixels(&rgb, &mut convertito);
 
-    for (indice, chunk) in rgba.chunks_exact_mut(4).enumerate() {
+    for (indice, chunk) in rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         chunk[..3].copy_from_slice(&convertito[indice * 3..indice * 3 + 3]);
     }
     Ok(true)

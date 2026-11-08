@@ -17,6 +17,24 @@ permissions:
   checks: write
 
 jobs:
+  security:
+    name: Dependency security audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+
+      - name: Audit locked dependencies
+        run: cargo audit
+
   checks:
     name: Build, lint and test (${{ matrix.os }})
     strategy:
@@ -46,20 +64,23 @@ jobs:
 
       - name: ExifTool (Windows)
         if: runner.os == 'Windows'
-        continue-on-error: true
         run: choco install exiftool -y --no-progress
+
+      - name: Require metadata engine for tests
+        shell: bash
+        run: exiftool -ver
 
       - name: Formatting (rustfmt)
         run: cargo fmt --all --check
 
       - name: Lint (clippy)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Test
         shell: bash
         run: |
           set -o pipefail
-          cargo test --workspace --no-fail-fast 2>&1 | tee test-output.txt
+          cargo test --workspace --locked --no-fail-fast 2>&1 | tee test-output.txt
 
       - name: Publish test log (diagnostics)
         if: failure()

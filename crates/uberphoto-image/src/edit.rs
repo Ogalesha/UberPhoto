@@ -277,7 +277,7 @@ pub fn apply_recipe_rgba(
 
     if needs_channel_ops(&recipe) {
         let luts = build_luts(&recipe);
-        for pixel in pixels.chunks_exact_mut(4) {
+        for pixel in pixels.as_chunks_mut::<4>().0 {
             pixel[0] = luts[0][pixel[0] as usize];
             pixel[1] = luts[1][pixel[1] as usize];
             pixel[2] = luts[2][pixel[2] as usize];
@@ -469,7 +469,7 @@ fn linear_to_srgb(linear: f32) -> f32 {
 fn apply_saturation(pixels: &mut [u8], saturation: f32, vibrance: f32) {
     let saturation = saturation / 100.0;
     let vibrance = vibrance / 100.0;
-    for pixel in pixels.chunks_exact_mut(4) {
+    for pixel in pixels.as_chunks_mut::<4>().0 {
         let r = f32::from(pixel[0]);
         let g = f32::from(pixel[1]);
         let b = f32::from(pixel[2]);

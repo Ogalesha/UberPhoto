@@ -217,6 +217,33 @@ pub enum SuggestionTarget {
     Shown,
 }
 
+/// Exactly one geographic lookup can be active at a time.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum GeoTask {
+    #[default]
+    Idle,
+    Search(String),
+    Reverse {
+        location: GpsLocation,
+        selection: Vec<PathBuf>,
+    },
+}
+
+impl GeoTask {
+    pub fn is_busy(&self) -> bool {
+        !matches!(self, Self::Idle)
+    }
+
+    pub fn accepts_search(&self, query: &str) -> bool {
+        matches!(self, Self::Search(requested) if requested == query)
+    }
+
+    pub fn accepts_reverse(&self, location: GpsLocation, selection: &[PathBuf]) -> bool {
+        matches!(self, Self::Reverse { location: requested, selection: paths }
+            if *requested == location && paths == selection)
+    }
+}
+
 /// Bozza GPS di una singola foto, indipendente dalla selezione corrente.
 #[derive(Debug, Clone, Default)]
 pub struct GpsDraft {
@@ -271,10 +298,9 @@ pub struct GpsState {
     pub centered_for: Option<GpsLocation>,
     pub search_query: String,
     pub search_results: Vec<GeocodeResult>,
-    pub searching: bool,
+    pub task: GeoTask,
     /// Errore dell'ultima ricerca o reverse geocoding.
     pub geo_error: Option<String>,
-    pub reverse_pending: bool,
     /// Nota sull'ultimo suggerimento reverse applicato.
     pub reverse_note: Option<String>,
     /// Finestra con la mappa grande.
@@ -305,9 +331,8 @@ impl Default for GpsState {
             centered_for: None,
             search_query: String::new(),
             search_results: Vec::new(),
-            searching: false,
+            task: GeoTask::Idle,
             geo_error: None,
-            reverse_pending: false,
             reverse_note: None,
             large_map: false,
         }
@@ -421,6 +446,31 @@ impl GpsState {
 /// mai riscritti) sia dai metadati (che seguono il proprio flusso di
 /// salvataggio). La cronologia undo/redo è per foto: cambiando selezione
 /// viene scartata.
+#[derive(Default)]
+pub enum EditSourceState {
+    #[default]
+    Empty,
+    Loading,
+    Ready(Arc<EditSource>),
+    Failed(String),
+}
+
+impl EditSourceState {
+    pub fn ready(&self) -> Option<&Arc<EditSource>> {
+        match self {
+            Self::Ready(source) => Some(source),
+            _ => None,
+        }
+    }
+
+    pub fn error(&self) -> Option<&str> {
+        match self {
+            Self::Failed(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
 pub struct EditState {
     /// Foto a cui appartiene la ricetta corrente.
     pub path: Option<PathBuf>,
@@ -433,10 +483,7 @@ pub struct EditState {
     /// Ricetta all'inizio del trascinamento di un controllo.
     pub drag_base: Option<EditRecipe>,
     /// Sorgente decodificata condivisa col worker di elaborazione.
-    pub source: Option<Arc<EditSource>>,
-    /// Decodifica della sorgente in corso.
-    pub source_requested: bool,
-    pub source_error: Option<String>,
+    pub source_state: EditSourceState,
     /// Texture dell'originale, caricata alla prima necessità.
     pub original: Option<egui::TextureHandle>,
     pub original_size: egui::Vec2,
@@ -470,9 +517,7 @@ impl Default for EditState {
             undo: Vec::new(),
             redo: Vec::new(),
             drag_base: None,
-            source: None,
-            source_requested: false,
-            source_error: None,
+            source_state: EditSourceState::Empty,
             original: None,
             original_size: egui::Vec2::ZERO,
             edited: None,
@@ -644,11 +689,18 @@ impl EditState {
 }
 
 /// Finestra di conferma del salvataggio manuale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SavePhase {
+    #[default]
+    Ready,
+    Writing,
+}
+
 #[derive(Debug, Clone)]
 pub struct SaveDialog {
     pub mode: SaveMode,
     pub overwrite_confirmed: bool,
-    pub busy: bool,
+    pub phase: SavePhase,
     pub error: Option<String>,
     /// Foto rimaste da salvare (dopo un eventuale errore parziale).
     pub targets: Vec<PathBuf>,
@@ -665,7 +717,7 @@ impl Default for SaveDialog {
         Self {
             mode: SaveMode::NewCopy,
             overwrite_confirmed: false,
-            busy: false,
+            phase: SavePhase::Ready,
             error: None,
             targets: Vec::new(),
             completed: BTreeSet::new(),
@@ -675,8 +727,83 @@ impl Default for SaveDialog {
     }
 }
 
-/// Stato applicativo della UI. Il filesystem resta l'autorità: qui vivono
-/// soltanto le viste correnti (cartella aperta, elenco scansionato, selezione).
+/// Cached recovery copies loaded on explicit user request.
+#[derive(Debug)]
+pub struct RecoveryListing {
+    pub path: PathBuf,
+    pub entries: Vec<uberphoto_files::BackupEntry>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Default)]
+pub enum RecoveryState {
+    #[default]
+    Unloaded,
+    Loaded(RecoveryListing),
+    Restoring {
+        listing: RecoveryListing,
+        backup: PathBuf,
+    },
+}
+
+impl RecoveryState {
+    pub fn listing(&self) -> Option<&RecoveryListing> {
+        match self {
+            Self::Unloaded => None,
+            Self::Loaded(listing) | Self::Restoring { listing, .. } => Some(listing),
+        }
+    }
+
+    pub fn is_restoring(&self) -> bool {
+        matches!(self, Self::Restoring { .. })
+    }
+
+    pub fn start_restore(&mut self, backup: PathBuf) -> bool {
+        if !matches!(self, Self::Loaded(_)) {
+            return false;
+        }
+        let Self::Loaded(listing) = std::mem::take(self) else {
+            unreachable!();
+        };
+        *self = Self::Restoring { listing, backup };
+        true
+    }
+
+    pub fn finish_restore(&mut self) -> Option<PathBuf> {
+        if !matches!(self, Self::Restoring { .. }) {
+            return None;
+        }
+        let Self::Restoring { listing, backup } = std::mem::take(self) else {
+            unreachable!();
+        };
+        *self = Self::Loaded(listing);
+        Some(backup)
+    }
+}
+
+/// A scan request remains distinct even when the folder is unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ScanState {
+    #[default]
+    Idle,
+    Loading {
+        directory: PathBuf,
+        generation: u64,
+    },
+}
+
+impl ScanState {
+    pub fn is_loading(&self) -> bool {
+        matches!(self, Self::Loading { .. })
+    }
+
+    pub fn accepts(&self, directory: &Path, generation: u64) -> bool {
+        matches!(self, Self::Loading { directory: expected, generation: current }
+            if expected == directory && *current == generation)
+    }
+}
+
+/// UI state; files and sidecars remain authoritative on disk.
 pub struct AppState {
     /// Lingua attiva dell'interfaccia.
     pub language: Language,
@@ -702,7 +829,7 @@ pub struct AppState {
     pub thumb_size: f32,
     pub recent_folders: Vec<PathBuf>,
     pub inspector_tab: InspectorTab,
-    pub loading_dir: Option<PathBuf>,
+    pub scan: ScanState,
     pub error: Option<String>,
     /// Righe dell'indice relative alla cartella corrente, per gli ordinamenti
     /// e i filtri che richiedono i metadati.
@@ -712,6 +839,7 @@ pub struct AppState {
     pub new_folder_prompt: Option<NewFolderPrompt>,
     pub delete_dir_prompt: Option<DeleteDirPrompt>,
     pub op_status: Option<OpStatus>,
+    pub recovery: RecoveryState,
     /// Editor e cache dei metadati.
     pub meta: MetaState,
     /// Scheda GPS: mappa, coordinate e località.
@@ -775,7 +903,7 @@ impl AppState {
                 .clamp(MIN_THUMB_SIZE, MAX_THUMB_SIZE),
             recent_folders: persisted.recent_folders,
             inspector_tab: InspectorTab::Informazioni,
-            loading_dir: None,
+            scan: ScanState::Idle,
             error: None,
             index_rows: HashMap::new(),
             conflict_prompt: None,
@@ -783,6 +911,7 @@ impl AppState {
             new_folder_prompt: None,
             delete_dir_prompt: None,
             op_status: None,
+            recovery: RecoveryState::default(),
             meta: MetaState::default(),
             exiftool: None,
             logo: None,
@@ -827,6 +956,31 @@ impl AppState {
         self.recent_folders.retain(|existing| existing != dir);
         self.recent_folders.insert(0, dir.to_path_buf());
         self.recent_folders.truncate(10);
+    }
+
+    /// Whether the current browser view is narrowed by any filter.
+    pub fn has_active_filters(&self) -> bool {
+        !self.filter_text.trim().is_empty()
+            || self.filter_format != FormatFilter::All
+            || self.filter_rating.is_some()
+            || self.filter_gps
+            || !self.filter_keywords.trim().is_empty()
+    }
+
+    /// Restores all photographs without changing the current selection.
+    pub fn clear_filters(&mut self) {
+        self.filter_text.clear();
+        self.filter_format = FormatFilter::All;
+        self.filter_rating = None;
+        self.filter_gps = false;
+        self.filter_keywords.clear();
+    }
+
+    /// Export reads metadata from disk, so these drafts must be saved first.
+    pub fn export_needs_metadata_save(&self) -> bool {
+        self.selection
+            .iter()
+            .any(|path| self.meta_pending(path) || self.gps_pending(path))
     }
 
     /// Vero se c'è almeno una modifica in bozza da salvare.
@@ -1545,10 +1699,27 @@ impl AppState {
 }
 
 /// Scheda Esportazione: parametri correnti, avanzamento e report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExportPhase {
+    #[default]
+    Idle,
+    Running,
+    Cancelling,
+    Finished {
+        cancelled: bool,
+    },
+}
+
+impl ExportPhase {
+    pub fn is_busy(self) -> bool {
+        matches!(self, Self::Running | Self::Cancelling)
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct ExportState {
     pub settings: ExportSettings,
-    pub busy: bool,
+    pub phase: ExportPhase,
     /// File completati (esportati o falliti).
     pub done: usize,
     pub total: usize,
@@ -1556,20 +1727,32 @@ pub struct ExportState {
     pub failures: Vec<(PathBuf, String)>,
     pub summary: Option<String>,
     pub error: Option<String>,
-    pub cancelled: bool,
 }
 
 impl ExportState {
     /// Azzera l'esito della precedente esportazione prima di avviarne una.
     pub fn prepara(&mut self, total: usize) {
-        self.busy = true;
+        self.phase = ExportPhase::Running;
         self.done = 0;
         self.total = total;
         self.reports.clear();
         self.failures.clear();
         self.summary = None;
         self.error = None;
-        self.cancelled = false;
+    }
+
+    pub fn finish(&mut self, cancelled: bool) {
+        self.phase = ExportPhase::Finished { cancelled };
+    }
+
+    pub fn clear(&mut self) {
+        self.phase = ExportPhase::Idle;
+        self.done = 0;
+        self.total = 0;
+        self.reports.clear();
+        self.failures.clear();
+        self.summary = None;
+        self.error = None;
     }
 
     pub fn registra_report(&mut self, report: ExportReport) {
@@ -1602,6 +1785,10 @@ pub struct UiActions {
     pub browse_dir: Option<PathBuf>,
     /// Riscansiona la cartella corrente.
     pub refresh: bool,
+    /// Loads completed recovery copies for the selected photo and its sidecars.
+    pub load_backups: Option<PathBuf>,
+    /// Restores a backup as a new file, leaving the current photo untouched.
+    pub restore_backup: Option<(PathBuf, PathBuf)>,
     /// Apri la finestra di anteprima grande su questa foto.
     pub open_preview: Option<PathBuf>,
     /// Mostra la finestra di dialogo nativa per scegliere una cartella.
@@ -1666,6 +1853,117 @@ pub struct UiActions {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn scan_state_rejects_an_older_result_for_the_same_folder() {
+        let directory = PathBuf::from("/photos");
+        let scan = ScanState::Loading {
+            directory: directory.clone(),
+            generation: 2,
+        };
+        assert!(!scan.accepts(&directory, 1));
+        assert!(scan.accepts(&directory, 2));
+        assert!(!scan.accepts(Path::new("/other"), 2));
+    }
+
+    #[test]
+    fn reverse_geocoding_is_bound_to_the_requested_selection() {
+        let location = GpsLocation::new(45.0, 12.0, None).unwrap();
+        let task = GeoTask::Reverse {
+            location,
+            selection: vec![PathBuf::from("/photos/first.jpg")],
+        };
+        assert!(task.accepts_reverse(location, &[PathBuf::from("/photos/first.jpg")]));
+        assert!(!task.accepts_reverse(location, &[PathBuf::from("/photos/second.jpg")]));
+        assert!(!task.accepts_reverse(
+            GpsLocation::new(46.0, 12.0, None).unwrap(),
+            &[PathBuf::from("/photos/first.jpg")]
+        ));
+    }
+
+    #[test]
+    fn recovery_cannot_start_twice_or_finish_twice() {
+        let listing = RecoveryListing {
+            path: PathBuf::from("/photos/photo.jpg"),
+            entries: Vec::new(),
+            error: None,
+        };
+        let mut recovery = RecoveryState::Loaded(listing);
+        let backup = PathBuf::from("/photos/.uberphoto-backups/photo.jpg.abc.bak");
+        assert!(recovery.start_restore(backup.clone()));
+        assert!(!recovery.start_restore(backup.clone()));
+        assert_eq!(recovery.finish_restore(), Some(backup));
+        assert_eq!(recovery.finish_restore(), None);
+        assert!(recovery.listing().is_some());
+    }
+
+    #[test]
+    fn export_phase_has_one_active_or_terminal_state() {
+        let mut export = ExportState::default();
+        assert_eq!(export.phase, ExportPhase::Idle);
+        export.prepara(2);
+        assert!(export.phase.is_busy());
+        export.phase = ExportPhase::Cancelling;
+        assert!(export.phase.is_busy());
+        export.finish(true);
+        assert_eq!(export.phase, ExportPhase::Finished { cancelled: true });
+        assert!(!export.phase.is_busy());
+        export.clear();
+        assert_eq!(export.phase, ExportPhase::Idle);
+    }
+
+    #[test]
+    fn export_requires_saved_metadata_for_selected_photos_but_accepts_color_drafts() {
+        let mut state = AppState::new(PersistedState::default());
+        let photo = PathBuf::from("/photos/a.jpg");
+        let other = PathBuf::from("/photos/b.jpg");
+        state.selection.insert(photo.clone());
+        state.edit.drafts.insert(
+            photo.clone(),
+            EditRecipe {
+                exposure: 1.0,
+                ..Default::default()
+            },
+        );
+        state
+            .meta
+            .drafts
+            .entry(other)
+            .or_default()
+            .insert(MetadataField::Title, Some("Outside selection".to_owned()));
+        assert!(!state.export_needs_metadata_save());
+        state
+            .meta
+            .drafts
+            .entry(photo.clone())
+            .or_default()
+            .insert(MetadataField::Title, Some("New title".to_owned()));
+        assert!(state.export_needs_metadata_save());
+        state.meta.drafts.remove(&photo);
+        state.gps.drafts.entry(photo).or_default().coordinates = Some(None);
+        assert!(
+            state.export_needs_metadata_save(),
+            "GPS removal must also be saved before export"
+        );
+    }
+
+    #[test]
+    fn clearing_all_filters_restores_photos_and_keeps_the_selection() {
+        let mut state = AppState::new(PersistedState::default());
+        state.set_entries(vec![asset("/photos/a.jpg"), asset("/photos/b.jpg")]);
+        let photo = PathBuf::from("/photos/a.jpg");
+        state.selection.insert(photo.clone());
+        state.filter_text = "missing".to_owned();
+        state.filter_format = FormatFilter::Raw;
+        state.filter_rating = Some(5);
+        state.filter_gps = true;
+        state.filter_keywords = "missing".to_owned();
+        assert!(state.visible_indices().is_empty());
+        state.clear_filters();
+        assert!(!state.has_active_filters());
+        assert_eq!(state.visible_indices().len(), 2);
+        assert!(state.selection.contains(&photo));
+    }
 
     fn asset(path: &str) -> PhotoAsset {
         PhotoAsset {

@@ -362,7 +362,7 @@ fn ricerca(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
             ui.weak(
                 t!("Ricerca su richiesta tramite Nominatim, fino a 5 risultati. La ricerca non parte mentre si digita."),
             );
-            let busy = state.gps.searching || state.gps.reverse_pending;
+            let busy = state.gps.task.is_busy();
             let response = ui.add(
                 egui::TextEdit::singleline(&mut state.gps.search_query)
                     .hint_text(t!("es. Duomo di Milano"))
@@ -387,7 +387,10 @@ fn ricerca(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
                     .clicked()
                 {
                     actions.geocode_reverse = state.gps.marker;
-                    state.gps.reverse_pending = true;
+                    state.gps.task = crate::state::GeoTask::Reverse {
+                        location: state.gps.marker.expect("enabled marker"),
+                        selection: state.selected_paths(),
+                    };
                     state.gps.geo_error = None;
                     state.gps.reverse_note = None;
                 }
@@ -396,7 +399,7 @@ fn ricerca(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
                 }
             });
             if let Some(query) = avvia {
-                state.gps.searching = true;
+                state.gps.task = crate::state::GeoTask::Search(query.clone());
                 state.gps.geo_error = None;
                 state.gps.reverse_note = None;
                 actions.geocode_search = Some(query);

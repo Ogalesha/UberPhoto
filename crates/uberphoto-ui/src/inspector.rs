@@ -33,14 +33,14 @@ pub fn ui(ui: &mut egui::Ui, state: &mut AppState, thumbs: &ThumbCache, actions:
         .auto_shrink([false, false])
         .show(ui, |ui| match state.inspector_tab {
             InspectorTab::Colori => crate::editor::ui(ui, state, actions),
-            InspectorTab::Informazioni => informazioni(ui, state, thumbs),
+            InspectorTab::Informazioni => informazioni(ui, state, thumbs, actions),
             InspectorTab::Metadati => metadati(ui, state, actions),
             InspectorTab::Gps => crate::gps::ui(ui, state, actions),
             InspectorTab::Esportazione => crate::export::ui(ui, state, actions),
         });
 }
 
-fn informazioni(ui: &mut egui::Ui, state: &AppState, thumbs: &ThumbCache) {
+fn informazioni(ui: &mut egui::Ui, state: &AppState, thumbs: &ThumbCache, actions: &mut UiActions) {
     let selected = state.selected_assets();
 
     match selected.as_slice() {
@@ -52,7 +52,10 @@ fn informazioni(ui: &mut egui::Ui, state: &AppState, thumbs: &ThumbCache) {
                 "Seleziona una o più foto nel browser: i dettagli si aggiornano automaticamente."
             ));
         }
-        [asset] => singola(ui, asset, thumbs),
+        [asset] => {
+            singola(ui, asset, thumbs);
+            recovery_copies(ui, state, &asset.path, actions);
+        }
         many => multipla(ui, many),
     }
 
@@ -107,6 +110,71 @@ fn singola(ui: &mut egui::Ui, asset: &PhotoAsset, thumbs: &ThumbCache) {
         });
 }
 
+fn recovery_copies(
+    ui: &mut egui::Ui,
+    state: &AppState,
+    path: &std::path::Path,
+    actions: &mut UiActions,
+) {
+    ui.add_space(10.0);
+    egui::CollapsingHeader::new(t!("Copie di recupero")).show(ui, |ui| {
+        let Some(listing) = state
+            .recovery
+            .listing()
+            .filter(|listing| listing.path == path)
+        else {
+            actions.load_backups = Some(path.to_owned());
+            ui.spinner();
+            return;
+        };
+        ui.label(t!("Crea una nuova copia senza modificare foto o backup."));
+        if let Some(error) = &listing.error {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
+        if listing.entries.is_empty() {
+            ui.weak(t!("Nessuna copia di recupero disponibile."));
+        } else {
+            egui::ScrollArea::vertical()
+                .id_salt("recovery-copies")
+                .max_height(220.0)
+                .show_rows(ui, 58.0, listing.entries.len(), |ui, rows| {
+                    for index in rows {
+                        let entry = &listing.entries[index];
+                        ui.push_id(&entry.path, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                if let Some(modified) = entry.modified {
+                                    ui.label(format_time(modified));
+                                }
+                                ui.weak(format_bytes(entry.byte_size));
+                                if entry
+                                    .original
+                                    .extension()
+                                    .is_some_and(|ext| ext.eq_ignore_ascii_case("xmp"))
+                                {
+                                    ui.weak("XMP");
+                                }
+                            });
+                            if ui
+                                .add_enabled(
+                                    !state.recovery.is_restoring(),
+                                    egui::Button::new(t!("Crea copia")),
+                                )
+                                .on_hover_text(entry.path.display().to_string())
+                                .clicked()
+                            {
+                                actions.restore_backup =
+                                    Some((entry.path.clone(), entry.original.clone()));
+                            }
+                        });
+                    }
+                });
+        }
+        if ui.button(t!("Ricarica")).clicked() {
+            actions.load_backups = Some(path.to_owned());
+        }
+    });
+}
+
 fn multipla(ui: &mut egui::Ui, assets: &[&PhotoAsset]) {
     ui.add_space(8.0);
     ui.strong(t!("{count} foto selezionate", count = assets.len()));
@@ -131,7 +199,8 @@ fn multipla(ui: &mut egui::Ui, assets: &[&PhotoAsset]) {
 
 fn row(ui: &mut egui::Ui, key: &str, value: &str) {
     ui.label(egui::RichText::new(key).strong());
-    ui.label(value);
+    ui.add(egui::Label::new(value).truncate())
+        .on_hover_text(value);
     ui.end_row();
 }
 

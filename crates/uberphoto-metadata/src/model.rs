@@ -327,6 +327,37 @@ pub struct MetadataDocument {
 }
 
 impl MetadataDocument {
+    /// Applies sidecar values while retaining camera-produced technical data.
+    pub(crate) fn apply_sidecar(&mut self, sidecar: &Self, canonical: bool) {
+        for field in MetadataField::ALL {
+            if sidecar_tags(field).is_empty() {
+                continue;
+            }
+            if field.is_list() {
+                if canonical || !sidecar.list(field).is_empty() {
+                    self.set_list(field, sidecar.list(field).to_vec());
+                }
+            } else if canonical || sidecar.value(field).is_some() {
+                self.set_value(field, sidecar.value(field).map(str::to_owned));
+            }
+        }
+        if canonical || sidecar.gps.is_some() {
+            self.gps = sidecar.gps;
+        }
+        for role in LocationRole::ALL {
+            let source = sidecar.location(role);
+            let target = match role {
+                LocationRole::Created => &mut self.location_created,
+                LocationRole::Shown => &mut self.location_shown,
+            };
+            for field in LocationField::ALL {
+                if canonical || source.value(field).is_some() {
+                    target.set(field, source.value(field).map(str::to_owned));
+                }
+            }
+        }
+    }
+
     pub fn value(&self, field: MetadataField) -> Option<&str> {
         self.values.get(&field).map(String::as_str)
     }
@@ -618,7 +649,14 @@ pub fn document_from_tags(tags: &TagMap) -> MetadataDocument {
     document.set_value(MetadataField::Label, text(tags, &["XMP-xmp:Label"]));
     document.set_value(
         MetadataField::Notes,
-        text(tags, &["EXIF:UserComment", "XMP-exif:UserComment"]),
+        text(
+            tags,
+            &[
+                "ExifIFD:UserComment",
+                "EXIF:UserComment",
+                "XMP-exif:UserComment",
+            ],
+        ),
     );
     document.set_value(
         MetadataField::Identifier,
@@ -701,7 +739,11 @@ pub fn document_from_tags(tags: &TagMap) -> MetadataDocument {
         MetadataField::DateOriginal,
         text(
             tags,
-            &["EXIF:DateTimeOriginal", "XMP-photoshop:DateCreated"],
+            &[
+                "ExifIFD:DateTimeOriginal",
+                "EXIF:DateTimeOriginal",
+                "XMP-photoshop:DateCreated",
+            ],
         ),
     );
     document.set_value(
@@ -709,8 +751,11 @@ pub fn document_from_tags(tags: &TagMap) -> MetadataDocument {
         text(
             tags,
             &[
+                "ExifIFD:OffsetTimeOriginal",
                 "EXIF:OffsetTimeOriginal",
+                "ExifIFD:OffsetTimeDigitized",
                 "EXIF:OffsetTimeDigitized",
+                "ExifIFD:OffsetTime",
                 "EXIF:OffsetTime",
             ],
         ),
@@ -730,45 +775,77 @@ pub fn document_from_tags(tags: &TagMap) -> MetadataDocument {
         lens: text(
             tags,
             &[
+                "ExifIFD:LensModel",
                 "EXIF:LensModel",
                 "EXIF:Lens",
                 "XMP-aux:Lens",
                 "XMP-exifEX:LensModel",
             ],
         ),
-        focal_length: number(tags, &["EXIF:FocalLength"]).map(mm),
-        f_number: number(tags, &["EXIF:FNumber"]).map(aperture),
-        exposure_time: number(tags, &["EXIF:ExposureTime"]).map(seconds),
+        focal_length: number(tags, &["ExifIFD:FocalLength", "EXIF:FocalLength"]).map(mm),
+        f_number: number(tags, &["ExifIFD:FNumber", "EXIF:FNumber"]).map(aperture),
+        exposure_time: number(tags, &["ExifIFD:ExposureTime", "EXIF:ExposureTime"]).map(seconds),
         iso: number(
             tags,
             &[
+                "ExifIFD:ISO",
                 "EXIF:ISO",
+                "ExifIFD:ISOSetting",
                 "EXIF:ISOSetting",
+                "ExifIFD:RecommendedExposureIndex",
                 "EXIF:RecommendedExposureIndex",
             ],
         )
         .map(|value| value.round() as i64),
-        color_profile: text(tags, &["ICC_Profile:ProfileDescription", "EXIF:ColorSpace"]),
-        date_created: text(tags, &["EXIF:CreateDate", "XMP-xmp:CreateDate"]),
-        date_modified: text(tags, &["EXIF:ModifyDate", "XMP-xmp:ModifyDate"]),
+        color_profile: text(
+            tags,
+            &[
+                "ICC_Profile:ProfileDescription",
+                "ExifIFD:ColorSpace",
+                "EXIF:ColorSpace",
+            ],
+        ),
+        date_created: text(
+            tags,
+            &[
+                "ExifIFD:CreateDate",
+                "EXIF:CreateDate",
+                "XMP-xmp:CreateDate",
+            ],
+        ),
+        date_modified: text(
+            tags,
+            &["IFD0:ModifyDate", "EXIF:ModifyDate", "XMP-xmp:ModifyDate"],
+        ),
     };
 
-    let latitude = number(tags, &["Composite:GPSLatitude"]).or_else(|| {
-        gps_axis(
-            tags,
-            &["GPS:GPSLatitude", "EXIF:GPSLatitude"],
-            &["GPS:GPSLatitudeRef", "EXIF:GPSLatitudeRef"],
-        )
-    });
-    let longitude = number(tags, &["Composite:GPSLongitude"]).or_else(|| {
-        gps_axis(
-            tags,
-            &["GPS:GPSLongitude", "EXIF:GPSLongitude"],
-            &["GPS:GPSLongitudeRef", "EXIF:GPSLongitudeRef"],
-        )
-    });
+    let latitude = number(tags, &["Composite:GPSLatitude"])
+        .or_else(|| {
+            gps_axis(
+                tags,
+                &["GPS:GPSLatitude", "EXIF:GPSLatitude"],
+                &["GPS:GPSLatitudeRef", "EXIF:GPSLatitudeRef"],
+            )
+        })
+        .or_else(|| number(tags, &["XMP-exif:GPSLatitude"]));
+    let longitude = number(tags, &["Composite:GPSLongitude"])
+        .or_else(|| {
+            gps_axis(
+                tags,
+                &["GPS:GPSLongitude", "EXIF:GPSLongitude"],
+                &["GPS:GPSLongitudeRef", "EXIF:GPSLongitudeRef"],
+            )
+        })
+        .or_else(|| number(tags, &["XMP-exif:GPSLongitude"]));
     let altitude = number(tags, &["Composite:GPSAltitude"]).or_else(|| {
-        let value = number(tags, &["GPS:GPSAltitude", "EXIF:GPSAltitude"])?;
+        let value = number(
+            tags,
+            &[
+                "GPS:GPSAltitude",
+                "EXIF:GPSAltitude",
+                "XMP-exif:GPSAltitude",
+            ],
+        )?;
         let below = number(
             tags,
             &[
@@ -819,6 +896,10 @@ pub struct MetadataSummary {
 
 pub fn summary_from_tags(tags: &TagMap) -> MetadataSummary {
     let document = document_from_tags(tags);
+    summary_from_document(&document)
+}
+
+pub(crate) fn summary_from_document(document: &MetadataDocument) -> MetadataSummary {
     let keywords = document.list(MetadataField::Keywords);
     MetadataSummary {
         has_gps: document.gps.is_some(),
@@ -837,6 +918,86 @@ pub fn summary_from_tags(tags: &TagMap) -> MetadataSummary {
         gps_lat: document.gps.map(|gps| gps.latitude),
         gps_lon: document.gps.map(|gps| gps.longitude),
     }
+}
+
+/// Seeds a complete editable snapshot before adopting a partial sidecar.
+pub(crate) fn sidecar_snapshot_assignments(
+    document: &MetadataDocument,
+    format: FormatKind,
+    present: &TagMap,
+    original: &TagMap,
+) -> Result<Vec<String>, String> {
+    let mut assignments = Vec::new();
+    for field in MetadataField::ALL {
+        let tags = sidecar_tags(field);
+        if tags.is_empty() || tags.iter().any(|tag| present.contains_key(*tag)) {
+            continue;
+        }
+        // Preserve the original XMP representation, especially creator sequences,
+        // rather than converting arrays through the editor's display strings.
+        if tags.iter().all(|tag| original.contains_key(*tag)) {
+            for tag in tags {
+                match &original[*tag] {
+                    Value::Array(values) => {
+                        assignments.push(format!("{tag}="));
+                        for value in values.iter().filter_map(string_value) {
+                            assignments.push(format!("{tag}+={value}"));
+                        }
+                    }
+                    value => {
+                        if let Some(value) = string_value(value) {
+                            assignments.push(format!("{tag}={value}"));
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        if field.is_list() {
+            let values = document.list(field);
+            if !values.is_empty() {
+                for tag in sidecar_tags(field) {
+                    assignments.push(format!("{tag}="));
+                    for value in values {
+                        assignments.push(format!("{tag}+={value}"));
+                    }
+                }
+            }
+        } else if let Some(value) = document.value(field) {
+            assignments.extend(assignments_for(
+                &MetadataEdit::Field(field, Some(value.to_owned())),
+                format,
+                true,
+            )?);
+        }
+    }
+    if let Some(gps) = document.gps {
+        assignments.extend(assignments_for(
+            &MetadataEdit::Gps(Some(GpsLocation {
+                latitude: gps.latitude,
+                longitude: gps.longitude,
+                altitude: gps.altitude,
+            })),
+            format,
+            true,
+        )?);
+    }
+    for role in LocationRole::ALL {
+        for field in LocationField::ALL {
+            if let Some(value) = document.location(role).value(field) {
+                assignments.extend(assignments_for(
+                    &MetadataEdit::Location {
+                        role,
+                        field,
+                        value: Some(value.to_owned()),
+                    },
+                    format,
+                    true,
+                )?);
+            }
+        }
+    }
+    Ok(assignments)
 }
 
 // ---------------------------------------------------------------------------

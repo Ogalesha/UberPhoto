@@ -26,18 +26,17 @@ pub fn ui(
     images: &ImageService,
     actions: &mut UiActions,
 ) {
-    toolbar(ui, state, actions);
-    ui.separator();
-
     if state.current_dir.is_none() {
         schermata_iniziale(ui, state, actions);
         return;
     }
 
+    toolbar(ui, state, actions);
+    ui.separator();
     subfolder_strip(ui, state, actions);
     let visible = state.visible_indices().to_vec();
 
-    if state.loading_dir.is_some() && state.entries.is_empty() {
+    if state.scan.is_loading() && state.entries.is_empty() {
         ui.centered_and_justified(|ui| {
             ui.spinner();
         });
@@ -50,8 +49,12 @@ pub fn ui(
         } else {
             t!("Nessuna foto corrisponde al filtro")
         };
-        ui.centered_and_justified(|ui| {
-            ui.weak(message);
+        ui.vertical_centered(|ui| {
+            ui.add_space(32.0);
+            ui.label(message);
+            if !state.entries.is_empty() && ui.button(t!("Rimuovi tutti i filtri")).clicked() {
+                state.clear_filters();
+            }
         });
         return;
     }
@@ -70,7 +73,7 @@ pub fn ui(
         .auto_shrink([false, false])
         .show_rows(ui, row_h, rows, |ui, row_range| {
             for row in row_range {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     for col in 0..cols {
                         let visible_index = row * cols + col;
                         if visible_index >= visible.len() {
@@ -94,7 +97,7 @@ pub fn ui(
 }
 
 fn toolbar(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         if ui
             .button(t!("🔄 Aggiorna"))
             .on_hover_text(t!(
@@ -129,10 +132,14 @@ fn toolbar(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
 
         ui.separator();
         ui.label(t!("Miniature:"));
-        ui.add(
-            egui::Slider::new(&mut state.thumb_size, MIN_THUMB_SIZE..=MAX_THUMB_SIZE)
-                .show_value(false),
-        );
+        ui.scope(|ui| {
+            ui.spacing_mut().slider_width = 96.0;
+            ui.add(
+                egui::Slider::new(&mut state.thumb_size, MIN_THUMB_SIZE..=MAX_THUMB_SIZE)
+                    .show_value(false),
+            )
+            .on_hover_text(t!("Miniature:"));
+        });
 
         if !state.selection.is_empty() {
             ui.separator();
@@ -144,7 +151,7 @@ fn toolbar(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
         }
     });
 
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label(t!("Filtri:"));
         ui.add(
             egui::TextEdit::singleline(&mut state.filter_text)
@@ -187,6 +194,9 @@ fn toolbar(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
         );
         if !state.filter_keywords.is_empty() && ui.small_button("✕").clicked() {
             state.filter_keywords.clear();
+        }
+        if state.has_active_filters() && ui.button(t!("Rimuovi tutti i filtri")).clicked() {
+            state.clear_filters();
         }
     });
 }
@@ -281,6 +291,9 @@ fn cell(
     let selected = state.selection.contains(&path);
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(cell_w, cell_h), egui::Sense::click_and_drag());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::Role::Button, ui.is_enabled(), selected, &file_name)
+    });
 
     if selected {
         ui.painter().rect_filled(
@@ -359,15 +372,29 @@ fn cell(
         if row.has_gps {
             paint_gps_badge(&painter, image_rect.left_top() + egui::vec2(4.0, 4.0));
         }
-        if let Some(rating) = row.rating.filter(|rating| *rating > 0) {
-            paint_chip(
-                &painter,
-                image_rect.right_top() + egui::vec2(-4.0, 4.0),
-                egui::Align2::RIGHT_TOP,
-                &"★".repeat(rating.min(5) as usize),
-                11.0,
-            );
-        }
+    }
+    let draft_rating = state
+        .meta
+        .drafts
+        .get(&path)
+        .and_then(|draft| draft.get(&uberphoto_metadata::MetadataField::Rating))
+        .map(|value| {
+            value
+                .as_deref()
+                .and_then(|value| value.parse::<u8>().ok())
+                .unwrap_or(0)
+        });
+    if let Some(rating) = draft_rating
+        .or_else(|| row.and_then(|row| row.rating))
+        .filter(|rating| *rating > 0)
+    {
+        paint_chip(
+            &painter,
+            image_rect.right_top() + egui::vec2(-4.0, 4.0),
+            egui::Align2::RIGHT_TOP,
+            &"★".repeat(rating.min(5) as usize),
+            11.0,
+        );
     }
 
     let text_x = rect.center().x;

@@ -1,20 +1,19 @@
 //! Servizio di esportazione su thread dedicato, con avanzamento e annullamento.
 
 use std::ffi::OsString;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use tracing::warn;
 use uberphoto_core::FormatKind;
 use uberphoto_image::EditRecipe;
 use uberphoto_metadata::ExifTool;
 
 use crate::error::ExportError;
 use crate::icc::profilo_srgb;
-use crate::render::render_export;
+use crate::render::prepare_export;
 use crate::report::{build_report, ExportReport, ReportInput};
 use crate::settings::{ExportPreset, ExportSettings};
 
@@ -139,7 +138,28 @@ fn esegui_lavoro(
 
     let tool = ExifTool::detect();
     let icc = profilo_srgb();
-    let icc_path = (tool.is_some() && !icc.is_empty()).then(|| write_icc_temporaneo(&icc));
+    let icc_file = if tool.is_some() && !icc.is_empty() {
+        match write_icc_temporaneo(&icc) {
+            Ok(file) => Some(file),
+            Err(error) => {
+                for item in &job.items {
+                    let _ = eventi.send(ExportEvent::Failed {
+                        source: item.path.clone(),
+                        error: error.to_string(),
+                    });
+                }
+                let _ = eventi.send(ExportEvent::Finished {
+                    exported: 0,
+                    failed: total,
+                    total,
+                    cancelled: false,
+                });
+                return;
+            }
+        }
+    } else {
+        None
+    };
     if tool.is_none() {
         // Senza ExifTool non si può garantire né copiare né verificare nulla.
         for item in &job.items {
@@ -185,7 +205,7 @@ fn esegui_lavoro(
             &job.settings,
             profilo.as_deref(),
             tool.as_ref(),
-            icc_path.as_deref(),
+            icc_file.as_ref().map(|file| file.path()),
         );
         match esito {
             Ok(report) => {
@@ -203,9 +223,6 @@ fn esegui_lavoro(
         repaint();
     }
 
-    if let Some(path) = icc_path {
-        let _ = std::fs::remove_file(path);
-    }
     let _ = eventi.send(ExportEvent::Finished {
         exported,
         failed,
@@ -232,15 +249,18 @@ fn esporta_item(
         return Err(ExportError::Invalid("ExifTool non disponibile".to_owned()));
     };
 
-    let rendered = render_export(&item.path, settings, &item.recipe, profilo)?;
-    match completa_metadati(&item.path, &rendered, settings, tool, icc_path) {
-        Ok(report) => Ok(report),
-        Err(err) => {
-            // Nessun file parziale con metadati non verificati.
-            let _ = std::fs::remove_file(&rendered.path);
-            Err(err)
-        }
+    let (staged, rendered, target) = prepare_export(&item.path, settings, &item.recipe, profilo)?;
+    let mut report = completa_metadati(&item.path, &rendered, settings, tool, icc_path)?;
+    if !report.verified() {
+        return Err(ExportError::Invalid(format!(
+            "verifica metadati fallita: {}; originale conservato",
+            report.lost.join(", ")
+        )));
     }
+    report.bytes = std::fs::metadata(staged.path())?.len();
+    staged.publish(&target)?;
+    report.output = target;
+    Ok(report)
 }
 
 fn completa_metadati(
@@ -363,21 +383,14 @@ pub(crate) fn argomenti_copia(
     args
 }
 
-pub(crate) fn write_icc_temporaneo(bytes: &[u8]) -> PathBuf {
-    static CONTATORE: AtomicU64 = AtomicU64::new(0);
-    let indice = CONTATORE.fetch_add(1, Ordering::Relaxed);
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|durata| durata.as_millis())
-        .unwrap_or_default();
-    let path = std::env::temp_dir().join(format!(
-        "uberphoto-srgb-{}-{millis}-{indice}.icc",
-        std::process::id()
-    ));
-    if let Err(err) = std::fs::write(&path, bytes) {
-        warn!("profilo sRGB temporaneo non scritto: {err}");
-    }
-    path
+pub(crate) fn write_icc_temporaneo(bytes: &[u8]) -> Result<tempfile::NamedTempFile, ExportError> {
+    let mut file = tempfile::Builder::new()
+        .prefix("uberphoto-srgb-")
+        .suffix(".icc")
+        .tempfile()?;
+    file.write_all(bytes)?;
+    file.as_file().sync_all()?;
+    Ok(file)
 }
 
 #[cfg(test)]

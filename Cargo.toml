@@ -16,7 +16,7 @@ members = [
 [workspace.package]
 version = "0.4.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.95"
 license = "MIT"
 
 [workspace.dependencies]
@@ -52,6 +52,7 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3"
+same-file = "1"
 ureq = { version = "3", default-features = false, features = [
     "rustls",
     "gzip",

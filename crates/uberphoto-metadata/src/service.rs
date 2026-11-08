@@ -4,18 +4,20 @@
 //! miniature, operazioni file): canale mpsc, nessun blocco della UI e
 //! richiesta di repaint al termine.
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, OnceLock};
 
 use uberphoto_core::{FormatKind, GpsLocation};
 
 use crate::error::MetadataError;
-use crate::exiftool::{sidecar_path, ExifTool};
+use crate::exiftool::{sidecar_path, ExifTool, TagMap};
 use crate::model::{
-    assignments_for, document_from_tags, raw_tags_from, summary_from_tags, LocationField,
-    LocationRole, MetadataDocument, MetadataEdit, MetadataField, MetadataSummary, RawTag,
+    assignments_for, document_from_tags, raw_tags_from, sidecar_snapshot_assignments,
+    summary_from_document, LocationField, LocationRole, MetadataDocument, MetadataEdit,
+    MetadataField, MetadataSummary, RawTag,
 };
 
 /// File per invocazione nelle letture riassuntive (indice).
@@ -40,6 +42,10 @@ const SUMMARY_TAGS: &[&str] = &[
     "IPTC:Keywords",
     "Composite:GPSLatitude",
     "Composite:GPSLongitude",
+    "XMP-exif:GPSLatitude",
+    "XMP-exif:GPSLongitude",
+    "XMP-exif:GPSAltitude",
+    "XMP-exif:GPSAltitudeRef",
 ];
 
 static TOOL: OnceLock<Option<ExifTool>> = OnceLock::new();
@@ -138,25 +144,33 @@ impl MetadataWriteReport {
 }
 
 pub struct MetadataService {
-    tx: Sender<MetadataRequest>,
-    rx: Receiver<MetadataOutcome>,
+    tx: Sender<(u64, MetadataRequest)>,
+    rx: Receiver<(u64, MetadataOutcome)>,
+    read_epoch: Arc<AtomicU64>,
     /// True mentre il worker sta servendo una richiesta (lettura o scrittura).
     busy: Arc<AtomicBool>,
 }
 
 impl MetadataService {
     pub fn new(repaint: Arc<dyn Fn() + Send + Sync>) -> Self {
-        let (tx, requests) = channel::<MetadataRequest>();
-        let (outcomes_tx, rx) = channel::<MetadataOutcome>();
+        let (tx, requests) = channel::<(u64, MetadataRequest)>();
+        let (outcomes_tx, rx) = channel::<(u64, MetadataOutcome)>();
         let busy = Arc::new(AtomicBool::new(false));
         let worker_busy = Arc::clone(&busy);
+        let read_epoch = Arc::new(AtomicU64::new(0));
+        let worker_epoch = read_epoch.clone();
 
         std::thread::Builder::new()
             .name("metadata".to_owned())
             .spawn(move || {
-                while let Ok(request) = requests.recv() {
+                while let Ok((epoch, request)) = requests.recv() {
+                    if !matches!(&request, MetadataRequest::Write { .. })
+                        && epoch != worker_epoch.load(Ordering::SeqCst)
+                    {
+                        continue;
+                    }
                     worker_busy.store(true, Ordering::Relaxed);
-                    if outcomes_tx.send(execute(request)).is_err() {
+                    if outcomes_tx.send((epoch, execute(request))).is_err() {
                         worker_busy.store(false, Ordering::Relaxed);
                         break;
                     }
@@ -166,11 +180,20 @@ impl MetadataService {
             })
             .expect("avvio del thread metadata");
 
-        Self { tx, rx, busy }
+        Self {
+            tx,
+            rx,
+            busy,
+            read_epoch,
+        }
     }
 
     pub fn request(&self, request: MetadataRequest) {
-        if self.tx.send(request).is_err() {
+        if self
+            .tx
+            .send((self.read_epoch.load(Ordering::SeqCst), request))
+            .is_err()
+        {
             tracing::error!("servizio metadati non disponibile");
         }
     }
@@ -180,8 +203,20 @@ impl MetadataService {
         self.busy.load(Ordering::Relaxed)
     }
 
+    /// Invalidates pending reads without dropping completed writes.
+    pub fn invalidate_reads(&self) {
+        self.read_epoch.fetch_add(1, Ordering::SeqCst);
+    }
+
     pub fn try_recv(&self) -> Option<MetadataOutcome> {
-        self.rx.try_recv().ok()
+        while let Ok((epoch, outcome)) = self.rx.try_recv() {
+            if matches!(&outcome, MetadataOutcome::Written { .. })
+                || epoch == self.read_epoch.load(Ordering::SeqCst)
+            {
+                return Some(outcome);
+            }
+        }
+        None
     }
 }
 
@@ -200,78 +235,197 @@ fn execute(request: MetadataRequest) -> MetadataOutcome {
 }
 
 fn ha_errore(map: &crate::exiftool::TagMap) -> Option<String> {
-    map.get("Error").map(|value| match value {
-        serde_json::Value::String(text) => text.clone(),
-        other => other.to_string(),
-    })
+    map.get("Error")
+        .or_else(|| map.get("ExifTool:Error"))
+        .map(|value| match value {
+            serde_json::Value::String(text) => text.clone(),
+            other => other.to_string(),
+        })
+}
+
+/// An app-managed sidecar holds a complete editable snapshot, including
+/// deliberately absent values. Foreign sidecars remain partial overlays.
+const SIDECAR_CREATOR: &str = "UberPhoto";
+
+fn managed_sidecar(tags: &TagMap) -> bool {
+    tags.get("XMP-xmp:CreatorTool")
+        .and_then(serde_json::Value::as_str)
+        == Some(SIDECAR_CREATOR)
+}
+
+fn existing_sidecar(image: &Path) -> std::io::Result<Option<PathBuf>> {
+    for candidate in [sidecar_path(image), image.with_extension("xmp")] {
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(_) if candidate.is_file() => return Ok(Some(candidate)),
+            Ok(_) => return Err(std::io::Error::other("il sidecar non è un file regolare")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(None)
+}
+
+fn one_map(tool: &ExifTool, path: &Path) -> Result<TagMap, String> {
+    let maps = tool
+        .read(&[path.to_path_buf()], &[])
+        .map_err(|error| error.to_string())?;
+    let map = maps
+        .into_iter()
+        .next()
+        .ok_or("ExifTool non ha restituito il documento richiesto")?;
+    if let Some(error) = ha_errore(&map) {
+        return Err(error);
+    }
+    Ok(map)
+}
+
+fn read_effective(
+    tool: &ExifTool,
+    paths: &[PathBuf],
+    tags: &[&str],
+) -> Vec<(PathBuf, Result<FullDocument, String>)> {
+    let images = match tool.read(paths, tags) {
+        Ok(maps) if maps.len() == paths.len() => maps,
+        Ok(_) => {
+            return paths
+                .iter()
+                .map(|path| (path.clone(), Err("lettura metadati incompleta".to_owned())))
+                .collect()
+        }
+        Err(error) => {
+            return paths
+                .iter()
+                .map(|path| (path.clone(), Err(error.to_string())))
+                .collect()
+        }
+    };
+    let mut errors = HashMap::new();
+    let mut sidecar_paths = Vec::new();
+    let mut sidecar_indices = Vec::new();
+    for (index, path) in paths.iter().enumerate() {
+        if FormatKind::from_path(path).is_some_and(|kind| kind.capabilities().xmp_sidecar) {
+            match existing_sidecar(path) {
+                Ok(Some(sidecar)) => {
+                    sidecar_indices.push(index);
+                    sidecar_paths.push(sidecar);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    errors.insert(index, error.to_string());
+                }
+            }
+        }
+    }
+    let mut sidecars = HashMap::new();
+    if !sidecar_paths.is_empty() {
+        match tool.read(&sidecar_paths, &[]) {
+            Ok(maps) if maps.len() == sidecar_paths.len() => {
+                sidecars.extend(sidecar_indices.iter().copied().zip(maps));
+            }
+            result => {
+                let message = match result {
+                    Err(error) => error.to_string(),
+                    Ok(_) => "lettura sidecar incompleta".to_owned(),
+                };
+                for index in sidecar_indices {
+                    errors.insert(index, message.clone());
+                }
+            }
+        }
+    }
+    paths
+        .iter()
+        .cloned()
+        .zip(images)
+        .enumerate()
+        .map(|(index, (path, mut map))| {
+            let result = (|| {
+                if let Some(error) = errors.remove(&index).or_else(|| ha_errore(&map)) {
+                    return Err(error);
+                }
+                let mut document = document_from_tags(&map);
+                if let Some(sidecar) = sidecars.remove(&index) {
+                    if let Some(error) = ha_errore(&sidecar) {
+                        return Err(error);
+                    }
+                    let canonical = managed_sidecar(&sidecar);
+                    document.apply_sidecar(&document_from_tags(&sidecar), canonical);
+                    if canonical {
+                        map.retain(|key, _| {
+                            !key.starts_with("XMP-") && !key.starts_with("Composite:GPS")
+                        });
+                    }
+                    map.extend(sidecar.into_iter().filter(|(key, _)| {
+                        key.starts_with("XMP-") || key.starts_with("Composite:GPS")
+                    }));
+                }
+                Ok(FullDocument {
+                    document,
+                    raw: raw_tags_from(&map),
+                })
+            })();
+            (path, result)
+        })
+        .collect()
 }
 
 fn read_summary(paths: &[PathBuf]) -> Vec<(PathBuf, MetadataSummary)> {
-    let mut items = Vec::new();
-    let tool = match tool() {
-        Ok(tool) => tool,
-        Err(err) => {
-            tracing::warn!("{err}");
-            return items;
-        }
+    let Ok(tool) = tool() else {
+        return Vec::new();
     };
-
+    let mut items = Vec::new();
     for chunk in paths.chunks(SUMMARY_CHUNK) {
-        match tool.read(chunk, SUMMARY_TAGS) {
-            Ok(maps) => {
-                for (path, map) in chunk.iter().zip(maps.iter()) {
-                    if let Some(error) = ha_errore(map) {
-                        tracing::warn!(path = %path.display(), "metadati non letti: {error}");
-                        continue;
-                    }
-                    items.push((path.clone(), summary_from_tags(map)));
-                }
+        for (path, result) in read_effective(tool, chunk, SUMMARY_TAGS) {
+            match result {
+                Ok(full) => items.push((path, summary_from_document(&full.document))),
+                Err(error) => tracing::warn!(path = %path.display(), "metadati non letti: {error}"),
             }
-            Err(err) => tracing::warn!("lettura metadati non riuscita: {err}"),
         }
     }
     items
 }
 
 fn read_full(paths: &[PathBuf]) -> Vec<(PathBuf, Result<FullDocument, String>)> {
-    let mut items = Vec::new();
     let tool = match tool() {
         Ok(tool) => tool,
-        Err(err) => {
-            let message = err.to_string();
+        Err(error) => {
             return paths
                 .iter()
-                .map(|path| (path.clone(), Err(message.clone())))
-                .collect();
+                .map(|path| (path.clone(), Err(error.to_string())))
+                .collect()
         }
     };
+    paths
+        .chunks(FULL_CHUNK)
+        .flat_map(|chunk| read_effective(tool, chunk, &[]))
+        .collect()
+}
 
-    for chunk in paths.chunks(FULL_CHUNK) {
-        match tool.read(chunk, &[]) {
-            Ok(maps) => {
-                for (path, map) in chunk.iter().zip(maps.iter()) {
-                    if let Some(error) = ha_errore(map) {
-                        items.push((path.clone(), Err(error)));
-                        continue;
-                    }
-                    items.push((
-                        path.clone(),
-                        Ok(FullDocument {
-                            document: document_from_tags(map),
-                            raw: raw_tags_from(map),
-                        }),
-                    ));
-                }
-            }
-            Err(err) => {
-                let message = err.to_string();
-                for path in chunk {
-                    items.push((path.clone(), Err(message.clone())));
-                }
-            }
-        }
+fn sidecar_assignments(
+    tool: &ExifTool,
+    image: &Path,
+    previous: Option<&Path>,
+    format: FormatKind,
+    edits: &[String],
+) -> Result<Vec<String>, String> {
+    let sidecar = previous.map(|path| one_map(tool, path)).transpose()?;
+    if sidecar.as_ref().is_some_and(managed_sidecar) {
+        return Ok(edits.to_vec());
     }
-    items
+    let original = one_map(tool, image)?;
+    let mut document = document_from_tags(&original);
+    if let Some(sidecar) = &sidecar {
+        document.apply_sidecar(&document_from_tags(sidecar), false);
+    }
+    let mut assignments = sidecar_snapshot_assignments(
+        &document,
+        format,
+        sidecar.as_ref().unwrap_or(&original),
+        &original,
+    )?;
+    assignments.extend_from_slice(edits);
+    assignments.push(format!("XMP-xmp:CreatorTool={SIDECAR_CREATOR}"));
+    Ok(assignments)
 }
 
 fn normalizza_confronto(field: MetadataField, value: &str) -> String {
@@ -442,15 +596,58 @@ pub fn write_edits(items: &[WriteItem]) -> MetadataWriteReport {
             ));
         }
 
-        let sidecar_file = sidecar_path(&item.path);
-        let esito = if sidecar {
-            if sidecar_file.is_file() {
-                tool.update_sidecar(&sidecar_file, &assignments)
-            } else {
-                tool.create_sidecar(&item.path, &sidecar_file, &assignments)
+        let sidecar_file = match existing_sidecar(&item.path) {
+            Ok(path) => path.unwrap_or_else(|| sidecar_path(&item.path)),
+            Err(error) if sidecar => {
+                report.failed.push((item.path.clone(), error.to_string()));
+                continue;
             }
+            Err(_) => sidecar_path(&item.path),
+        };
+        let destination = if sidecar {
+            sidecar_file
         } else {
-            tool.write_embedded(&item.path, &assignments)
+            item.path.clone()
+        };
+        let preparation = (|| -> std::io::Result<_> {
+            let backup = match std::fs::symlink_metadata(&destination) {
+                Ok(_) => Some(uberphoto_files::backup_file(&destination)?),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound && sidecar => None,
+                Err(error) => return Err(error),
+            };
+            let staged = if let Some(backup) = &backup {
+                uberphoto_files::StagedFile::copy(backup, &destination)?
+            } else {
+                uberphoto_files::StagedFile::new(&destination)?
+            };
+            Ok((staged, backup))
+        })();
+        let (staged, backup) = match preparation {
+            Ok(value) => value,
+            Err(error) => {
+                report.failed.push((item.path.clone(), error.to_string()));
+                continue;
+            }
+        };
+        if sidecar {
+            match sidecar_assignments(
+                tool,
+                &item.path,
+                backup.as_deref(),
+                item.format,
+                &assignments,
+            ) {
+                Ok(complete) => assignments = complete,
+                Err(error) => {
+                    report.failed.push((item.path.clone(), error));
+                    continue;
+                }
+            }
+        }
+        let esito = if sidecar && backup.is_none() {
+            tool.create_sidecar(&item.path, staged.path(), &assignments)
+        } else {
+            tool.write_embedded(staged.path(), &assignments)
         };
         if let Err(err) = esito {
             report.failed.push((item.path.clone(), err.to_string()));
@@ -459,12 +656,8 @@ pub fn write_edits(items: &[WriteItem]) -> MetadataWriteReport {
 
         // Verifica post-scrittura: rilegge il file (o il sidecar) e confronta
         // i valori effettivi con quelli richiesti.
-        let target = if sidecar {
-            sidecar_file
-        } else {
-            item.path.clone()
-        };
-        match tool.read(std::slice::from_ref(&target), &[]) {
+        let unverified_before = report.unverified.len();
+        match tool.read(&[staged.path().to_path_buf()], &[]) {
             Ok(maps) => match maps.first() {
                 Some(map) if ha_errore(map).is_none() => {
                     let document = document_from_tags(map);
@@ -505,7 +698,6 @@ pub fn write_edits(items: &[WriteItem]) -> MetadataWriteReport {
                             report.unverified.push((item.path.clone(), message));
                         }
                     }
-                    report.updated.push(item.path.clone());
                 }
                 _ => report.unverified.push((
                     item.path.clone(),
@@ -513,6 +705,17 @@ pub fn write_edits(items: &[WriteItem]) -> MetadataWriteReport {
                 )),
             },
             Err(err) => report.unverified.push((item.path.clone(), err.to_string())),
+        }
+        if report.unverified.len() == unverified_before {
+            let commit = if let Some(backup) = &backup {
+                staged.replace(&destination, backup)
+            } else {
+                staged.publish(&destination)
+            };
+            match commit {
+                Ok(()) => report.updated.push(item.path.clone()),
+                Err(error) => report.failed.push((item.path.clone(), error.to_string())),
+            }
         }
     }
 
@@ -524,6 +727,262 @@ mod tests {
     use super::*;
     use std::path::Path;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn invalidating_reads_discards_old_results_but_keeps_write_reports() {
+        let (tx, _requests) = channel();
+        let (outcomes, rx) = channel();
+        let service = MetadataService {
+            tx,
+            rx,
+            busy: Arc::new(AtomicBool::new(false)),
+            read_epoch: Arc::new(AtomicU64::new(0)),
+        };
+        outcomes
+            .send((0, MetadataOutcome::Summary { items: Vec::new() }))
+            .unwrap();
+        outcomes
+            .send((0, MetadataOutcome::Full { items: Vec::new() }))
+            .unwrap();
+        outcomes
+            .send((
+                0,
+                MetadataOutcome::Written {
+                    report: MetadataWriteReport::default(),
+                },
+            ))
+            .unwrap();
+        service.invalidate_reads();
+        outcomes
+            .send((1, MetadataOutcome::Summary { items: Vec::new() }))
+            .unwrap();
+        assert!(matches!(
+            service.try_recv(),
+            Some(MetadataOutcome::Written { .. })
+        ));
+        assert!(matches!(
+            service.try_recv(),
+            Some(MetadataOutcome::Summary { .. })
+        ));
+        assert!(service.try_recv().is_none());
+    }
+
+    fn raw_fixture(directory: &Path, tool: &ExifTool) -> PathBuf {
+        let png = directory.join("fixture.png");
+        crea_immagine(&png);
+        let raw = directory.join("fixture.dng");
+        tool.write_embedded(
+            &png,
+            &[
+                "XMP-dc:Title=Embedded title".to_owned(),
+                "XMP-dc:Subject=alpha".to_owned(),
+                "XMP-dc:Subject+=with,comma".to_owned(),
+                "XMP-xmp:Rating=3".to_owned(),
+                "XMP-dc:Creator=Alice".to_owned(),
+                "XMP-dc:Creator+=Bob".to_owned(),
+                "XMP-xmp:Nickname=Preserve this unknown field".to_owned(),
+                "EXIF:Make=Fixture camera".to_owned(),
+                "EXIF:DateTimeOriginal=2024:01:02 03:04:05".to_owned(),
+            ],
+        )
+        .unwrap();
+        std::fs::rename(png, &raw).unwrap();
+        raw
+    }
+
+    fn reread(path: &Path) -> MetadataDocument {
+        read_full(&[path.to_path_buf()])
+            .pop()
+            .unwrap()
+            .1
+            .unwrap()
+            .document
+    }
+
+    fn write_raw(path: &Path, edits: Vec<MetadataEdit>) {
+        let report = write_edits(&[WriteItem {
+            path: path.to_path_buf(),
+            format: FormatKind::Dng,
+            edits,
+        }]);
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+        assert!(report.unverified.is_empty(), "{:?}", report.unverified);
+        assert_eq!(report.updated, [path]);
+    }
+
+    #[test]
+    fn sidecar_roundtrip_preserves_original_lists_and_camera_data_then_keeps_deletions() {
+        let Some(tool) = exiftool() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let raw = raw_fixture(dir.path(), &tool);
+        let original = std::fs::read(&raw).unwrap();
+        let gps = GpsLocation {
+            latitude: -45.2,
+            longitude: -9.8,
+            altitude: Some(-15.0),
+        };
+        write_raw(
+            &raw,
+            vec![
+                MetadataEdit::Field(MetadataField::Title, Some("Edited title".to_owned())),
+                MetadataEdit::Field(MetadataField::Rating, Some("5".to_owned())),
+                MetadataEdit::Gps(Some(gps)),
+            ],
+        );
+        let document = reread(&raw);
+        assert_eq!(document.value(MetadataField::Title), Some("Edited title"));
+        assert_eq!(
+            document.list(MetadataField::Keywords),
+            ["alpha", "with,comma"]
+        );
+        assert_eq!(document.technical.make.as_deref(), Some("Fixture camera"));
+        assert_eq!(
+            document.value(MetadataField::DateOriginal),
+            Some("2024:01:02 03:04:05")
+        );
+        assert!(gps_conferma(Some(gps), document.gps).is_ok());
+        let summary = read_summary(std::slice::from_ref(&raw)).pop().unwrap().1;
+        assert_eq!(summary.rating, Some(5));
+        assert!(summary.has_gps);
+        assert_eq!(summary.keywords.as_deref(), Some("alpha, with,comma"));
+        let sidecar = sidecar_path(&raw);
+        let sidecar_tags = one_map(&tool, &sidecar).unwrap();
+        assert_eq!(
+            sidecar_tags["XMP-xmp:Nickname"],
+            "Preserve this unknown field"
+        );
+        assert!(managed_sidecar(&sidecar_tags));
+
+        write_raw(
+            &raw,
+            vec![MetadataEdit::Field(
+                MetadataField::Keywords,
+                Some("changed, values".to_owned()),
+            )],
+        );
+        assert_eq!(
+            reread(&raw).list(MetadataField::Keywords),
+            ["changed", "values"]
+        );
+        write_raw(
+            &raw,
+            vec![
+                MetadataEdit::Field(MetadataField::Title, None),
+                MetadataEdit::Field(MetadataField::Keywords, None),
+                MetadataEdit::Field(MetadataField::DateOriginal, None),
+                MetadataEdit::Field(MetadataField::Rating, None),
+                MetadataEdit::Gps(None),
+            ],
+        );
+        let document = reread(&raw);
+        assert!(document.value(MetadataField::Title).is_none());
+        assert!(document.list(MetadataField::Keywords).is_empty());
+        assert!(document.value(MetadataField::DateOriginal).is_none());
+        assert!(document.gps.is_none());
+        let summary = read_summary(std::slice::from_ref(&raw)).pop().unwrap().1;
+        assert!(!summary.has_gps);
+        assert!(summary.rating.is_none());
+        assert!(summary.keywords.is_none());
+        assert!(summary.date_original.is_none());
+        assert_eq!(std::fs::read(raw).unwrap(), original);
+    }
+
+    #[test]
+    fn a_partial_legacy_sidecar_is_read_and_adopted_in_place_without_losing_unknown_tags() {
+        let Some(tool) = exiftool() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let raw = raw_fixture(dir.path(), &tool);
+        let original = std::fs::read(&raw).unwrap();
+        let legacy = raw.with_extension("xmp");
+        tool.create_sidecar(
+            &raw,
+            &legacy,
+            &[
+                "XMP-dc:Title=Legacy title".to_owned(),
+                "XMP-dc:Subject=".to_owned(),
+                "XMP-dc:Creator=".to_owned(),
+                "XMP-xmp:CreatorTool=Foreign editor".to_owned(),
+                "XMP-xmp:Nickname=Legacy unknown field".to_owned(),
+            ],
+        )
+        .unwrap();
+        let document = reread(&raw);
+        assert_eq!(document.value(MetadataField::Title), Some("Legacy title"));
+        assert_eq!(
+            document.list(MetadataField::Keywords),
+            ["alpha", "with,comma"]
+        );
+        write_raw(&raw, vec![MetadataEdit::Field(MetadataField::Title, None)]);
+        assert!(!sidecar_path(&raw).exists());
+        assert!(reread(&raw).value(MetadataField::Title).is_none());
+        let tags = one_map(&tool, &legacy).unwrap();
+        assert_eq!(tags["XMP-xmp:Nickname"], "Legacy unknown field");
+        assert_eq!(tags["XMP-dc:Creator"], serde_json::json!(["Alice", "Bob"]));
+        assert!(managed_sidecar(&tags));
+        assert_eq!(std::fs::read(raw).unwrap(), original);
+    }
+
+    #[test]
+    fn appended_sidecar_takes_precedence_and_writing_leaves_the_legacy_file_untouched() {
+        let Some(tool) = exiftool() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let raw = raw_fixture(dir.path(), &tool);
+        let legacy = raw.with_extension("xmp");
+        let appended = sidecar_path(&raw);
+        tool.create_sidecar(&raw, &legacy, &["XMP-dc:Title=Legacy title".to_owned()])
+            .unwrap();
+        tool.create_sidecar(
+            &raw,
+            &appended,
+            &["XMP-dc:Title=Preferred title".to_owned()],
+        )
+        .unwrap();
+        let legacy_bytes = std::fs::read(&legacy).unwrap();
+        assert_eq!(
+            reread(&raw).value(MetadataField::Title),
+            Some("Preferred title")
+        );
+        write_raw(
+            &raw,
+            vec![MetadataEdit::Field(
+                MetadataField::Title,
+                Some("Updated title".to_owned()),
+            )],
+        );
+        assert_eq!(
+            reread(&raw).value(MetadataField::Title),
+            Some("Updated title")
+        );
+        assert_eq!(std::fs::read(legacy).unwrap(), legacy_bytes);
+    }
+
+    #[test]
+    fn verification_failure_never_commits_metadata_to_the_original() {
+        if exiftool().is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let photo = dir.path().join("photo.png");
+        crea_immagine(&photo);
+        let original = std::fs::read(&photo).unwrap();
+        let report = write_edits(&[WriteItem {
+            path: photo.clone(),
+            format: FormatKind::Png,
+            edits: vec![
+                MetadataEdit::Field(MetadataField::Title, Some("First value".to_owned())),
+                MetadataEdit::Field(MetadataField::Title, Some("Conflicting value".to_owned())),
+            ],
+        }]);
+        assert!(!report.unverified.is_empty());
+        assert!(report.updated.is_empty());
+        assert_eq!(std::fs::read(photo).unwrap(), original);
+    }
 
     fn exiftool() -> Option<ExifTool> {
         ExifTool::detect()

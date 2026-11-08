@@ -19,6 +19,8 @@ use crate::tree::{load_subdirs_filtered, DirNode};
 
 /// Esito di una scansione richiesta a [`DirectoryScanner`].
 pub struct ScanResult {
+    /// Identifies the request, including repeated scans of the same folder.
+    pub generation: u64,
     pub dir: PathBuf,
     pub entries: Vec<PhotoAsset>,
     /// Sotto-cartelle dirette della cartella scansionata, per la barra di
@@ -132,9 +134,9 @@ fn ordina(mut named: Vec<(String, PhotoAsset)>) -> Vec<PhotoAsset> {
 ///
 /// Se arrivano più richieste mentre una scansione è in corso, viene servita
 /// soltanto l'ultima: i risultati obsoleti vengono scartati dal chiamante
-/// confrontando `ScanResult::dir` con la cartella corrente.
+/// confrontando `ScanResult::generation` con la richiesta corrente.
 pub struct DirectoryScanner {
-    tx: Sender<PathBuf>,
+    tx: Sender<(u64, PathBuf)>,
     rx: Receiver<ScanResult>,
 }
 
@@ -142,27 +144,30 @@ impl DirectoryScanner {
     /// `repaint` viene invocato dopo ogni risultato recapitato, per risvegliare
     /// la UI (tipicamente `egui::Context::request_repaint`).
     pub fn new(repaint: Arc<dyn Fn() + Send + Sync>) -> Self {
-        let (tx, request_rx) = channel::<PathBuf>();
+        let (tx, request_rx) = channel::<(u64, PathBuf)>();
         let (result_tx, rx) = channel::<ScanResult>();
 
         std::thread::Builder::new()
             .name("uberphoto-scan".into())
             .spawn(move || {
-                while let Ok(mut dir) = request_rx.recv() {
+                while let Ok((mut generation, mut dir)) = request_rx.recv() {
                     // Salta le richieste superate: conta solo l'ultima.
-                    while let Ok(newer) = request_rx.try_recv() {
+                    while let Ok((new_generation, newer)) = request_rx.try_recv() {
+                        generation = new_generation;
                         dir = newer;
                     }
 
                     let subdirs = load_subdirs_filtered(&dir, false).unwrap_or_default();
                     let result = match scan_tree(&dir, false) {
                         Ok(entries) => ScanResult {
+                            generation,
                             dir,
                             entries,
                             subdirs,
                             error: None,
                         },
                         Err(err) => ScanResult {
+                            generation,
                             dir,
                             entries: Vec::new(),
                             subdirs,
@@ -182,8 +187,8 @@ impl DirectoryScanner {
     }
 
     /// Richiede la scansione di `dir` (non bloccante).
-    pub fn request(&self, dir: &Path) {
-        let _ = self.tx.send(dir.to_path_buf());
+    pub fn request(&self, dir: &Path, generation: u64) {
+        let _ = self.tx.send((generation, dir.to_path_buf()));
     }
 
     /// Estrae il prossimo risultato disponibile, se presente (non bloccante).
@@ -195,6 +200,28 @@ impl DirectoryScanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn repeated_scans_of_one_folder_keep_distinct_generations() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("sample.jpg"), b"fixture").unwrap();
+        let scanner = DirectoryScanner::new(Arc::new(|| {}));
+        scanner.request(directory.path(), 1);
+        scanner.request(directory.path(), 2);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let result = loop {
+            if let Some(result) = scanner.try_recv() {
+                if result.generation == 2 {
+                    break result;
+                }
+            }
+            assert!(Instant::now() < deadline, "latest scan did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(result.dir, directory.path());
+        assert_eq!(result.entries.len(), 1);
+    }
 
     #[test]
     fn scansiona_filtra_e_ordina() {

@@ -68,13 +68,13 @@ pub fn ui(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
     barra_comandi(ui, edit, actions, &path);
     preset(ui, edit, actions);
 
-    if let Some(error) = edit.source_error.clone() {
+    if let Some(error) = edit.source_state.error() {
         ui.add_space(6.0);
         ui.colored_label(
             ui.visuals().error_fg_color,
             t!("Anteprima non disponibile: {error}", error = error),
         );
-    } else if edit.source.is_none() {
+    } else if edit.source_state.ready().is_none() {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.spinner();
@@ -243,8 +243,8 @@ fn anteprima(ui: &mut egui::Ui, edit: &mut EditState) {
 
     if !disponibile {
         let testo = edit
-            .source_error
-            .as_deref()
+            .source_state
+            .error()
             .unwrap_or(t!("Caricamento dell'anteprima…"));
         painter.text(
             rect.center(),
@@ -768,7 +768,9 @@ mod tests {
             None,
             EditRecipe::default(),
         );
-        state.edit.source_error = Some("decodifica fallita: RAW non supportato".to_owned());
+        state.edit.source_state = crate::state::EditSourceState::Failed(
+            "decodifica fallita: RAW non supportato".to_owned(),
+        );
         let mut actions = UiActions::default();
         egui::__run_test_ui(|ui| {
             super::ui(ui, &mut state, &mut actions);

@@ -230,6 +230,52 @@ fn export_privacy_rimuove_il_gps_e_conserva_il_resto() {
 }
 
 #[test]
+fn privacy_removes_the_iptc_author_as_well_as_xmp() {
+    if !exiftool_disponibile() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("private.jpg");
+    prepara_sorgente(&source);
+    let tool = ExifTool::detect().unwrap();
+    tool.write_embedded(&source, &["IPTC:By-line=Private author".to_owned()])
+        .unwrap();
+    let original = std::fs::read(&source).unwrap();
+    let service = ExportService::new(Arc::new(|| {}));
+    assert!(service.start(ExportJob {
+        settings: ExportSettings {
+            destination: dir.path().join("web"),
+            preset: ExportPreset::Privacy,
+            privacy: PrivacyOptions {
+                remove_author: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        items: vec![ExportItem {
+            path: source.clone(),
+            kind: FormatKind::Jpeg,
+            recipe: EditRecipe::default()
+        }],
+    }));
+    let (events, finished) = attendi_lavoro(&service);
+    assert!(finished);
+    let output = events
+        .iter()
+        .find_map(|event| match event {
+            ExportEvent::Item(report) => Some(report.output.clone()),
+            _ => None,
+        })
+        .expect("export should succeed");
+    let tags = tool.read(&[output], &[]).unwrap();
+    assert!(!tags[0].contains_key("IPTC:By-line"));
+    assert!(uberphoto_metadata::document_from_tags(&tags[0])
+        .value(uberphoto_metadata::MetadataField::Creator)
+        .is_none());
+    assert_eq!(std::fs::read(source).unwrap(), original);
+}
+
+#[test]
 fn export_web_optimized_copia_solo_i_campi_editoriali() {
     if !exiftool_disponibile() {
         eprintln!("exiftool assente: test saltato");

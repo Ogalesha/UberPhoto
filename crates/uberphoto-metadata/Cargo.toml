@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 uberphoto-core.workspace = true
+uberphoto-files.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 

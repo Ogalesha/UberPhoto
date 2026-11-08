@@ -39,6 +39,7 @@ struct Job {
     path: PathBuf,
     mtime: Option<SystemTime>,
     max_dim: u32,
+    epoch: u64,
 }
 
 pub struct ImageService {
@@ -77,6 +78,7 @@ impl ImageService {
         {
             let results_tx = results_tx.clone();
             let repaint = repaint.clone();
+            let current_epoch = epoch.clone();
             std::thread::Builder::new()
                 .name("uberphoto-preview".into())
                 .spawn(move || {
@@ -85,14 +87,20 @@ impl ImageService {
                         while let Ok(newer) = preview_rx.try_recv() {
                             job = newer;
                         }
+                        if current_epoch.load(Ordering::Relaxed) != job.epoch {
+                            continue;
+                        }
                         let outcome = load_image_rgba(&job.path, Some(job.max_dim));
+                        if current_epoch.load(Ordering::Relaxed) != job.epoch {
+                            continue;
+                        }
                         if results_tx
                             .send(ImageResult {
                                 path: job.path,
                                 mtime: job.mtime,
                                 kind: ImageKind::Preview,
                                 outcome,
-                                epoch: 0,
+                                epoch: job.epoch,
                             })
                             .is_err()
                         {
@@ -166,6 +174,7 @@ impl ImageService {
             path,
             mtime,
             max_dim: PREVIEW_MAX_DIM,
+            epoch: self.epoch(),
         });
     }
 

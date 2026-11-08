@@ -2,22 +2,25 @@
 //!
 //! Il salvataggio è esplicito: la ricetta colore, i metadati e la posizione
 //! vengono applicati solo quando l'utente lo conferma. Sono previste due
-//! modalità, entrambe con rollback del file di lavoro:
+//! modalità, entrambe con file di lavoro verificati:
 //!
 //! - **nuova copia**: rigenera i pixel in `nome-modificata.ext` accanto
 //!   all'originale e non tocca il file di partenza;
 //! - **sovrascrittura**: rigenera i pixel in un file temporaneo nella stessa
-//!   cartella e sostituisce l'originale solo dopo che metadati e modifiche
-//!   sono stati applicati con successo. Con le sole modifiche ai metadati il
-//!   file viene aggiornato sul posto da ExifTool e riletto per verifica.
+//!   cartella e pubblica il risultato solo dopo la verifica. La versione
+//!   precedente resta in `.uberphoto-backups`; una breve assenza del nome
+//!   originale è possibile durante la pubblicazione. Anche le sole modifiche
+//!   ai metadati seguono il percorso di staging e verifica.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use uberphoto_core::FormatKind;
+use uberphoto_files::{backup_file, files_equal, StagedFile};
 use uberphoto_image::EditRecipe;
 use uberphoto_metadata::{write_edits, ExifTool, MetadataEdit, WriteItem};
 
@@ -32,7 +35,7 @@ use crate::settings::{ExportFormat, ExportPreset, ExportSettings, NameMode, Nami
 pub enum SaveMode {
     /// Crea una copia accanto all'originale.
     NewCopy,
-    /// Riscrive il file originale (irreversibile).
+    /// Replaces the original after retaining a verified recovery copy.
     Overwrite,
 }
 
@@ -53,6 +56,31 @@ pub struct SaveRequest {
     pub recipe: EditRecipe,
     pub edits: Vec<MetadataEdit>,
     pub mode: SaveMode,
+    /// Version shown in the browser when the user started the save.
+    pub expected: Option<ExpectedFileVersion>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ExpectedFileVersion {
+    pub byte_size: u64,
+    pub modified: Option<SystemTime>,
+}
+
+impl ExpectedFileVersion {
+    fn verify(self, path: &Path) -> Result<(), ExportError> {
+        let metadata = fs::metadata(path)?;
+        if metadata.len() != self.byte_size
+            || self
+                .modified
+                .is_some_and(|expected| metadata.modified().ok() != Some(expected))
+        {
+            return Err(ExportError::Invalid(
+                "la foto è cambiata dopo la selezione; aggiorna la cartella prima di salvare"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Lotto di salvataggio (una selezione con le stesse modifiche).
@@ -182,6 +210,9 @@ fn esegui_lavoro(job: SaveJob, eventi: &Sender<SaveEvent>, repaint: &Arc<dyn Fn(
 
 /// Applica una richiesta di salvataggio con garanzia di rollback.
 fn salva_foto(request: &SaveRequest) -> Result<SaveOutcome, ExportError> {
+    if let Some(expected) = request.expected {
+        expected.verify(&request.path)?;
+    }
     let capabilities = request.kind.capabilities();
     let pixel_changes = !request.recipe.is_identity();
     if pixel_changes && !capabilities.pixel_edit {
@@ -219,30 +250,27 @@ fn salva_copia(request: &SaveRequest, pixel_changes: bool) -> Result<SaveOutcome
         )));
     }
 
-    let target = percorso_copia(&request.path)?;
-    let esito = (|| -> Result<Vec<String>, ExportError> {
-        if pixel_changes {
-            rigenera_e_copia_metadati(request, &target)?;
-        } else {
-            fs::copy(&request.path, &target)?;
-        }
-        let warnings = applica_modifiche(&target, request)?;
-        copia_permessi(&request.path, &target)?;
-        Ok(warnings)
-    })();
-
-    match esito {
-        Ok(warnings) => Ok(SaveOutcome {
-            source: request.path.clone(),
-            output: target,
-            created: true,
-            warnings,
-        }),
-        Err(error) => {
-            let _ = fs::remove_file(&target);
-            Err(error)
+    let target = suggested_copy_path(&request.path)?;
+    let mut staged = StagedFile::new(&target)?;
+    if pixel_changes {
+        rigenera_e_copia_metadati(request, staged.path())?;
+    } else {
+        fs::copy(&request.path, staged.path())?;
+        if !files_equal(&request.path, staged.path())? {
+            return Err(ExportError::Invalid(
+                "sorgente cambiata durante la copia".to_owned(),
+            ));
         }
     }
+    let warnings = applica_modifiche(staged.path(), request)?;
+    staged.preserve_permissions(&request.path)?;
+    staged.publish(&target)?;
+    Ok(SaveOutcome {
+        source: request.path.clone(),
+        output: target,
+        created: true,
+        warnings,
+    })
 }
 
 fn salva_sovrascrivendo(
@@ -258,28 +286,22 @@ fn salva_sovrascrivendo(
             warnings,
         });
     }
-
-    let target = percorso_temporaneo(&request.path, request.kind)?;
-    let esito = (|| -> Result<Vec<String>, ExportError> {
-        rigenera_e_copia_metadati(request, &target)?;
-        let warnings = applica_modifiche(&target, request)?;
-        copia_permessi(&request.path, &target)?;
-        sostituisci(&target, &request.path)?;
-        Ok(warnings)
-    })();
-
-    match esito {
-        Ok(warnings) => Ok(SaveOutcome {
-            source: request.path.clone(),
-            output: request.path.clone(),
-            created: false,
-            warnings,
-        }),
-        Err(error) => {
-            let _ = fs::remove_file(&target);
-            Err(error)
-        }
+    let backup = backup_file(&request.path)?;
+    if let Some(expected) = request.expected {
+        expected.verify(&request.path)?;
     }
+    let staged = StagedFile::new(&request.path)?;
+    let mut snapshot = request.clone();
+    snapshot.path = backup.clone();
+    rigenera_e_copia_metadati(&snapshot, staged.path())?;
+    let warnings = applica_modifiche(staged.path(), request)?;
+    staged.replace(&request.path, &backup)?;
+    Ok(SaveOutcome {
+        source: request.path.clone(),
+        output: request.path.clone(),
+        created: false,
+        warnings,
+    })
 }
 
 /// Rigenera i pixel nel percorso indicato e trasferisce i metadati.
@@ -308,15 +330,16 @@ fn rigenera_e_copia_metadati(request: &SaveRequest, target: &Path) -> Result<(),
 
     // Se i pixel sono stati convertiti in sRGB incorporiamo il profilo nuovo;
     // altrimenti lasciamo copiare l'ICC originale da ExifTool.
-    let icc_path = rendered
+    let icc_file = rendered
         .converted_profile
-        .then(|| write_icc_temporaneo(&profilo_srgb()));
-    let argomenti = argomenti_copia(&request.path, &settings, icc_path.as_deref());
-    let esito = tool.write_from(target, &argomenti);
-    if let Some(path) = &icc_path {
-        let _ = fs::remove_file(path);
-    }
-    esito?;
+        .then(|| write_icc_temporaneo(&profilo_srgb()))
+        .transpose()?;
+    let argomenti = argomenti_copia(
+        &request.path,
+        &settings,
+        icc_file.as_ref().map(|file| file.path()),
+    );
+    tool.write_from(target, &argomenti)?;
     Ok(())
 }
 
@@ -378,8 +401,11 @@ fn export_format(kind: FormatKind) -> Option<ExportFormat> {
     }
 }
 
-/// `nome-modificata.ext`, con gestione automatica delle collisioni.
-fn percorso_copia(source: &Path) -> Result<PathBuf, ExportError> {
+/// Suggests a new copy name without reserving or replacing a file.
+///
+/// # Errors
+/// Returns an error when all candidate names are occupied.
+pub fn suggested_copy_path(source: &Path) -> Result<PathBuf, ExportError> {
     let directory = source.parent().unwrap_or_else(|| Path::new("."));
     let stem = source
         .file_stem()
@@ -396,44 +422,13 @@ fn percorso_copia(source: &Path) -> Result<PathBuf, ExportError> {
             format!("{stem}-modificata-{indice}.{estensione}")
         };
         let candidate = directory.join(nome);
-        if !candidate.exists() {
+        if fs::symlink_metadata(&candidate).is_err() {
             return Ok(candidate);
         }
     }
     Err(ExportError::Invalid(
         "impossibile trovare un nome libero per la nuova copia".to_owned(),
     ))
-}
-
-fn percorso_temporaneo(source: &Path, kind: FormatKind) -> Result<PathBuf, ExportError> {
-    let directory = source.parent().unwrap_or_else(|| Path::new("."));
-    let estensione = export_format(kind)
-        .map(ExportFormat::extension)
-        .ok_or_else(|| ExportError::Invalid("formato non supportato".to_owned()))?;
-    for indice in 0..10_000u32 {
-        let nome = format!(
-            ".uberphoto-save-{}-{indice}.{estensione}",
-            std::process::id()
-        );
-        let candidate = directory.join(nome);
-        if !candidate.exists() {
-            return Ok(candidate);
-        }
-    }
-    Err(ExportError::Invalid(
-        "impossibile creare un file temporaneo nella cartella della foto".to_owned(),
-    ))
-}
-
-fn copia_permessi(source: &Path, target: &Path) -> Result<(), ExportError> {
-    let permessi = fs::metadata(source)?.permissions();
-    fs::set_permissions(target, permessi)?;
-    Ok(())
-}
-
-fn sostituisci(temp: &Path, target: &Path) -> Result<(), ExportError> {
-    fs::rename(temp, target)?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -467,6 +462,7 @@ mod tests {
             },
             edits: Vec::new(),
             mode: SaveMode::NewCopy,
+            expected: None,
         };
         if exiftool().is_none() {
             eprintln!("ExifTool assente: test saltato");
@@ -481,7 +477,32 @@ mod tests {
     }
 
     #[test]
-    fn la_sovrascrittura_sostituisce_l_originale_in_modo_atomico() {
+    fn save_rejects_a_photo_changed_since_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("scatto.jpg");
+        fs::write(&source, b"new external version").unwrap();
+        let request = SaveRequest {
+            path: source.clone(),
+            kind: FormatKind::Jpeg,
+            recipe: EditRecipe::default(),
+            edits: vec![MetadataEdit::Field(
+                uberphoto_metadata::MetadataField::Rating,
+                Some("5".to_owned()),
+            )],
+            mode: SaveMode::Overwrite,
+            expected: Some(ExpectedFileVersion {
+                byte_size: 8,
+                modified: None,
+            }),
+        };
+        let error = salva_foto(&request).unwrap_err().to_string();
+        assert!(error.contains("cambiata"), "{error}");
+        assert_eq!(fs::read(&source).unwrap(), b"new external version");
+        assert!(!dir.path().join(".uberphoto-backups").exists());
+    }
+
+    #[test]
+    fn la_sovrascrittura_conserva_l_originale_e_pubblica_il_risultato() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("scatto.jpg");
         crea_foto(&source, 40, 30);
@@ -494,6 +515,7 @@ mod tests {
             },
             edits: Vec::new(),
             mode: SaveMode::Overwrite,
+            expected: None,
         };
         if exiftool().is_none() {
             eprintln!("ExifTool assente: test saltato");
@@ -540,6 +562,7 @@ mod tests {
                 Some("5".to_owned()),
             )],
             mode: SaveMode::Overwrite,
+            expected: None,
         };
         let esito = salva_foto(&request).unwrap();
         assert_eq!(esito.output, source);
@@ -574,6 +597,7 @@ mod tests {
                 Some("99".to_owned()),
             )],
             mode: SaveMode::Overwrite,
+            expected: None,
         };
         let errore = salva_foto(&request).unwrap_err().to_string();
         assert!(errore.contains("valutazione"), "{errore}");
@@ -609,6 +633,7 @@ mod tests {
                 Some("5".to_owned()),
             )],
             mode: SaveMode::NewCopy,
+            expected: None,
         };
         let esito = salva_foto(&request).unwrap();
         let tool = ExifTool::detect().unwrap();
@@ -633,6 +658,7 @@ mod tests {
                 Some("3".to_owned()),
             )],
             mode: SaveMode::NewCopy,
+            expected: None,
         };
         let errore = salva_foto(&request).unwrap_err().to_string();
         assert!(errore.contains("nuova copia"), "{errore}");
@@ -644,12 +670,12 @@ mod tests {
         let source = dir.path().join("foto.png");
         fs::write(&source, b"x").unwrap();
         assert_eq!(
-            percorso_copia(&source).unwrap(),
+            suggested_copy_path(&source).unwrap(),
             dir.path().join("foto-modificata.png")
         );
         fs::write(dir.path().join("foto-modificata.png"), b"x").unwrap();
         assert_eq!(
-            percorso_copia(&source).unwrap(),
+            suggested_copy_path(&source).unwrap(),
             dir.path().join("foto-modificata-2.png")
         );
     }

@@ -12,7 +12,6 @@
 //! a catena.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -21,24 +20,48 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 /// Periodo di quiete dopo l'ultimo evento.
 const QUIET_PERIOD: Duration = Duration::from_millis(350);
 
-/// Finestra durante la quale gli eventi causati dalle scritture dell'app
-/// vengono ignorati (con un margine per gli eventi in ritardo).
+/// Finestra durante la quale gli eventi vengono differiti (con un margine per
+/// gli eventi in ritardo). Anche modifiche esterne concomitanti restano visibili.
 const SUPPRESS_GRACE: Duration = Duration::from_millis(800);
 
 struct Inner {
-    pending: AtomicBool,
-    last_event: Mutex<Instant>,
-    suppress_until: Mutex<Option<Instant>>,
+    state: Mutex<WatcherState>,
 }
 
-/// True se gli eventi sono attualmente soppressi.
-fn is_suppressed(inner: &Inner) -> bool {
-    inner
-        .suppress_until
-        .lock()
-        .ok()
-        .and_then(|until| *until)
-        .is_some_and(|until| Instant::now() < until)
+enum ChangeState {
+    Idle,
+    Pending { last_event: Instant },
+}
+
+struct WatcherState {
+    change: ChangeState,
+    suppress_until: Option<Instant>,
+}
+
+impl WatcherState {
+    fn is_suppressed(&self, now: Instant) -> bool {
+        self.suppress_until.is_some_and(|until| now < until)
+    }
+
+    fn record_event(&mut self, now: Instant) -> bool {
+        self.change = ChangeState::Pending { last_event: now };
+        true
+    }
+
+    fn take_settled(&mut self, now: Instant) -> bool {
+        if self.is_suppressed(now) {
+            return false;
+        }
+        match self.change {
+            ChangeState::Pending { last_event }
+                if now.duration_since(last_event) >= QUIET_PERIOD =>
+            {
+                self.change = ChangeState::Idle;
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 pub struct DirWatcher {
@@ -55,23 +78,26 @@ impl DirWatcher {
 
     pub fn new(repaint: Arc<dyn Fn() + Send + Sync>) -> Option<Self> {
         let inner = Arc::new(Inner {
-            pending: AtomicBool::new(false),
-            last_event: Mutex::new(Instant::now()),
-            suppress_until: Mutex::new(None),
+            state: Mutex::new(WatcherState {
+                change: ChangeState::Idle,
+                suppress_until: None,
+            }),
         });
         let handler_inner = Arc::clone(&inner);
         let watcher = notify::recommended_watcher(move |event: Result<Event, notify::Error>| {
             let Ok(event) = event else {
                 return;
             };
-            if !Self::is_significant(&event) || is_suppressed(&handler_inner) {
+            if !Self::is_significant(&event) {
                 return;
             }
-            handler_inner.pending.store(true, Ordering::Relaxed);
-            if let Ok(mut last) = handler_inner.last_event.lock() {
-                *last = Instant::now();
+            if handler_inner
+                .state
+                .lock()
+                .is_ok_and(|mut state| state.record_event(Instant::now()))
+            {
+                repaint();
             }
-            repaint();
         })
         .map_err(|err| {
             tracing::warn!("watcher non disponibile: {err}");
@@ -101,7 +127,10 @@ impl DirWatcher {
 
     /// True se esistono eventi non ancora consumati.
     pub fn has_pending(&self) -> bool {
-        self.inner.pending.load(Ordering::Relaxed)
+        self.inner
+            .state
+            .lock()
+            .is_ok_and(|state| matches!(state.change, ChangeState::Pending { .. }))
     }
 
     /// Estende la finestra di soppressione degli eventi: da usare mentre
@@ -112,7 +141,7 @@ impl DirWatcher {
         }
     }
 
-    /// Ignora gli eventi per `duration` a partire da adesso (o fino alla
+    /// Differisce gli eventi per `duration` a partire da adesso (o fino alla
     /// scadenza già impostata, se più lontana). Usata per le operazioni
     /// sincrone.
     pub fn suppress_for(&self, duration: Duration) {
@@ -121,9 +150,9 @@ impl DirWatcher {
 
     fn extend_suppression(&self, duration: Duration) {
         let until = Instant::now() + duration;
-        if let Ok(mut guard) = self.inner.suppress_until.lock() {
-            if guard.is_none_or(|current| until > current) {
-                *guard = Some(until);
+        if let Ok(mut state) = self.inner.state.lock() {
+            if state.suppress_until.is_none_or(|current| until > current) {
+                state.suppress_until = Some(until);
             }
         }
     }
@@ -134,25 +163,31 @@ impl DirWatcher {
         // Durante le scritture dell'app non si riscansiona: gli eventi
         // eventualmente già in sospeso restano validi e verranno consumati
         // al termine della finestra di soppressione.
-        if is_suppressed(&self.inner) || !self.has_pending() {
-            return false;
-        }
-        let settled = self
-            .inner
-            .last_event
+        self.inner
+            .state
             .lock()
-            .map(|last| last.elapsed() >= QUIET_PERIOD)
-            .unwrap_or(true);
-        if settled {
-            self.inner.pending.store(false, Ordering::Relaxed);
-        }
-        settled
+            .is_ok_and(|mut state| state.take_settled(Instant::now()))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_event_cannot_be_consumed_as_an_older_settled_change() {
+        let start = Instant::now();
+        let mut state = WatcherState {
+            change: ChangeState::Idle,
+            suppress_until: None,
+        };
+        assert!(state.record_event(start));
+        let settled = start + QUIET_PERIOD;
+        assert!(state.record_event(settled));
+        assert!(!state.take_settled(settled));
+        assert!(state.take_settled(settled + QUIET_PERIOD));
+        assert!(!state.take_settled(settled + QUIET_PERIOD));
+    }
 
     fn test_watcher() -> DirWatcher {
         DirWatcher::new(Arc::new(|| {})).expect("watcher disponibile")
@@ -216,19 +251,21 @@ mod tests {
     }
 
     #[test]
-    fn gli_eventi_durante_la_soppressione_sono_ignorati() {
+    fn gli_eventi_durante_la_soppressione_vengono_recuperati_dopo() {
         let temp = tempfile::tempdir().unwrap();
         let mut watcher = test_watcher();
         watcher.watch(temp.path());
         std::thread::sleep(QUIET_PERIOD + Duration::from_millis(100));
         let _ = watcher.take_settled_change();
 
-        watcher.suppress_for(Duration::from_millis(1_500));
+        watcher.suppress_for(Duration::from_millis(800));
         std::fs::write(temp.path().join("scritta-dall-app.jpg"), b"dati").unwrap();
         std::thread::sleep(QUIET_PERIOD + Duration::from_millis(250));
         assert!(
             !watcher.take_settled_change(),
-            "le scritture dell'app non devono causare una riscansione"
+            "la scansione deve attendere la fine della soppressione"
         );
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(watcher.take_settled_change());
     }
 }

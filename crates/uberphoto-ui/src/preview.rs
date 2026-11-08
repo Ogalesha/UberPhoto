@@ -16,20 +16,27 @@ use uberphoto_image::{ImageService, LoadedImage};
 
 use crate::t;
 
+enum PreviewContent {
+    Empty,
+    Loading,
+    Ready {
+        texture: egui::TextureHandle,
+        size: egui::Vec2,
+    },
+    Failed(String),
+}
+
 pub struct PreviewState {
     open: bool,
     path: Option<PathBuf>,
     mtime: Option<SystemTime>,
-    texture: Option<egui::TextureHandle>,
-    size_px: egui::Vec2,
+    content: PreviewContent,
     /// Anteprima con la ricetta di editing applicata, condivisa con la
     /// scheda Colori (è la stessa texture, il costo è quello di un handle).
     edited: Option<egui::TextureHandle>,
     edited_size: egui::Vec2,
     /// Mostra l'anteprima modificata quando disponibile.
     prefer_edited: bool,
-    loading: bool,
-    error: Option<String>,
     zoom: f32,
     offset: egui::Vec2,
     needs_fit: bool,
@@ -41,13 +48,10 @@ impl PreviewState {
             open: false,
             path: None,
             mtime: None,
-            texture: None,
-            size_px: egui::Vec2::ZERO,
+            content: PreviewContent::Empty,
             edited: None,
             edited_size: egui::Vec2::ZERO,
             prefer_edited: true,
-            loading: false,
-            error: None,
             zoom: 1.0,
             offset: egui::Vec2::ZERO,
             needs_fit: true,
@@ -60,22 +64,34 @@ impl PreviewState {
         let already_current =
             self.open && self.path.as_deref() == Some(path) && self.mtime == mtime;
         self.open = true;
-        if already_current && (self.texture.is_some() || self.loading) {
+        if already_current
+            && matches!(
+                &self.content,
+                PreviewContent::Ready { .. } | PreviewContent::Loading
+            )
+        {
             return;
         }
 
         self.path = Some(path.to_path_buf());
         self.mtime = mtime;
-        self.texture = None;
+        self.content = PreviewContent::Loading;
         self.edited = None;
         self.edited_size = egui::Vec2::ZERO;
-        self.size_px = egui::Vec2::ZERO;
-        self.loading = true;
-        self.error = None;
         self.zoom = 1.0;
         self.offset = egui::Vec2::ZERO;
         self.needs_fit = true;
         images.request_preview(path.to_path_buf(), mtime);
+    }
+
+    /// Refreshes an open preview after the image job epoch changes.
+    pub fn refresh_after_scan(&mut self, images: &ImageService) {
+        if let (true, Some(path)) = (self.open, self.path.clone()) {
+            self.content = PreviewContent::Loading;
+            self.edited = None;
+            self.edited_size = egui::Vec2::ZERO;
+            images.request_preview(path, self.mtime);
+        }
     }
 
     /// Vero se `path`/`mtime` corrispondono all'anteprima corrente
@@ -89,9 +105,10 @@ impl PreviewState {
             [image.width as usize, image.height as usize],
             &image.rgba,
         );
-        self.texture = Some(ctx.load_texture("preview", color, egui::TextureOptions::LINEAR));
-        self.size_px = egui::vec2(image.width as f32, image.height as f32);
-        self.loading = false;
+        self.content = PreviewContent::Ready {
+            texture: ctx.load_texture("preview", color, egui::TextureOptions::LINEAR),
+            size: egui::vec2(image.width as f32, image.height as f32),
+        };
         self.needs_fit = true;
     }
 
@@ -115,12 +132,11 @@ impl PreviewState {
     }
 
     pub fn set_error(&mut self, error: String) {
-        self.loading = false;
-        self.error = Some(error);
+        self.content = PreviewContent::Failed(error);
     }
 
     pub fn is_loading(&self) -> bool {
-        self.open && self.loading
+        self.open && matches!(&self.content, PreviewContent::Loading)
     }
 
     pub fn ui(&mut self, ctx: &egui::Context) {
@@ -144,18 +160,16 @@ impl PreviewState {
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .fixed_size(screen * 0.92)
             .show(ctx, |ui| self.window_contents(ui));
-        self.open = open;
+        self.open &= open;
 
         // Alla chiusura la texture viene liberata: l'anteprima è ricreabile
         // a costo di una nuova decodifica.
         if !self.open {
-            self.texture = None;
+            self.content = PreviewContent::Empty;
             self.edited = None;
             self.edited_size = egui::Vec2::ZERO;
             self.path = None;
             self.mtime = None;
-            self.error = None;
-            self.loading = false;
         }
     }
 
@@ -220,7 +234,7 @@ impl PreviewState {
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, egui::CornerRadius::ZERO, egui::Color32::from_gray(18));
 
-        if let Some(error) = &self.error {
+        if let PreviewContent::Failed(error) = &self.content {
             painter.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
@@ -238,7 +252,10 @@ impl PreviewState {
         } else {
             None
         }
-        .or_else(|| self.texture.as_ref().map(|texture| (texture, self.size_px)));
+        .or(match &self.content {
+            PreviewContent::Ready { texture, size } => Some((texture, *size)),
+            _ => None,
+        });
 
         let Some((texture, size_px)) = attiva else {
             painter.text(

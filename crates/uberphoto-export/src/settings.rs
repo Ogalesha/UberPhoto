@@ -136,7 +136,11 @@ impl PrivacyOptions {
         if self.remove_author {
             esclusioni.extend([
                 "--OwnerName",
+                "--CameraOwnerName",
                 "--Artist",
+                "--IPTC:By-line",
+                "--XMP-tiff:Artist",
+                "--XPAuthor",
                 "--XMP-dc:Creator",
                 "--CreatorContactInfo",
             ]);
@@ -204,6 +208,8 @@ impl Naming {
             NameMode::Suffix => format!("{stem}{}", self.suffix.trim()),
             NameMode::WebSafe => web_safe(&stem),
         };
+        // A prefix or suffix must never escape the chosen output directory.
+        let stem = stem.replace(['/', '\\'], "_");
         format!("{stem}.{extension}")
     }
 }

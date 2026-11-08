@@ -14,6 +14,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::safety::{backup_file, files_equal, writable_regular_file, StagedFile};
+
 /// Politica di risoluzione quando il nome esiste già nella destinazione.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConflictPolicy {
@@ -93,7 +95,26 @@ pub fn rename_asset(path: &Path, new_name: &str, policy: ConflictPolicy) -> File
         return report;
     }
 
-    let photo_dest = parent.join(new_name);
+    let mut safe_name = std::ffi::OsString::from(new_name);
+    if let Some(extension) = path.extension() {
+        match Path::new(new_name).extension() {
+            None => {
+                safe_name.push(".");
+                safe_name.push(extension);
+            }
+            Some(new_extension) if !new_extension.eq_ignore_ascii_case(extension) => {
+                report.failed.push((
+                    path.to_owned(),
+                    "la rinomina non converte il formato: conserva l'estensione originale"
+                        .to_owned(),
+                ));
+                return report;
+            }
+            Some(_) => {}
+        }
+    }
+
+    let photo_dest = parent.join(safe_name);
     if photo_dest == path {
         report.skipped.push((
             path.to_path_buf(),
@@ -181,6 +202,7 @@ fn transfer(
 struct AssetSet {
     photo: PathBuf,
     sidecars: Vec<PathBuf>,
+    shared_legacy: Option<PathBuf>,
 }
 
 impl AssetSet {
@@ -188,6 +210,11 @@ impl AssetSet {
         let mut sidecars = Vec::new();
         let appended = PathBuf::from(format!("{}.xmp", photo.display()));
         let replaced = photo.with_extension("xmp");
+        let shared_legacy = if replaced.is_file() && legacy_sidecar_is_shared(photo) {
+            Some(replaced.clone())
+        } else {
+            None
+        };
         for candidate in [appended, replaced] {
             if candidate != photo && candidate.is_file() && !sidecars.contains(&candidate) {
                 sidecars.push(candidate);
@@ -196,8 +223,25 @@ impl AssetSet {
         Self {
             photo: photo.to_path_buf(),
             sidecars,
+            shared_legacy,
         }
     }
+}
+
+fn legacy_sidecar_is_shared(photo: &Path) -> bool {
+    let Some(parent) = photo.parent() else {
+        return true;
+    };
+    let Ok(entries) = fs::read_dir(parent) else {
+        return true;
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        let candidate = entry.path();
+        candidate != photo
+            && candidate.file_stem() == photo.file_stem()
+            && uberphoto_core::FormatKind::from_path(&candidate).is_some()
+            && candidate.is_file()
+    })
 }
 
 /// Trasferisce una foto e i suoi sidecar verso `photo_dest` (nome finale).
@@ -210,6 +254,14 @@ fn transfer_asset(
     force_copy: bool,
     report: &mut FileOpReport,
 ) {
+    if !copy {
+        if let Some(sidecar) = &assets.shared_legacy {
+            report.failed.push((assets.photo.clone(), format!(
+                "sidecar condiviso tra più immagini: {}. Usa Copia per conservarlo nella cartella originale", sidecar.display()
+            )));
+            return;
+        }
+    }
     let Some(target_dir) = photo_dest.parent() else {
         report
             .failed
@@ -240,52 +292,17 @@ fn transfer_asset(
         }
     };
 
-    if policy == ConflictPolicy::Replace {
-        if let Err(err) = remove_if_exists(&plan.photo_dest) {
-            report.failed.push((
-                assets.photo.clone(),
-                format!("impossibile sostituire il file esistente: {err}"),
-            ));
-            return;
-        }
-    }
-
-    let photo_result = if copy {
-        copy_to_destination(&assets.photo, &plan.photo_dest)
-    } else {
-        move_file(&assets.photo, &plan.photo_dest, force_copy)
-    };
-    match photo_result {
-        Ok(()) => report.moved.push(PathMove {
-            from: assets.photo.clone(),
-            to: plan.photo_dest.clone(),
-        }),
-        Err(err) => {
-            report
-                .failed
-                .push((assets.photo.clone(), format!("operazione fallita: {err}")));
-            return;
-        }
-    }
-
-    for (from, to) in &plan.sidecar_dests {
-        if policy == ConflictPolicy::Replace {
-            let _ = remove_if_exists(to);
-        }
-        let result = if copy {
-            copy_to_destination(from, to)
-        } else {
-            move_file(from, to, force_copy)
-        };
-        match result {
-            Ok(()) => report.moved.push(PathMove {
-                from: from.clone(),
-                to: to.clone(),
-            }),
-            Err(err) => report
-                .failed
-                .push((from.clone(), format!("sidecar non trasferito: {err}"))),
-        }
+    let mut pairs = vec![(assets.photo.clone(), plan.photo_dest)];
+    pairs.extend(plan.sidecar_dests);
+    let result = transfer_set(&pairs, policy, copy, force_copy);
+    match result {
+        Ok(()) => report
+            .moved
+            .extend(pairs.into_iter().map(|(from, to)| PathMove { from, to })),
+        Err(error) => report.failed.push((
+            assets.photo.clone(),
+            format!("operazione interrotta; sorgenti o backup conservati: {error}"),
+        )),
     }
 }
 
@@ -312,7 +329,10 @@ fn plan_destinations(
     let conflicts = |dest: &Path| -> Result<Vec<PathBuf>, String> {
         let mut all = vec![dest.to_path_buf()];
         all.extend(map_sidecars(assets, dest)?.into_iter().map(|(_, to)| to));
-        Ok(all.into_iter().filter(|path| path.exists()).collect())
+        Ok(all
+            .into_iter()
+            .filter(|path| fs::symlink_metadata(path).is_ok())
+            .collect())
     };
 
     match policy {
@@ -389,67 +409,90 @@ fn split_name(file_name: &str) -> (&str, &str) {
     }
 }
 
-/// Sposta un file: rinomina diretta e, solo per errori tra volumi diversi,
-/// copia verificata + rimozione della sorgente.
-fn move_file(from: &Path, to: &Path, force_copy: bool) -> io::Result<()> {
-    if !force_copy {
-        match fs::rename(from, to) {
-            Ok(()) => return Ok(()),
-            Err(err) if is_cross_device(&err) => {}
-            Err(err) => return Err(err),
+/// Stages every member before publishing, and removes no source until all
+/// destinations have been published and verified. A partial destination set
+/// may remain on failure; recovery copies and the sources are retained.
+fn transfer_set(
+    pairs: &[(PathBuf, PathBuf)],
+    policy: ConflictPolicy,
+    copy: bool,
+    _force_copy: bool,
+) -> io::Result<()> {
+    for (_, target) in pairs {
+        if pairs
+            .iter()
+            .any(|(source, _)| same_file::is_same_file(source, target).unwrap_or(false))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "la destinazione coincide con una sorgente",
+            ));
         }
     }
-    copy_then_remove(from, to)
-}
-
-fn is_cross_device(err: &io::Error) -> bool {
-    matches!(err.kind(), io::ErrorKind::CrossesDevices) || err.raw_os_error() == Some(18)
-}
-
-/// Copia su file temporaneo nella destinazione, preserva il mtime,
-/// rinomina atomicamente e solo dopo elimina la sorgente.
-fn copy_then_remove(from: &Path, to: &Path) -> io::Result<()> {
-    copy_to_destination(from, to)?;
-    fs::remove_file(from)
-}
-
-/// Copia `from` su un file temporaneo accanto a `to`, preserva il mtime,
-/// quindi rinomina atomicamente su `to`. Un fallimento lascia la
-/// destinazione intatta.
-fn copy_to_destination(from: &Path, to: &Path) -> io::Result<()> {
-    let temp = temp_path(to);
-    let result = copy_temp(from, &temp).and_then(|()| fs::rename(&temp, to));
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
+    let mut stages = Vec::new();
+    let mut source_backups = Vec::new();
+    let mut destination_backups = Vec::new();
+    for (from, to) in pairs {
+        if same_file::is_same_file(from, to).unwrap_or(false) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "sorgente e destinazione sono lo stesso file",
+            ));
+        }
+        if !copy {
+            writable_regular_file(from)?;
+            source_backups.push(backup_file(from)?);
+        }
+        let backup = if policy == ConflictPolicy::Replace && fs::symlink_metadata(to).is_ok() {
+            Some(backup_file(to)?)
+        } else {
+            None
+        };
+        destination_backups.push(backup);
+        stages.push(StagedFile::copy(from, to)?);
     }
-    result
-}
-
-fn copy_temp(from: &Path, temp: &Path) -> io::Result<()> {
-    fs::copy(from, temp)?;
-    if let Ok(meta) = fs::metadata(from) {
-        if let Ok(modified) = meta.modified() {
-            let file = fs::File::options().write(true).open(temp)?;
-            file.set_modified(modified)?;
+    for ((stage, (_, to)), backup) in stages.into_iter().zip(pairs).zip(&destination_backups) {
+        if let Some(backup) = backup {
+            stage.replace(to, backup)?;
+        } else {
+            stage.publish(to)?;
+        }
+    }
+    for (from, to) in pairs {
+        if !files_equal(from, to)? {
+            return Err(io::Error::other(
+                "destinazione non verificata; sorgenti conservate",
+            ));
+        }
+    }
+    if !copy {
+        // Validate the entire set again before removing any source.
+        for ((from, _), backup) in pairs.iter().zip(&source_backups) {
+            if !files_equal(from, backup)? {
+                return Err(io::Error::other(
+                    "sorgente modificata da un altro programma; rimozione annullata",
+                ));
+            }
+        }
+        for ((from, _), backup) in pairs.iter().zip(&source_backups) {
+            writable_regular_file(from)?;
+            // Keep the actual source as the recovery copy, rather than unlinking it.
+            fs::rename(from, backup)?;
+            crate::safety::sync_directory(backup.parent().unwrap_or_else(|| Path::new(".")))?;
+            crate::safety::sync_directory(from.parent().unwrap_or_else(|| Path::new(".")))?;
         }
     }
     Ok(())
 }
 
-fn temp_path(to: &Path) -> PathBuf {
-    let name = to
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "file".to_owned());
-    to.with_file_name(format!(".{name}.uberphoto-tmp"))
-}
-
-fn remove_if_exists(path: &Path) -> io::Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err),
-    }
+#[cfg(test)]
+fn move_file(from: &Path, to: &Path, force_copy: bool) -> io::Result<()> {
+    transfer_set(
+        &[(from.to_owned(), to.to_owned())],
+        ConflictPolicy::RenameAuto,
+        false,
+        force_copy,
+    )
 }
 
 /// Crea una sottocartella `name` dentro `parent`.
@@ -509,6 +552,149 @@ mod tests {
             fs::create_dir_all(parent).unwrap();
         }
         fs::write(path, b"contenuto").unwrap();
+    }
+
+    #[test]
+    fn a_shared_legacy_sidecar_is_never_taken_from_an_unselected_photo() {
+        let dir = tempdir().unwrap();
+        let jpg = dir.path().join("source/photo.jpg");
+        let raw = dir.path().join("source/photo.dng");
+        let sidecar = dir.path().join("source/photo.xmp");
+        let target = dir.path().join("target");
+        for path in [&jpg, &raw, &sidecar] {
+            write_file(path);
+        }
+        fs::create_dir(&target).unwrap();
+        let report = move_assets(
+            std::slice::from_ref(&jpg),
+            &target,
+            ConflictPolicy::RenameAuto,
+        );
+        assert_eq!(report.failed.len(), 1);
+        assert!(report.moved.is_empty());
+        for path in [&jpg, &raw, &sidecar] {
+            assert_eq!(fs::read(path).unwrap(), b"contenuto");
+        }
+        let copied = copy_assets(
+            std::slice::from_ref(&jpg),
+            &target,
+            ConflictPolicy::RenameAuto,
+        );
+        assert!(copied.failed.is_empty());
+        assert_eq!(fs::read(target.join("photo.xmp")).unwrap(), b"contenuto");
+        assert!(sidecar.exists());
+    }
+
+    #[test]
+    fn renaming_keeps_the_original_format_and_does_not_hide_the_photo() {
+        let dir = tempdir().unwrap();
+        let photo = dir.path().join("photo.jpg");
+        write_file(&photo);
+        let refused = rename_asset(&photo, "photo.tiff", ConflictPolicy::RenameAuto);
+        assert_eq!(refused.failed.len(), 1);
+        assert_eq!(fs::read(&photo).unwrap(), b"contenuto");
+        let renamed = rename_asset(&photo, "holiday", ConflictPolicy::RenameAuto);
+        assert!(renamed.failed.is_empty());
+        assert_eq!(renamed.moved[0].to, dir.path().join("holiday.jpg"));
+        assert_eq!(fs::read(&renamed.moved[0].to).unwrap(), b"contenuto");
+    }
+
+    #[test]
+    fn copying_onto_itself_never_deletes_the_photo() {
+        let dir = tempdir().unwrap();
+        let photo = dir.path().join("photo.jpg");
+        write_file(&photo);
+        let report = copy_assets(
+            std::slice::from_ref(&photo),
+            dir.path(),
+            ConflictPolicy::Replace,
+        );
+        assert_eq!(fs::read(&photo).unwrap(), b"contenuto");
+        assert!(report.moved.is_empty());
+    }
+
+    #[test]
+    fn failed_replacement_preserves_the_existing_destination() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("missing/photo.jpg");
+        let target = dir.path().join("photo.jpg");
+        write_file(&target);
+        let report = copy_assets(&[source], dir.path(), ConflictPolicy::Replace);
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(fs::read(target).unwrap(), b"contenuto");
+    }
+
+    #[test]
+    fn replacement_keeps_the_displaced_photo_in_a_verified_backup() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source/photo.jpg");
+        let target_dir = dir.path().join("target");
+        write_file(&source);
+        fs::create_dir(&target_dir).unwrap();
+        fs::write(target_dir.join("photo.jpg"), b"old precious photo").unwrap();
+        let report = move_assets(
+            std::slice::from_ref(&source),
+            &target_dir,
+            ConflictPolicy::Replace,
+        );
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+        assert_eq!(
+            fs::read(target_dir.join("photo.jpg")).unwrap(),
+            b"contenuto"
+        );
+        let backups: Vec<_> = fs::read_dir(target_dir.join(".uberphoto-backups"))
+            .unwrap()
+            .map(|entry| fs::read(entry.unwrap().path()).unwrap())
+            .collect();
+        assert!(backups.contains(&b"old precious photo".to_vec()));
+        assert!(!source.exists());
+        assert!(
+            fs::read_dir(source.parent().unwrap().join(".uberphoto-backups"))
+                .unwrap()
+                .any(|entry| fs::read(entry.unwrap().path()).unwrap() == b"contenuto")
+        );
+    }
+
+    #[test]
+    fn sidecar_preparation_failure_leaves_both_photos_and_source_sidecar_intact() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source/photo.jpg");
+        let sidecar = dir.path().join("source/photo.jpg.xmp");
+        let target = dir.path().join("target");
+        write_file(&source);
+        write_file(&sidecar);
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("photo.jpg"), b"existing destination").unwrap();
+        fs::create_dir(target.join("photo.jpg.xmp")).unwrap();
+        let report = move_assets(
+            std::slice::from_ref(&source),
+            &target,
+            ConflictPolicy::Replace,
+        );
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(fs::read(&source).unwrap(), b"contenuto");
+        assert_eq!(fs::read(sidecar).unwrap(), b"contenuto");
+        assert_eq!(
+            fs::read(target.join("photo.jpg")).unwrap(),
+            b"existing destination"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_preexisting_temp_symlink_cannot_overwrite_another_file() {
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source/photo.jpg");
+        let target_dir = dir.path().join("target");
+        let unrelated = dir.path().join("unrelated.jpg");
+        write_file(&source);
+        fs::create_dir(&target_dir).unwrap();
+        fs::write(&unrelated, b"precious photo").unwrap();
+        symlink(&unrelated, target_dir.join(".photo.jpg.uberphoto-tmp")).unwrap();
+        let report = copy_assets(&[source], &target_dir, ConflictPolicy::RenameAuto);
+        assert!(report.failed.is_empty());
+        assert_eq!(fs::read(unrelated).unwrap(), b"precious photo");
     }
 
     #[test]

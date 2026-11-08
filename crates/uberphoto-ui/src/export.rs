@@ -13,6 +13,7 @@ use crate::util::format_bytes;
 
 pub fn ui(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
     let selezionati = state.selected_assets().len();
+    let needs_save = state.export_needs_metadata_save();
     let exiftool = state.exiftool.clone();
     let export = &mut state.export;
 
@@ -189,10 +190,18 @@ pub fn ui(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
             ));
         });
 
+    if needs_save && !export.phase.is_busy() {
+        ui.add_space(8.0);
+        ui.label(t!("Salva metadati e posizione prima di esportare."));
+        if ui.button(t!("Salva")).clicked() {
+            actions.save_open = true;
+        }
+    }
+
     ui.add_space(8.0);
     ui.separator();
     ui.horizontal(|ui| {
-        if export.busy {
+        if export.phase.is_busy() {
             ui.spinner();
             ui.label(t!(
                 "Esportazione… {done}/{total}",
@@ -203,7 +212,7 @@ pub fn ui(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
                 actions.export_cancel = true;
             }
         } else {
-            let abilitato = selezionati > 0 && exiftool.is_some();
+            let abilitato = selezionati > 0 && exiftool.is_some() && !needs_save;
             let etichetta = if selezionati == 1 {
                 t!("Esporta 1 foto").to_owned()
             } else {
@@ -226,7 +235,7 @@ pub fn ui(ui: &mut egui::Ui, state: &mut AppState, actions: &mut UiActions) {
         }
     });
 
-    if export.total > 0 && (export.busy || export.done > 0) {
+    if export.total > 0 && (export.phase.is_busy() || export.done > 0) {
         ui.add(
             egui::ProgressBar::new(export.progress())
                 .show_percentage()

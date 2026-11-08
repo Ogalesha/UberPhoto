@@ -11,6 +11,7 @@ use image::codecs::tiff::TiffEncoder;
 use image::codecs::webp::WebPEncoder;
 use image::imageops::FilterType;
 use image::{ExtendedColorType, ImageEncoder, RgbaImage};
+use uberphoto_files::StagedFile;
 use uberphoto_image::{apply_recipe_rgba, load_image_rgba, EditRecipe};
 
 use crate::error::ExportError;
@@ -38,13 +39,28 @@ pub fn render_export(
     recipe: &EditRecipe,
     profilo_icc: Option<&[u8]>,
 ) -> Result<RenderOutput, ExportError> {
+    let (staged, mut output, target) = prepare_export(source, settings, recipe, profilo_icc)?;
+    staged.publish(&target)?;
+    output.path = target;
+    Ok(output)
+}
+
+/// Keeps pixels private until the caller has also verified metadata.
+pub(crate) fn prepare_export(
+    source: &Path,
+    settings: &ExportSettings,
+    recipe: &EditRecipe,
+    profilo_icc: Option<&[u8]>,
+) -> Result<(StagedFile, RenderOutput, PathBuf), ExportError> {
     let destination = settings.destination_for(source);
     std::fs::create_dir_all(&destination)?;
-    let nome = settings
+    let name = settings
         .naming
         .file_name(source, settings.format.extension());
-    let path = percorso_unico(&destination, &nome);
-    render_export_to(source, settings, recipe, profilo_icc, &path)
+    let target = percorso_unico(&destination, &name)?;
+    let staged = StagedFile::new(&target)?;
+    let output = render_export_to(source, settings, recipe, profilo_icc, staged.path())?;
+    Ok((staged, output, target))
 }
 
 /// Applica la ricetta e scrive il file nel percorso esatto indicato.
@@ -98,10 +114,10 @@ pub(crate) fn render_export_to(
 }
 
 /// Evita di sovrascrivere file esistenti aggiungendo `-2`, `-3`, …
-fn percorso_unico(directory: &Path, nome: &str) -> PathBuf {
+fn percorso_unico(directory: &Path, nome: &str) -> Result<PathBuf, ExportError> {
     let candidate = directory.join(nome);
-    if !candidate.exists() {
-        return candidate;
+    if std::fs::symlink_metadata(&candidate).is_err() {
+        return Ok(candidate);
     }
     let percorso = Path::new(nome);
     let stem = percorso
@@ -119,11 +135,13 @@ fn percorso_unico(directory: &Path, nome: &str) -> PathBuf {
             format!("{stem}-{indice}.{estensione}")
         };
         let candidate = directory.join(nome);
-        if !candidate.exists() {
-            return candidate;
+        if std::fs::symlink_metadata(&candidate).is_err() {
+            return Ok(candidate);
         }
     }
-    candidate
+    Err(ExportError::Invalid(
+        "troppi file con lo stesso nome; nessun file sovrascritto".to_owned(),
+    ))
 }
 
 fn codifica(path: &Path, pixel: &RgbaImage, settings: &ExportSettings) -> Result<(), ExportError> {
